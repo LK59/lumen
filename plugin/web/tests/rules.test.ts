@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { audioTrackFor, eligible, lumenProfile, streamAddress } from "../src/rules";
+import { audioTrackFor, eligible, lumenProfile, streamAddress, televisionClient } from "../src/rules";
 
 describe("ce que Lumen se propose de lire", () => {
   const film = { Id: "a", MediaType: "Video", Type: "Movie", LocationType: "FileSystem", VideoType: "VideoFile" };
@@ -70,5 +70,15 @@ describe("la piste son que Jellyfin désigne", () => {
     expect(audioTrackFor(audioFirst, 7, [1, 3])).toBeNull();
     expect(audioTrackFor(audioFirst, null, [1, 3])).toBeNull();
     expect(audioTrackFor(undefined, 0, [1])).toBeNull();
+  });
+});
+
+describe("televisionClient", () => {
+  it("reconnaît les téléviseurs et laisse les ordinateurs et les téléphones", () => {
+    expect(televisionClient("Mozilla/5.0 (Web0S; Linux/SmartTV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.88 Safari/537.36 WebAppManager")).toBe(true);
+    expect(televisionClient("Mozilla/5.0 (SMART-TV; LINUX; Tizen 6.0) AppleWebKit/537.36 (KHTML, like Gecko) 76.0.3809.146/6.0 TV Safari/537.36")).toBe(true);
+    expect(televisionClient("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36")).toBe(false);
+    expect(televisionClient("Mozilla/5.0 (iPhone; CPU iPhone OS 26_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148")).toBe(false);
+    expect(televisionClient("Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Mobile Safari/537.36")).toBe(false);
   });
 });

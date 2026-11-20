@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/LK59/lumen/main/plugin/logo.png",
     "versions": [
       {
+        "version": "0.1.9.0",
+        "changelog": "On TVs and game consoles, playback stays with the regular player. Two quick skips in a row now add up while a seek is in progress.",
+        "targetAbi": "10.10.0.0",
+        "sourceUrl": "https://raw.githubusercontent.com/LK59/lumen/main/releases/lumen_0.1.9.0.zip",
+        "checksum": "46cb24b46fa1c3ee748604539d5d522d",
+        "timestamp": "2026-11-20T23:10:09Z"
+      },
+      {
         "version": "0.1.8.0",
         "changelog": "Seeking inside what is already loaded no longer reloads it. The playback log records where the opening time goes.",
         "targetAbi": "10.10.0.0",

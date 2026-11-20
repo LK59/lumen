@@ -91,3 +91,11 @@ export function audioTrackFor(streams: JellyfinMediaStream[] | undefined, wanted
   if (rank < 0 || internal.length !== trackNumbers.length) return null;
   return trackNumbers[rank] ?? null;
 }
+
+/**
+ * Un téléviseur ou une console, d'après ce que son navigateur dit de lui : les applications Jellyfin
+ * pour webOS et Tizen, entre autres, ne sont que le client web dans le navigateur de l'appareil.
+ */
+export function televisionClient(userAgent: string): boolean {
+  return /web0s|webos|tizen|smart-?tv|netcast|vidaa|viera|hbbtv|playstation|xbox/i.test(userAgent);
+}

@@ -19,7 +19,7 @@
 // tombe le pont se retire en le disant dans la console — jellyfin-web lit alors comme sans lui.
 import type * as LumenCore from "../../../lumen-core/src/index";
 import { PlaybackRecorder, transcodeReasonsOf } from "./journal";
-import { PLUGIN_NAME, audioTrackFor, eligible, lumenProfile, streamAddress, type JellyfinItem, type JellyfinMediaSource } from "./rules";
+import { PLUGIN_NAME, audioTrackFor, eligible, lumenProfile, streamAddress, televisionClient, type JellyfinItem, type JellyfinMediaSource } from "./rules";
 
 type Core = typeof LumenCore;
 type Playback = Awaited<ReturnType<Awaited<ReturnType<Core["probePlaybackPath"]>>["start"]>>;
@@ -80,6 +80,12 @@ interface State {
    * image seule ne disait pas où le temps passait : trois fichiers différents ouverts en 3 545, 3 549 et
    * 3 553 ms (Chrome, 20/11/2026) montraient un délai fixe sans qu'on puisse dire lequel.
    */
+  /**
+   * La cible du dernier saut confié au moteur, tant qu'il ne l'a pas servi. jellyfin-web calcule un saut
+   * relatif (« avance rapide ») depuis la position qu'on lui rend : rendue depuis la tête, qui n'a pas
+   * encore bougé, deux appuis rapprochés n'en valaient qu'un (602 s → 637 s au lieu de 662 s, au banc).
+   */
+  seekTarget: number | null;
   steps: Record<string, number>;
   stepsFrom: number;
   /** L'élément de la lecture en cours, et ce qui fait qu'un arrêt de l'image n'est pas une attente. */
@@ -156,7 +162,7 @@ class LumenPlayer {
   isLocalPlayer = true;
 
   constructor(deps: Deps) {
-    states.set(this, { deps, adopted: null, playback: null, opening: 0, verdicts: new Map(), settings: new Map(), recorder: null, recorderServerId: undefined, askedAt: null, element: null, busy: 0, steps: {}, stepsFrom: 0, offered: null, onRangeRefused: null });
+    states.set(this, { deps, adopted: null, playback: null, opening: 0, verdicts: new Map(), settings: new Map(), recorder: null, recorderServerId: undefined, askedAt: null, element: null, busy: 0, seekTarget: null, steps: {}, stepsFrom: 0, offered: null, onRangeRefused: null });
     instance = this;
   }
 
@@ -196,6 +202,14 @@ interface Adopted {
 function adopt(self: LumenPlayer): boolean {
   const state = states.get(self)!;
   if (state.adopted !== null) return state.adopted;
+  if (televisionClient(navigator.userAgent)) {
+    // Les applications Jellyfin des téléviseurs affichent ce même client web, donc ce même script. Leur
+    // navigateur est ancien et leur processeur modeste, alors que leur lecteur d'origine lit déjà les
+    // fichiers tels quels : Lumen n'y a rien à gagner et n'y a jamais été essayé.
+    state.adopted = false;
+    log("téléviseur ou console : lecture laissée à jellyfin-web");
+    return false;
+  }
   const html = state.deps.playbackManager.getPlayers().find((player) => player.id === "htmlvideoplayer");
   // Pas encore chargé : on réessaiera à la prochaine question.
   if (!html) return false;
@@ -347,11 +361,18 @@ function lumenPrototype(base: Adopted): object {
         // (`onSeeking`, chemin « mémoire » — c'est par là que passent les commandes de Laterna). Son
         // `seek()`, lui, vide les tampons et recharge, même pour dix secondes déjà là. Seulement hors
         // d'un saut en cours : celui-ci va vider les tampons, et le dernier geste doit l'emporter.
-        if (element && !playback.seekPending && !element.seeking && loadedAt(element, seconds)) element.currentTime = seconds;
-        else void playback.seek(seconds);
+        if (element && !playback.seekPending && !element.seeking && loadedAt(element, seconds)) {
+          state.seekTarget = null;
+          element.currentTime = seconds;
+        } else {
+          state.seekTarget = seconds;
+          void playback.seek(seconds);
+        }
         return undefined;
       }
-      return playback.position * 1000;
+      // Le moteur dit quand le saut est fini : il peut avoir posé la tête ailleurs que sur la cible.
+      if (state.seekTarget !== null && !playback.seekPending) state.seekTarget = null;
+      return (state.seekTarget ?? playback.position) * 1000;
     },
 
     /**
@@ -445,6 +466,7 @@ function close(state: State): void {
   state.onRangeRefused = null;
   const playback = state.playback;
   state.playback = null;
+  state.seekTarget = null;
   try {
     playback?.destroy();
   } catch (error) {
