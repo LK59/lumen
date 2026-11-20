@@ -2,7 +2,7 @@
 // changée pendant la pause, saut donné pendant qu'un flux se rouvre, deux « avance rapide » coup sur
 // coup, et la fin du fichier. Relève des faits, en JSON ; ne juge pas.
 //
-//   ITEM_ID JF_URL JF_TOKEN JF_USERID JF_SERVERID  [USER_AGENT]  [BLOCK_SCRIPT=1]  [ONLY_OPEN=1 | ONLY_FORWARD=1]
+//   ITEM_ID JF_URL JF_TOKEN JF_USERID JF_SERVERID  [USER_AGENT]  [BLOCK_SCRIPT=1]  [ONLY_OPEN=1 | ONLY_FORWARD=1 | LOSS=1|4]
 import { chromium } from "playwright-core";
 
 const { ITEM_ID, JF_URL, JF_TOKEN, JF_USERID, JF_SERVERID } = process.env;
@@ -95,6 +95,42 @@ try {
   const duration = await page.evaluate(() => document.querySelector("video").duration);
   out.duration = Math.round(duration);
   if (process.env.ONLY_OPEN) throw new Error("ouverture seule");
+
+  if (process.env.LOSS) {
+    // La source meurt sans erreur (ce qu'iOS fait à une page en arrière-plan), puis la page « revient » :
+    // Lumen doit rouvrir à la position, sans passer par le serveur. Deux fois : en lecture, puis en pause.
+    out.loss = [];
+    // LOSS=4 : quatre pertes de suite, en lecture — la quatrième doit rendre la main à jellyfin-web.
+    for (const pause of process.env.LOSS === "4" ? [false, false, false, false] : [false, true]) {
+      await page.waitForTimeout(2500);
+      if (pause) await page.evaluate(() => document.querySelector("video").pause());
+      const before = await facts();
+      if (pause && process.env.TRACE_PLAY) {
+        await page.evaluate(() => {
+          const play = HTMLMediaElement.prototype.play;
+          window.__plays = [];
+          HTMLMediaElement.prototype.play = function () {
+            window.__plays.push(new Error().stack.split("\n").slice(2, 7).map((l) => l.trim().replace(/https?:\/\/[^/]+/, "").slice(0, 110)));
+            return play.call(this);
+          };
+        });
+      }
+      await page.evaluate(() => {
+        const v = document.querySelector("video");
+        v.removeAttribute("src");
+        v.load();
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      await page.waitForFunction(() => { const v = document.querySelector("video"); return v && v.readyState >= 2 && v.currentTime > 1; }, null, { timeout: 30_000 }).catch(() => {});
+      await page.waitForTimeout(2500);
+      out.loss.push({ pause, before, after: await facts() });
+      if (pause && process.env.TRACE_PLAY) out.plays = await page.evaluate(() => window.__plays);
+      if (pause) await page.evaluate(() => document.querySelector("video").play().catch(() => {}));
+    }
+    out.movesAfterLoss = await advancing();
+    out.afterLoss = await facts();
+    throw new Error("perte seule");
+  }
 
   // 2. Deux « avance rapide » coup sur coup : la seconde doit s'ajouter à la première.
   await wake();

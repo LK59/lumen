@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/LK59/lumen/main/plugin/logo.png",
     "versions": [
       {
+        "version": "0.1.10.0",
+        "changelog": "When its source is lost (a failure during playback, or the page coming back from the background), Lumen reopens the film at the same position before handing over to the regular player.",
+        "targetAbi": "10.10.0.0",
+        "sourceUrl": "https://raw.githubusercontent.com/LK59/lumen/main/releases/lumen_0.1.10.0.zip",
+        "checksum": "fe6ca1cecc71894fc8c4fefca6958de4",
+        "timestamp": "2026-11-20T23:44:40Z"
+      },
+      {
         "version": "0.1.9.0",
         "changelog": "On TVs and game consoles, playback stays with the regular player. Two quick skips in a row now add up while a seek is in progress.",
         "targetAbi": "10.10.0.0",

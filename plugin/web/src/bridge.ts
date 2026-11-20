@@ -98,6 +98,23 @@ interface State {
    * annoncé, et Lumen le lisait encore sur la foi d'un ancien verdict, « Play with Lumen » décoché.
    */
   offered: string | null;
+  /** Ce que Lumen lit en ce moment, gardé pour pouvoir le rouvrir — voir `rebuild`. */
+  current: { element: HTMLVideoElement; options: StreamInfo; verdict: Verdict } | null;
+  /** Les reconstructions récentes : leur instant et leur position, pour en borner le nombre. */
+  rebuilds: { at: number; seconds: number }[];
+  /** Une reconstruction est en cours : la position où elle rouvre, que le lecteur rend en attendant. */
+  rebuilding: number | null;
+  /** Un saut demandé pendant une reconstruction, servi dès qu'elle aboutit. */
+  seekAfterRebuild: number | null;
+  /** La dernière position jouée : une source perdue peut avoir remis l'horloge de l'élément à zéro. */
+  lastPosition: number;
+  /**
+   * Le film était-il en pause, d'après le dernier geste vu sur une source vivante ? L'élément lui-même ne
+   * le dit plus après une perte : une source retirée le remet « en pause » quoi qu'il en fût.
+   */
+  wasPaused: boolean;
+  /** La main a déjà été rendue à jellyfin-web pour ce flux : deux pannes ne font pas deux renégociations. */
+  handedOver: boolean;
   /** Ce que la lecture en cours fait d'une plage que le serveur refuse — voir `open`. */
   onRangeRefused: ((status: number) => void) | null;
 }
@@ -162,7 +179,7 @@ class LumenPlayer {
   isLocalPlayer = true;
 
   constructor(deps: Deps) {
-    states.set(this, { deps, adopted: null, playback: null, opening: 0, verdicts: new Map(), settings: new Map(), recorder: null, recorderServerId: undefined, askedAt: null, element: null, busy: 0, seekTarget: null, steps: {}, stepsFrom: 0, offered: null, onRangeRefused: null });
+    states.set(this, { deps, adopted: null, playback: null, opening: 0, verdicts: new Map(), settings: new Map(), recorder: null, recorderServerId: undefined, askedAt: null, element: null, busy: 0, seekTarget: null, steps: {}, stepsFrom: 0, offered: null, current: null, rebuilds: [], rebuilding: null, seekAfterRebuild: null, lastPosition: 0, wasPaused: false, handedOver: false, onRangeRefused: null });
     instance = this;
   }
 
@@ -336,7 +353,14 @@ function lumenPrototype(base: Adopted): object {
           return true;
         },
         get(target, property) {
-          if (property === "play") return () => open(self, target, options, verdict);
+          if (property === "play") {
+            return () => {
+              state.current = { element: target, options, verdict };
+              state.rebuilds = [];
+              state.wasPaused = false;
+              return open(self, target, options, verdict);
+            };
+          }
           // L'erreur de l'élément est l'affaire du moteur, qui a ses reprises ; il dit lui-même quand il
           // renonce (`onError`). Le lecteur de jellyfin-web, lui, basculerait au premier incident.
           if (property === "addEventListener") return (type: string, ...rest: unknown[]) => (type === "error" ? undefined : (target.addEventListener as Function)(type, ...rest));
@@ -353,6 +377,12 @@ function lumenPrototype(base: Adopted): object {
       const playback = state.playback;
       const seeking = ms !== undefined && ms !== null;
       if (seeking) timeSeek(state);
+      if (state.rebuilding !== null) {
+        // Pendant une reconstruction, il n'y a pas de moteur à qui parler : le saut attend qu'elle
+        // aboutisse, et la position rendue est celle où le film va reprendre — pas le zéro d'un élément vidé.
+        if (seeking) state.seekAfterRebuild = ms / 1000;
+        return seeking ? undefined : (state.seekAfterRebuild ?? state.rebuilding) * 1000;
+      }
       if (!playback) return base.currentTime.call(this, ms);
       if (seeking) {
         const seconds = ms / 1000;
@@ -372,7 +402,10 @@ function lumenPrototype(base: Adopted): object {
       }
       // Le moteur dit quand le saut est fini : il peut avoir posé la tête ailleurs que sur la cible.
       if (state.seekTarget !== null && !playback.seekPending) state.seekTarget = null;
-      return (state.seekTarget ?? playback.position) * 1000;
+      // Une source perdue a pu remettre l'horloge de l'élément à zéro : jellyfin-web, à qui la main
+      // est rendue, reprendrait alors au début (constaté au banc : 602 s au lieu de 619 s).
+      const position = playback.lost && playback.position === 0 ? state.lastPosition : playback.position;
+      return (state.seekTarget ?? position) * 1000;
     },
 
     /**
@@ -461,7 +494,13 @@ function englishAudio(text: string | undefined): string | undefined {
   return encoded ? `decoded here, re-encoded to ${encoded[1]}` : text;
 }
 
-function close(state: State): void {
+function close(state: State, rebuilding = false): void {
+  if (!rebuilding) {
+    state.handedOver = false;
+    state.current = null;
+    state.rebuilding = null;
+    state.seekAfterRebuild = null;
+  }
   state.opening += 1;
   state.onRangeRefused = null;
   const playback = state.playback;
@@ -563,8 +602,14 @@ function observe(state: State, element: HTMLVideoElement, options: StreamInfo): 
       waitingSince = null;
     };
     element.addEventListener("playing", resumed);
+    for (const type of ["pause", "play", "playing"]) {
+      element.addEventListener(type, () => {
+        if (state.playback && !state.playback.lost && state.rebuilding === null && element.readyState > 0) state.wasPaused = element.paused;
+      });
+    }
     element.addEventListener("seeking", () => (waitingSince = null));
     element.addEventListener("timeupdate", () => {
+      if (state.playback && !element.seeking && element.currentTime > 0) state.lastPosition = element.currentTime;
       if (lastTime !== null) state.recorder?.watched(element.currentTime - lastTime);
       lastTime = element.currentTime;
     });
@@ -742,7 +787,7 @@ async function check(self: LumenPlayer, item: JellyfinItem): Promise<Verdict | n
 }
 
 /** Ouvre Lumen sur l'élément et lance la lecture. C'est le `play()` que le lecteur de jellyfin-web attend. */
-async function open(self: LumenPlayer, element: HTMLVideoElement, options: StreamInfo, verdict: Verdict): Promise<void> {
+async function open(self: LumenPlayer, element: HTMLVideoElement, options: StreamInfo, verdict: Verdict, resume?: { seconds: number; paused: boolean }): Promise<void> {
   const state = states.get(self)!;
   const mine = ++state.opening;
   const item = options.item!;
@@ -757,13 +802,19 @@ async function open(self: LumenPlayer, element: HTMLVideoElement, options: Strea
       knownSize: source.Size ?? null,
       fileVersion: source.ETag ?? null,
       videoRangeType: video?.VideoRangeType ?? null,
-      startSeconds: (options.playerStartPositionTicks ?? 0) / 1e7,
+      startSeconds: resume?.seconds ?? (options.playerStartPositionTicks ?? 0) / 1e7,
+      // Une reconstruction ne relance pas un film que le spectateur avait mis en pause.
+      startPaused: resume?.paused ?? false,
       audioTrackNumber,
-      // Le moteur a épuisé ses reprises : c'est une erreur de lecture pour jellyfin-web, qui renégocie.
+      onWarning: (warning) => log("avertissement du moteur —", warning.code, warning.detail ?? ""),
+      // Le moteur a épuisé ses reprises sur cette source. On la rouvre à la même position, quelques
+      // fois ; au-delà, c'est une erreur de lecture pour jellyfin-web, qui renégocie et transcode.
       onError: (message, kind) => {
         if (states.get(self)!.opening !== mine) return;
         log("le moteur renonce —", message);
-        state.deps.events.trigger(self, "error", [{ type: kind === "network" ? "network" : "mediadecodeerror" }]);
+        void rebuild(self, kind === "network" ? "réseau" : "source perdue").then((rebuilt) => {
+          if (!rebuilt) handOver(self, kind === "network" ? "network" : "mediadecodeerror");
+        });
       },
     });
   // Un serveur qui refuse le fichier (403, 500…) n'est pas un réseau absent. Le moteur, lui, ne fait pas
@@ -779,7 +830,7 @@ async function open(self: LumenPlayer, element: HTMLVideoElement, options: Strea
     lastRefusal = now;
     if (refusals !== REFUSALS_BEFORE_HANDOVER) return;
     log(`le serveur refuse le fichier (statut ${status}) — lecture rendue à jellyfin-web`);
-    state.deps.events.trigger(self, "error", [{ type: "network" }]);
+    handOver(self, "network");
   };
   // La piste que le serveur a retenue (préférences du compte, choix au menu), traduite pour le moteur.
   const known = verdict.mediaSourceId === source.Id ? verdict.audioTracks : [];
@@ -797,6 +848,9 @@ async function open(self: LumenPlayer, element: HTMLVideoElement, options: Strea
     return;
   }
   step(state, "probed");
+  // jellyfin-web crée son élément avec `autoplay` : sur une source neuve, le navigateur relançait de
+  // lui-même un film rouvert en pause, sans qu'aucun `play()` ne soit appelé.
+  if (resume?.paused) element.autoplay = false;
   const playback = await probe.start(element);
   step(state, "started");
   if (state.opening !== mine) {
@@ -809,8 +863,97 @@ async function open(self: LumenPlayer, element: HTMLVideoElement, options: Strea
   step(state, "released");
   if (state.opening !== mine) return;
   log(`lecture — ${playback.diagnostics["Vidéo"] ?? "?"}, son ${playback.diagnostics["Traitement audio"] ?? "?"}`);
-  await element.play();
+  if (!resume?.paused) await element.play();
 }
+
+/** Rend la lecture à jellyfin-web : pour lui c'est une erreur de lecture, il renégocie et transcode. Une seule fois par flux. */
+function handOver(self: LumenPlayer, type: "network" | "mediadecodeerror"): void {
+  const state = states.get(self)!;
+  if (state.handedOver) return;
+  state.handedOver = true;
+  state.deps.events.trigger(self, "error", [{ type }]);
+}
+
+/** Au plus tant de reconstructions dans cette fenêtre — les bornes de Laterna (`playerLifecycle`). */
+const MAX_REBUILDS = 3;
+const REBUILD_WINDOW_MS = 3 * 60_000;
+/** Deux pertes à moins de cette distance sont « au même endroit » : on rouvre alors au-delà. */
+const SAME_PLACE_S = 2;
+
+/**
+ * Rouvre Lumen là où le film en était, sur le même élément : la source est morte (le moteur a épuisé ses
+ * reprises, ou le système l'a fermée pendant que la page était en arrière-plan), le fichier, lui, est
+ * toujours lisible. Dans Laterna c'est l'hôte qui fait ce geste ; sans lui, toute panne finissait ici en
+ * transcodage par le serveur pour le reste du film.
+ *
+ * Borné : au-delà de trois fois en trois minutes, ou si la réouverture échoue, rend faux — à l'appelant
+ * de passer la main à jellyfin-web. Une perte répétée au même endroit rouvre à l'image clé suivante.
+ */
+async function rebuild(self: LumenPlayer, why: string): Promise<boolean> {
+  const state = states.get(self)!;
+  const current = state.current;
+  const playback = state.playback;
+  if (!current || !playback || state.rebuilding !== null) return state.rebuilding !== null;
+  const now = performance.now();
+  state.rebuilds = state.rebuilds.filter((past) => now - past.at < REBUILD_WINDOW_MS);
+  if (state.rebuilds.length >= MAX_REBUILDS) {
+    log(`${MAX_REBUILDS} reconstructions en ${REBUILD_WINDOW_MS / 60_000} minutes — lecture rendue à jellyfin-web`);
+    return false;
+  }
+  let seconds = playback.position > 0 ? playback.position : state.lastPosition;
+  const last = state.rebuilds[state.rebuilds.length - 1];
+  if (last && Math.abs(last.seconds - seconds) < SAME_PLACE_S) seconds = playback.nextKeyframeAfter(seconds) ?? seconds;
+  state.rebuilds.push({ at: now, seconds });
+  // En pause, il le reste : par le spectateur, ou par le système quand la page est passée en arrière-plan.
+  const paused = state.wasPaused;
+  log(`reconstruction (${why}) à ${seconds.toFixed(1)} s${paused ? ", en pause" : ""} — moteur ${playback.position.toFixed(1)} s, dernière position jouée ${state.lastPosition.toFixed(1)} s`);
+  state.recorder?.rebuilt();
+  state.rebuilding = seconds;
+  close(state, true);
+  try {
+    // Sans réseau, rouvrir échouerait aussitôt : on attend son retour, comme le fait le moteur.
+    if (navigator.onLine === false) await new Promise<void>((resolve) => window.addEventListener("online", () => resolve(), { once: true }));
+    if (state.current !== current) return true;
+    state.busy += 1;
+    try {
+      await open(self, current.element, current.options, current.verdict, { seconds, paused });
+    } finally {
+      state.busy -= 1;
+    }
+    if (state.current !== current) return true;
+    const wanted = state.seekAfterRebuild;
+    state.rebuilding = null;
+    state.seekAfterRebuild = null;
+    if (wanted !== null) void state.playback?.seek(wanted);
+    return true;
+  } catch (error) {
+    if (state.current !== current) return true;
+    state.rebuilding = null;
+    log("reconstruction impossible —", error instanceof Error ? error.message : error);
+    return false;
+  }
+}
+
+/**
+ * Le retour au premier plan. Sur iPhone, le système peut fermer la source d'une page restée en
+ * arrière-plan, sans erreur : le moteur le sait (`lost`) mais n'a personne à qui le dire tant qu'aucun
+ * envoi n'échoue, et l'image restait figée. Regardé au retour, puis un peu après — la fermeture arrive
+ * parfois juste derrière l'événement (les 400 ms de Laterna, `useNativeRecovery`).
+ */
+function checkAfterReturn(): void {
+  if (document.visibilityState !== "visible") return;
+  const look = () => {
+    const state = instance ? states.get(instance) : null;
+    if (!instance || !state?.playback?.lost || state.rebuilding !== null) return;
+    const self = instance as LumenPlayer;
+    void rebuild(self, "retour au premier plan").then((rebuilt) => {
+      if (!rebuilt) handOver(self, "mediadecodeerror");
+    });
+  };
+  look();
+  setTimeout(look, 400);
+}
+document.addEventListener("visibilitychange", checkAfterReturn);
 
 // --- la porte d'entrée de jellyfin-web ----------------------------------------------------------
 

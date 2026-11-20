@@ -38,6 +38,8 @@ export interface PlaybackEntry {
   waitsMs: number;
   /** Les secondes de film réellement jouées. */
   watchedSeconds: number;
+  /** Les fois où Lumen a rouvert sa source à la position, après une panne ou un retour d'arrière-plan. */
+  rebuilds: number;
   /** Une erreur de lecture a-t-elle fait renégocier le flux ? */
   errors: number;
 }
@@ -52,7 +54,7 @@ export class PlaybackRecorder {
   private entry: PlaybackEntry;
 
   constructor(itemId: string, title: string) {
-    this.entry = { itemId, title, player: "jellyfin", playMethod: null, transcodeReasons: null, refusal: null, audio: null, firstFrameMs: null, openingSteps: null, seeksMs: [], streamChangesMs: [], waits: 0, waitsMs: 0, watchedSeconds: 0, errors: 0 };
+    this.entry = { itemId, title, player: "jellyfin", playMethod: null, transcodeReasons: null, refusal: null, audio: null, firstFrameMs: null, openingSteps: null, seeksMs: [], streamChangesMs: [], waits: 0, waitsMs: 0, watchedSeconds: 0, rebuilds: 0, errors: 0 };
   }
 
   get itemId(): string {
@@ -96,6 +98,10 @@ export class PlaybackRecorder {
   watched(seconds: number): void {
     // Un écart d'horloge de plus de deux secondes entre deux relevés est un saut, pas du film regardé.
     if (seconds > 0 && seconds < 2) this.entry.watchedSeconds += seconds;
+  }
+
+  rebuilt(): void {
+    this.entry.rebuilds += 1;
   }
 
   error(): void {
