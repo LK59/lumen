@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/LK59/lumen/main/plugin/logo.png",
     "versions": [
       {
+        "version": "0.1.8.0",
+        "changelog": "Seeking inside what is already loaded no longer reloads it. The playback log records where the opening time goes.",
+        "targetAbi": "10.10.0.0",
+        "sourceUrl": "https://raw.githubusercontent.com/LK59/lumen/main/releases/lumen_0.1.8.0.zip",
+        "checksum": "8e5182eb83255213af17b1879dcf9999",
+        "timestamp": "2026-11-20T22:52:31Z"
+      },
+      {
         "version": "0.1.7.0",
         "changelog": "iPhone and iPad: sound now plays when the device is in silent mode, as in any video app.",
         "targetAbi": "10.10.0.0",

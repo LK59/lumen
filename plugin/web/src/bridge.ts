@@ -75,6 +75,13 @@ interface State {
   recorderServerId: string | undefined;
   /** L'instant où jellyfin-web a commencé à préparer le flux en cours (sa demande de profil). */
   askedAt: number | null;
+  /**
+   * Les étapes de l'ouverture en cours, en millisecondes depuis `askedAt`, pour le journal. La première
+   * image seule ne disait pas où le temps passait : trois fichiers différents ouverts en 3 545, 3 549 et
+   * 3 553 ms (Chrome, 20/11/2026) montraient un délai fixe sans qu'on puisse dire lequel.
+   */
+  steps: Record<string, number>;
+  stepsFrom: number;
   /** L'élément de la lecture en cours, et ce qui fait qu'un arrêt de l'image n'est pas une attente. */
   element: HTMLVideoElement | null;
   busy: number;
@@ -149,7 +156,7 @@ class LumenPlayer {
   isLocalPlayer = true;
 
   constructor(deps: Deps) {
-    states.set(this, { deps, adopted: null, playback: null, opening: 0, verdicts: new Map(), settings: new Map(), recorder: null, recorderServerId: undefined, askedAt: null, element: null, busy: 0, offered: null, onRangeRefused: null });
+    states.set(this, { deps, adopted: null, playback: null, opening: 0, verdicts: new Map(), settings: new Map(), recorder: null, recorderServerId: undefined, askedAt: null, element: null, busy: 0, steps: {}, stepsFrom: 0, offered: null, onRangeRefused: null });
     instance = this;
   }
 
@@ -247,12 +254,18 @@ function lumenPrototype(base: Adopted): object {
       // Le chronomètre du journal part d'ici : c'est le premier geste de jellyfin-web vers son lecteur, et
       // la vérification du fichier par Lumen, qui suit, fait partie de ce que le spectateur attend.
       state.askedAt = performance.now();
+      state.stepsFrom = state.askedAt;
+      state.steps = {};
       state.offered = null;
       if (options?.isRetry) state.recorder?.error();
       const profile = await base.getDeviceProfile.call(this, item, options);
+      step(state, "profile");
       if (!config.enabled || options?.isRetry || !eligible(item)) return profile;
-      if (!(await settings(state, item)).enabled) return profile;
+      const allowed = (await settings(state, item)).enabled;
+      step(state, "settings");
+      if (!allowed) return profile;
       const verdict = await check(this, item);
+      step(state, "check");
       if (!verdict?.ok) return profile;
       state.offered = item.Id ?? null;
       return lumenProfile(profile);
@@ -294,6 +307,7 @@ function lumenPrototype(base: Adopted): object {
       const state = states.get(this)!;
       // Un changement de flux rappelle cette méthode sans arrêt préalable : ce qui jouait se ferme d'abord.
       close(state);
+      step(state, "negotiated");
       observe(state, element, options);
       alignSubtitles(state, element);
       const verdict = options.item?.Id ? state.verdicts.get(options.item.Id) : undefined;
@@ -327,7 +341,14 @@ function lumenPrototype(base: Adopted): object {
       if (seeking) timeSeek(state);
       if (!playback) return base.currentTime.call(this, ms);
       if (seeking) {
-        void playback.seek(ms / 1000);
+        const seconds = ms / 1000;
+        const element = state.element;
+        // Une cible déjà chargée : poser la tête suffit, et le moteur sert ce geste sans rien relire
+        // (`onSeeking`, chemin « mémoire » — c'est par là que passent les commandes de Laterna). Son
+        // `seek()`, lui, vide les tampons et recharge, même pour dix secondes déjà là. Seulement hors
+        // d'un saut en cours : celui-ci va vider les tampons, et le dernier geste doit l'emporter.
+        if (element && !playback.seekPending && !element.seeking && loadedAt(element, seconds)) element.currentTime = seconds;
+        else void playback.seek(seconds);
         return undefined;
       }
       return playback.position * 1000;
@@ -504,6 +525,7 @@ function observe(state: State, element: HTMLVideoElement, options: StreamInfo): 
         transcodeReasons: transcodeReasonsOf(options.url),
         audio: state.playback?.diagnostics["Traitement audio"] ?? null,
       });
+      if (!recorder.opened) recorder.opening({ ...state.steps });
       recorder.frame(at - startedAt);
     });
     if (watched.has(element)) return;
@@ -567,6 +589,23 @@ function alignSubtitles(state: State, element: HTMLVideoElement): void {
       /* un sous-titre mal calé vaut mieux qu'une lecture interrompue */
     }
   });
+}
+
+/** Note une étape de l'ouverture — voir `State.steps`. La première image clôt le relevé. */
+function step(state: State, name: string): void {
+  if (!(name in state.steps)) state.steps[name] = Math.round(performance.now() - state.stepsFrom);
+}
+
+/** La marge gardée avant la fin d'une zone chargée : y poser la tête la laisserait aussitôt à sec. */
+const LOADED_MARGIN_S = 1;
+
+/** L'élément a-t-il déjà cette position en mémoire, avec de quoi jouer derrière ? */
+function loadedAt(element: HTMLVideoElement, seconds: number): boolean {
+  const spans = element.buffered;
+  for (let i = 0; i < spans.length; i += 1) {
+    if (seconds >= spans.start(i) && seconds <= spans.end(i) - LOADED_MARGIN_S) return true;
+  }
+  return false;
 }
 
 /** Un saut : de l'ordre à la première image présentée après lui. */
@@ -686,6 +725,7 @@ async function open(self: LumenPlayer, element: HTMLVideoElement, options: Strea
   const mine = ++state.opening;
   const item = options.item!;
   const source = options.mediaSource!;
+  step(state, "play");
   const engine = await loadCore();
   const api = hostFor(state, engine, item);
   const video = source.MediaStreams?.find((s) => s.Type === "Video");
@@ -734,7 +774,9 @@ async function open(self: LumenPlayer, element: HTMLVideoElement, options: Strea
     probe.discard();
     return;
   }
+  step(state, "probed");
   const playback = await probe.start(element);
+  step(state, "started");
   if (state.opening !== mine) {
     playback.destroy();
     return;
@@ -742,6 +784,7 @@ async function open(self: LumenPlayer, element: HTMLVideoElement, options: Strea
   state.playback = playback;
   // Un départ de zéro part avec sa première image, pas avant (`openingHold`, contrat du moteur).
   await (playback.openingHold() ?? Promise.resolve());
+  step(state, "released");
   if (state.opening !== mine) return;
   log(`lecture — ${playback.diagnostics["Vidéo"] ?? "?"}, son ${playback.diagnostics["Traitement audio"] ?? "?"}`);
   await element.play();

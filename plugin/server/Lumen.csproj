@@ -5,9 +5,9 @@
     <RootNamespace>Lumen.Jellyfin</RootNamespace>
     <AssemblyName>Lumen</AssemblyName>
     <!-- Quatre nombres : Jellyfin compare les versions de plugin ainsi, et nomme le dossier d'après elles. -->
-    <Version>0.1.7.0</Version>
+    <Version>0.1.8.0</Version>
     <!-- Ce que cette version change, en une ligne : repris dans le manifeste du dépôt de plugins. -->
-    <PackageReleaseNotes>iPhone and iPad: sound now plays when the device is in silent mode, as in any video app.</PackageReleaseNotes>
+    <PackageReleaseNotes>Seeking inside what is already loaded no longer reloads it. The playback log records where the opening time goes.</PackageReleaseNotes>
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>

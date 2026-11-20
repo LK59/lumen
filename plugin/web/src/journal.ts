@@ -23,6 +23,12 @@ export interface PlaybackEntry {
   audio: string | null;
   /** Du geste de lecture à la première image. Null si aucune image n'est venue. */
   firstFrameMs: number | null;
+  /**
+   * Où le temps de l'ouverture est passé : chaque étape en millisecondes depuis le geste de lecture
+   * (`profile`, `settings`, `check` : la vérification du fichier ; `negotiated` : le serveur a répondu ;
+   * `play`, `probed`, `started`, `released` : l'ouverture du moteur). Null avant la première image.
+   */
+  openingSteps: Record<string, number> | null;
   /** Chaque saut, de l'ordre à la première image après lui. */
   seeksMs: number[];
   /** Chaque changement de flux en cours de lecture (piste son, qualité, repli) jusqu'à l'image suivante. */
@@ -46,7 +52,7 @@ export class PlaybackRecorder {
   private entry: PlaybackEntry;
 
   constructor(itemId: string, title: string) {
-    this.entry = { itemId, title, player: "jellyfin", playMethod: null, transcodeReasons: null, refusal: null, audio: null, firstFrameMs: null, seeksMs: [], streamChangesMs: [], waits: 0, waitsMs: 0, watchedSeconds: 0, errors: 0 };
+    this.entry = { itemId, title, player: "jellyfin", playMethod: null, transcodeReasons: null, refusal: null, audio: null, firstFrameMs: null, openingSteps: null, seeksMs: [], streamChangesMs: [], waits: 0, waitsMs: 0, watchedSeconds: 0, errors: 0 };
   }
 
   get itemId(): string {
@@ -71,6 +77,10 @@ export class PlaybackRecorder {
   frame(ms: number): void {
     if (this.entry.firstFrameMs === null) this.entry.firstFrameMs = Math.round(ms);
     else if (this.entry.streamChangesMs.length < KEPT) this.entry.streamChangesMs.push(Math.round(ms));
+  }
+
+  opening(steps: Record<string, number>): void {
+    this.entry.openingSteps = steps;
   }
 
   seek(ms: number): void {
