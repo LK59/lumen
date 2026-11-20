@@ -29,6 +29,28 @@ and in the playback log.
 
 ![Lumen settings](plugin/screenshot.png)
 
+## Measured
+
+On an iPhone, in the Jellyfin iOS app, with the plugin's own playback log: eight files of a real library, each
+played with Lumen and with the regular player, 24 playbacks and 58 seeks in all. Medians:
+
+| | Lumen | Regular player | |
+|---|---|---|---|
+| First frame | 1.0 s | 3.8 s | about 4 times sooner |
+| Seek | 1.0 s | 2.7 s | about 3 times faster |
+| ffmpeg CPU on the server, per playback | 0.6 s | 7.5 s | |
+
+What the server was doing for the regular player makes the difference:
+
+- **Files that only needed a new container** (five of them, HEVC with Dolby audio the iPhone plays natively,
+  some in Dolby Vision): the first frame came 4 times sooner and seeks were twice as fast. The server spent
+  little CPU either way, since it was copying streams.
+- **Files whose audio the server had to transcode** (DTS and TrueHD, one of them 4K): the first frame came 2.5
+  times sooner, seeks were 4.5 times faster, and ffmpeg went from 24 s of CPU per playback to none.
+
+One device, one server, one or two playbacks per file and per player: enough to show the direction, not to
+promise a figure. The playback log gives you the same comparison on your own library and devices.
+
 ## A complete engine, light on the client
 
 Lumen handles the whole chain that feeds the `<video>` element. It reads the file by byte ranges, demuxes
