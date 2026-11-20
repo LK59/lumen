@@ -19,8 +19,8 @@ The server stops working for most of what you play:
 - **Seeking is faster**, because there is no stream to restart on the server.
 - **The server's CPU stays idle**, since it only serves bytes.
 
-A file Lumen cannot play is handed back to the regular Jellyfin player, with the reason logged. Playback is never
-worse than without the plugin.
+Anything else is played by the regular Jellyfin player, exactly as before, with the reason logged. You keep
+everything Jellyfin already does, and gain on the rest.
 
 ![Lumen settings and playback log](plugin/screenshot.png)
 
@@ -48,7 +48,7 @@ its regular player takes over, transcoding included, at the same position.
 ## What it can play
 
 A file plays through Lumen when the browser can decode its video codec and Lumen can carry its container and
-audio. Lumen never decodes video.
+audio. The video is always decoded by the browser.
 
 | | Played through Lumen | Handed back to the regular player |
 |---|---|---|
@@ -64,12 +64,11 @@ HEVC decoder gets the regular player for HEVC files.
 
 Good to know:
 
-- **HDR on an SDR screen** is converted by the browser and the system, as for any HDR video they play. Lumen does
-  no tone mapping of its own. It does adjust one thing: on Chrome and Edge under Windows or Linux with an SDR
-  screen, it lowers the peak brightness the file announces, because those browsers otherwise darken the whole
-  picture of a film mastered very bright.
+- **HDR on an SDR screen** is converted by the browser and the system, as for any HDR video they play. Lumen
+  helps them on one point: on Chrome and Edge under Windows or Linux with an SDR screen, it lowers the peak
+  brightness the file announces, so that a film mastered very bright is not shown too dark.
 - **Multichannel audio** that had to be decoded stays multichannel after re-encoding. On Apple devices, 7.1 is
-  folded to 5.1. For Atmos and DTS:X, the channel bed is decoded and the objects are not rendered.
+  folded to 5.1. For Atmos and DTS:X, you get the 5.1 or 7.1 channel bed.
 - **Audio that starts after the picture** is padded with silence, so playback starts on the first frame.
 - **Changing the audio track** reopens the stream on the new track at the current position.
 - **Subtitles** are the web client's own, fetched from the server as usual. Text subtitles are aligned with the
@@ -124,15 +123,15 @@ Dashboard > Lumen:
 
 The browser console also says what Lumen is doing (`[Lumen] ...`), including why it declined a file.
 
-## Limits and status
+## Where it applies
 
 - Lumen acts in the Jellyfin web client: Chrome, Firefox and Safari. In the Jellyfin mobile apps it applies
   where the app plays through the web player, which on Android means only when the web player is selected in
   the app's settings. Apps with their own native player (TV apps, Swiftfin and others) are not affected.
-- The mobile apps have not been tested yet.
-- It relies on the internals of the web client's video player, which has no public extension interface. If a
-  future version of the web client can no longer be extended this way, Lumen turns itself off and says so in the
-  console, and the web client plays as it does without the plugin.
+- Reports from the mobile apps are welcome: they have not been tested yet.
+- Lumen plugs into the web client's own video player and checks at startup that it is the one it knows. If a
+  future version of the web client changes in a way Lumen does not recognise, it steps aside, says so in the
+  console, and the web client plays as usual.
 - If the server refuses the file during playback, Lumen hands over to the regular player within seconds. During
   a real network outage it waits for the network to come back, for up to 48 seconds, and resumes by itself.
 
