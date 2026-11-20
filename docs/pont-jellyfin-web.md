@@ -67,11 +67,14 @@ Un script classique (`lumen-jellyfin.js`), exécuté avant ceux de jellyfin-web.
   demandée (un passage de ffmpeg sans décodage, puis mise en cache) et jellyfin-web l'affiche. Le moteur sait
   lire les sous-titres du fichier lui-même ; le brancher supprimerait ce dernier appel à ffmpeg, au prix d'un
   second affichage de sous-titres à maintenir.
-- **L'image a ~0,2 s de retard sur l'horloge de l'élément** (décalage de présentation du remux). La position
-  rapportée au serveur en tient compte ; les sous-titres de jellyfin-web, calés sur l'horloge de l'élément, sont
-  en avance de cette durée.
-- **Une coupure réseau** est rendue à jellyfin-web comme une erreur de lecture. L'écran « connexion perdue » de
-  Laterna, qui attend le retour du réseau, n'a pas d'équivalent ici.
+- **L'image a ~0,2 s de retard sur l'horloge de l'élément** (décalage de présentation du remux), et les
+  sous-titres que jellyfin-web reçoit du serveur sont datés sur l'horloge du fichier. Le pont décale donc de ce
+  retard chaque réplique posée dans une piste de texte du navigateur. Les sous-titres ASS et PGS, dessinés par
+  les moteurs de jellyfin-web sur leur propre horloge, gardent cette avance.
+- **Un serveur qui refuse le fichier n'est pas un réseau absent.** Le moteur ne fait pas la différence et attend
+  48 s que le réseau revienne. Le pont, prévenu de chaque refus (`rangeRefused`), rend la main à jellyfin-web au
+  quatrième refus rapproché : il sait transcoder, lui. Une vraie coupure garde la patience du moteur, puis est
+  rendue à jellyfin-web comme une erreur de lecture.
 - **La piste son désignée par Jellyfin** est retrouvée par son rang parmi les flux son du fichier (les index de
   Jellyfin et les numéros de piste du conteneur ne se correspondent pas).
 
@@ -80,3 +83,17 @@ Un script classique (`lumen-jellyfin.js`), exécuté avant ceux de jellyfin-web.
 Le flux `Videos/{id}/stream?static=true` est servi **sans authentification** par Jellyfin 12.4.0 (mesuré : 206
 sans aucun en-tête). Le pont envoie tout de même `Authorization: MediaBrowser Token="…"` sur chaque requête, et
 ne met jamais le jeton dans l'adresse.
+
+## Versions de Jellyfin
+
+Le pont et le plugin ont été essayés sur un serveur vierge de chaque version, avec le même parcours (lecture,
+saut, piste son, sous-titres, reprise, refus) : **10.10.7, 10.11.11, 12.0, 12.2 et 12.4**. Un seul assemblage,
+compilé pour 10.10 (.NET 8), se charge sur toutes : ce que le plugin demande au serveur n'a pas changé de forme,
+et un assemblage .NET 8 tourne sous les .NET suivants. Les versions antérieures à 10.10 n'ont pas été essayées.
+
+## Sous une politique de sécurité stricte
+
+Le décodage du son demande `worker-src blob:` et `script-src 'wasm-unsafe-eval'`. Sans eux (essayé avec une
+politique qui n'autorise que l'origine du serveur), le moteur refuse les fichiers dont le son doit être décodé,
+avec un motif nommé, et jellyfin-web les lit ; ceux dont le son se copie restent lus par Lumen.
+

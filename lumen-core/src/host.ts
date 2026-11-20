@@ -40,9 +40,16 @@ export interface LumenHost {
    */
   sessionEnded: ((res: Response) => boolean) | null;
   linkShaper: LinkShaper | null;
+  /**
+   * Le serveur a répondu à une plage par autre chose que la plage (un 403, un 500…). Pour le moteur,
+   * c'est un échec comme une coupure : il redemande, puis patiente en attendant que le réseau revienne.
+   * Un hôte qui a un autre lecteur sous la main peut préférer ne pas attendre : un serveur qui répond
+   * « non » n'est pas un réseau absent. Prévenu ici, il décide ; rien ne change dans le moteur.
+   */
+  rangeRefused: ((status: number) => void) | null;
 }
 
-const DEFAULTS: LumenHost = { build: "dev", requestHeaders: null, sessionEnded: null, linkShaper: null };
+const DEFAULTS: LumenHost = { build: "dev", requestHeaders: null, sessionEnded: null, linkShaper: null, rangeRefused: null };
 
 let host: LumenHost = { ...DEFAULTS };
 
@@ -81,6 +88,14 @@ export function hostSaysSessionEnded(res: Response): boolean {
     return res.status === 401 && host.sessionEnded?.(res) === true;
   } catch {
     return false;
+  }
+}
+
+export function noteRangeRefused(status: number): void {
+  try {
+    host.rangeRefused?.(status);
+  } catch {
+    // Prévenir l'hôte ne doit pas changer ce qui arrive à la plage.
   }
 }
 

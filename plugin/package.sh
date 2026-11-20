@@ -19,7 +19,11 @@ set -eu
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 VERSION=$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' plugin/server/Lumen.csproj)
-ABI=$(sed -n 's:.*<JellyfinVersion>\(.*\)</JellyfinVersion>.*:\1:p' plugin/server/Directory.Build.props).0
+# La version de Jellyfin contre laquelle l'assemblage est compilé — la plus ancienne qu'il accepte de
+# servir : Jellyfin charge un plugin dont le `targetAbi` ne dépasse pas sa propre version.
+JELLYFIN_VERSION="${JELLYFIN_VERSION:-$(sed -n 's:.*<JellyfinVersion[^>]*>\(.*\)</JellyfinVersion>.*:\1:p' plugin/server/Directory.Build.props)}"
+JELLYFIN_FRAMEWORK="${JELLYFIN_FRAMEWORK:-$(sed -n 's:.*<JellyfinFramework[^>]*>\(.*\)</JellyfinFramework>.*:\1:p' plugin/server/Directory.Build.props)}"
+ABI="$JELLYFIN_VERSION.0"
 GUID=$(sed -n 's/.*Guid\.Parse("\([^"]*\)").*/\1/p' plugin/server/Plugin.cs)
 DOTNET_IMAGE="${DOTNET_IMAGE:-mcr.microsoft.com/dotnet/sdk:10.0}"
 REPO_URL="${REPO_URL:-https://exemple.invalid/lumen}"
@@ -35,13 +39,13 @@ echo "— moteur"
 node lumen-core '[ -d node_modules ] || npm install --no-audit --no-fund >/dev/null; node build.mjs >/dev/null'
 echo "— pont"
 node plugin/web '[ -d node_modules ] || npm install --no-audit --no-fund >/dev/null; node build.mjs'
-echo "— assemblage ($DOTNET_IMAGE, Jellyfin ${ABI%.0})"
+echo "— assemblage ($DOTNET_IMAGE, Jellyfin $JELLYFIN_VERSION, $JELLYFIN_FRAMEWORK)"
 # Le dossier du SDK (cache NuGet compris), gardé d'une construction à l'autre. Créé ici : monté sans
 # exister, Docker le créerait au nom de root et le SDK, lancé sous notre compte, ne pourrait pas y écrire.
 mkdir -p plugin/.nuget
 docker run --rm --user "$ME" -e HOME=/home/build -e DOTNET_CLI_TELEMETRY_OPTOUT=1 -e DOTNET_NOLOGO=1 \
   -v "$ROOT/plugin/server":/src -v "$ROOT/plugin/.nuget":/home/build -w /src "$DOTNET_IMAGE" \
-  dotnet build -c Release -o /src/bin/out --nologo -v quiet
+  sh -c "rm -rf /src/obj /src/bin && dotnet build -c Release -o /src/bin/out --nologo -v quiet -p:JellyfinVersion=$JELLYFIN_VERSION -p:JellyfinFramework=$JELLYFIN_FRAMEWORK"
 
 OUT="plugin/dist/Lumen_$VERSION"
 rm -rf plugin/dist && mkdir -p "$OUT/web"

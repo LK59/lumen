@@ -17,6 +17,10 @@
                         audio itself, and the server only sends bytes. A file Lumen cannot play is played as before,
                         by the regular player.
                     </p>
+                    <div id="LumenVersion" class="fieldDescription" style="margin: 0 0 1.5em;">
+                        <span id="LumenVersionText"></span>
+                        <button is="emby-button" type="button" id="LumenUpdate" class="raised button-submit emby-button" style="display: none; margin-left: 1em;"><span></span></button>
+                    </div>
                     <div class="checkboxContainer checkboxContainer-withDescription">
                         <label class="emby-checkbox-label">
                             <input id="LumenEnabled" type="checkbox" is="emby-checkbox" />
@@ -206,6 +210,69 @@
                     });
                 }
 
+                // --- la version --------------------------------------------------------------------
+
+                // Mettre à jour un plugin demande d'ordinaire trois écrans (le catalogue, la fiche du plugin, puis
+                // le redémarrage du serveur, qu'il faut penser à faire). Ici : la version installée, celle que le
+                // dépôt propose, et un bouton qui installe puis redémarre.
+                var newer = function (a, b) {
+                    var x = String(a).split('.').map(Number), y = String(b).split('.').map(Number);
+                    for (var i = 0; i < 4; i++) { if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0); }
+                    return false;
+                };
+
+                function restart(text) {
+                    $('#LumenUpdate').style.display = 'none';
+                    $('#LumenVersionText').textContent = text;
+                    ApiClient.restartServer();
+                }
+
+                function loadVersion() {
+                    var text = $('#LumenVersionText');
+                    var button = $('#LumenUpdate');
+                    button.style.display = 'none';
+                    return Promise.all([
+                        ApiClient.getInstalledPlugins(),
+                        ApiClient.ajax({ type: 'GET', url: ApiClient.getUrl('Packages'), dataType: 'json' }).catch(function () { return []; })
+                    ]).then(function (results) {
+                        var mine = results[0].filter(function (plugin) { return compact(plugin.Id) === compact(pluginId); });
+                        var active = mine.filter(function (plugin) { return plugin.Status === 'Active'; })[0] || mine[0];
+                        var waiting = mine.filter(function (plugin) { return plugin.Status === 'Restart'; })[0];
+                        var offered = results[1].filter(function (pkg) { return compact(pkg.guid) === compact(pluginId); })[0];
+                        var latest = offered && offered.versions && offered.versions[0];
+                        var show = function (label, action) {
+                            button.querySelector('span').textContent = label;
+                            button.onclick = action;
+                            button.style.display = '';
+                        };
+                        if (waiting) {
+                            text.textContent = 'Version ' + waiting.Version + ' is installed and will be used after Jellyfin restarts.';
+                            show('Restart Jellyfin', function () { restart('Jellyfin is restarting. Reload this page in a minute.'); });
+                        } else if (active && latest && newer(latest.version, active.Version)) {
+                            text.textContent = 'Version ' + active.Version + ' is running. Version ' + latest.version + ' is available' + (latest.changelog ? ': ' + latest.changelog : '.');
+                            show('Update and restart Jellyfin', function () {
+                                button.style.display = 'none';
+                                text.textContent = 'Installing version ' + latest.version + '...';
+                                ApiClient.ajax({ type: 'POST', url: ApiClient.getUrl('Packages/Installed/' + encodeURIComponent(offered.name), { assemblyGuid: pluginId, version: latest.version }) }).then(function () {
+                                    // L'installation se fait en arrière-plan : on attend que le serveur tienne la nouvelle version.
+                                    var tries = 0;
+                                    var wait = function () {
+                                        ApiClient.getInstalledPlugins().then(function (plugins) {
+                                            var there = plugins.some(function (plugin) { return compact(plugin.Id) === compact(pluginId) && plugin.Version === latest.version; });
+                                            if (there) return restart('Version ' + latest.version + ' is installed. Jellyfin is restarting. Reload this page in a minute.');
+                                            if (++tries > 40) { text.textContent = 'The update did not finish. Check the server log, or install it from Dashboard > Plugins.'; return; }
+                                            setTimeout(wait, 1500);
+                                        });
+                                    };
+                                    wait();
+                                }, function () { text.textContent = 'The update could not be started. Install it from Dashboard > Plugins.'; });
+                            });
+                        } else if (active) {
+                            text.textContent = 'Version ' + active.Version + ' is running' + (latest ? ', and is the latest.' : '.');
+                        }
+                    }).catch(function () { text.textContent = ''; });
+                }
+
                 // --- les réglages -------------------------------------------------------------------
 
                 page.addEventListener('pageshow', function () {
@@ -233,6 +300,7 @@
                             list.appendChild(label);
                         });
                         showUsers();
+                        loadVersion();
                         return loadJournal();
                     }).then(Dashboard.hideLoadingMsg, Dashboard.hideLoadingMsg);
                 });

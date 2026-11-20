@@ -78,6 +78,8 @@ interface State {
   /** L'élément de la lecture en cours, et ce qui fait qu'un arrêt de l'image n'est pas une attente. */
   element: HTMLVideoElement | null;
   busy: number;
+  /** Ce que la lecture en cours fait d'une plage que le serveur refuse — voir `open`. */
+  onRangeRefused: ((status: number) => void) | null;
 }
 
 /** Ce que le plugin répond pour un compte : Lumen lit-il pour lui, et ses lectures sont-elles journalisées ? */
@@ -97,6 +99,10 @@ let instance: object | null = null;
 
 /** Un refus vaut dix minutes : le temps d'une séance de navigation, pas celui d'un fichier remplacé. */
 const VERDICT_MS = 10 * 60_000;
+/** Le nombre de refus rapprochés du serveur après lequel la lecture est rendue à jellyfin-web. */
+const REFUSALS_BEFORE_HANDOVER = 4;
+/** Au-delà de ce délai sans refus, le compte repart de zéro : un incident passager n'est pas une panne. */
+const REFUSAL_WINDOW_MS = 10_000;
 /** Le temps pendant lequel une réponse des réglages vaut pour les questions qui suivent : une préparation de flux. */
 const SETTINGS_MS = 5_000;
 /** Au-delà, la vérification n'a pas répondu à temps : on lit comme jellyfin-web plutôt que de faire attendre. */
@@ -136,7 +142,7 @@ class LumenPlayer {
   isLocalPlayer = true;
 
   constructor(deps: Deps) {
-    states.set(this, { deps, adopted: null, playback: null, opening: 0, verdicts: new Map(), settings: new Map(), recorder: null, recorderServerId: undefined, askedAt: null, element: null, busy: 0 });
+    states.set(this, { deps, adopted: null, playback: null, opening: 0, verdicts: new Map(), settings: new Map(), recorder: null, recorderServerId: undefined, askedAt: null, element: null, busy: 0, onRangeRefused: null });
     instance = this;
   }
 
@@ -278,6 +284,7 @@ function lumenPrototype(base: Adopted): object {
       // Un changement de flux rappelle cette méthode sans arrêt préalable : ce qui jouait se ferme d'abord.
       close(state);
       observe(state, element, options);
+      alignSubtitles(state, element);
       const verdict = options.item?.Id ? state.verdicts.get(options.item.Id) : undefined;
       if (!config.enabled || options.playMethod !== "DirectPlay" || !verdict?.ok || !options.mediaSource?.Id || !options.item?.Id) {
         return base.setCurrentSrc.call(this, element, options);
@@ -365,6 +372,7 @@ function englishAudio(text: string | undefined): string | undefined {
 
 function close(state: State): void {
   state.opening += 1;
+  state.onRangeRefused = null;
   const playback = state.playback;
   state.playback = null;
   try {
@@ -472,6 +480,46 @@ function observe(state: State, element: HTMLVideoElement, options: StreamInfo): 
   }
 }
 
+const aligned = new WeakSet<HTMLVideoElement>();
+const shifted = new WeakSet<TextTrackCue>();
+
+/**
+ * Cale les sous-titres de jellyfin-web sur l'image quand Lumen lit.
+ *
+ * Le remux pose l'image sur l'horloge du lecteur avec un retard fixe sur celle du fichier (les images
+ * sont réordonnées avant d'être montrées : un quart de seconde sur du HEVC). Les sous-titres que
+ * jellyfin-web reçoit du serveur sont datés sur l'horloge du fichier ; affichés tels quels, ils
+ * devançaient l'image d'autant. Chaque réplique est donc décalée de ce retard, une fois.
+ *
+ * Seulement les répliques posées dans une piste de texte du navigateur, ce que fait jellyfin-web pour
+ * les sous-titres texte sur ordinateur. Les sous-titres dessinés par ses propres moteurs (ASS, PGS) ont
+ * leur horloge à eux, hors de portée d'ici : ils gardent cette avance.
+ */
+function alignSubtitles(state: State, element: HTMLVideoElement): void {
+  if (aligned.has(element)) return;
+  aligned.add(element);
+  element.addEventListener("timeupdate", () => {
+    try {
+      const delay = state.playback?.presentationDelay ?? 0;
+      if (!(delay > 0.02)) return;
+      for (const track of Array.from(element.textTracks)) {
+        const cues = track.cues;
+        // Déjà fait pour cette piste : la première et la dernière réplique le disent sans tout relire.
+        if (!cues || cues.length === 0 || (shifted.has(cues[0]!) && shifted.has(cues[cues.length - 1]!))) continue;
+        for (const cue of Array.from(cues)) {
+          if (shifted.has(cue)) continue;
+          shifted.add(cue);
+          // La fin d'abord : une réplique ne doit jamais, même un instant, finir avant de commencer.
+          cue.endTime += delay;
+          cue.startTime += delay;
+        }
+      }
+    } catch {
+      /* un sous-titre mal calé vaut mieux qu'une lecture interrompue */
+    }
+  });
+}
+
 /** Un saut : de l'ordre à la première image présentée après lui. */
 function timeSeek(state: State): void {
   const recorder = state.recorder;
@@ -515,7 +563,11 @@ function flush(state: State): void {
 function hostFor(state: State, core: Core, item: JellyfinItem) {
   const api = state.deps.ServerConnections.getApiClient(item.ServerId);
   // Le jeton en en-tête, lu à chaque requête : jamais dans l'adresse, et toujours le jeton courant.
-  core.configureHost({ build: config.build, requestHeaders: () => ({ Authorization: `MediaBrowser Token="${api.accessToken()}"` }) });
+  core.configureHost({
+    build: config.build,
+    requestHeaders: () => ({ Authorization: `MediaBrowser Token="${api.accessToken()}"` }),
+    rangeRefused: (status) => state.onRangeRefused?.(status),
+  });
   return api;
 }
 
@@ -603,6 +655,21 @@ async function open(self: LumenPlayer, element: HTMLVideoElement, options: Strea
         state.deps.events.trigger(self, "error", [{ type: kind === "network" ? "network" : "mediadecodeerror" }]);
       },
     });
+  // Un serveur qui refuse le fichier (403, 500…) n'est pas un réseau absent. Le moteur, lui, ne fait pas
+  // la différence : il redemande, puis attend 48 s que le réseau revienne — c'est juste dans Laterna, où
+  // l'autre lecteur a besoin du même réseau. Ici jellyfin-web sait transcoder : au quatrième refus
+  // rapproché (le moteur a épuisé ses tentatives sur un morceau), on lui rend la main tout de suite.
+  let refusals = 0;
+  let lastRefusal = 0;
+  state.onRangeRefused = (status) => {
+    if (states.get(self)!.opening !== mine) return;
+    const now = performance.now();
+    refusals = now - lastRefusal > REFUSAL_WINDOW_MS ? 1 : refusals + 1;
+    lastRefusal = now;
+    if (refusals !== REFUSALS_BEFORE_HANDOVER) return;
+    log(`le serveur refuse le fichier (statut ${status}) — lecture rendue à jellyfin-web`);
+    state.deps.events.trigger(self, "error", [{ type: "network" }]);
+  };
   // La piste que le serveur a retenue (préférences du compte, choix au menu), traduite pour le moteur.
   const known = verdict.mediaSourceId === source.Id ? verdict.audioTracks : [];
   let probe = await ask(audioTrackFor(source.MediaStreams, source.DefaultAudioStreamIndex, known));

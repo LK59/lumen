@@ -5,7 +5,7 @@ obj/
 *.log
 .env
 # Le Jellyfin de test et ses données : jamais dans le dépôt.
-test-jellyfin/
+test-jellyfin*/
 # Médias de test copiés ou générés localement.
 media/
 # Sorties des bancs (elles nomment des fichiers de la bibliothèque locale).

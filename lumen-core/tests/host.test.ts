@@ -170,3 +170,40 @@ describe("le lien bridé", () => {
     expect(transfer.mock.calls.some(([bytes]) => bytes === CHUNK)).toBe(true);
   });
 });
+
+describe("une plage refusée par le serveur", () => {
+  it("est dite à l'hôte avec son statut, à chaque tentative, sans rien changer à ce que fait le moteur", async () => {
+    stubFetch(503);
+    const refused = vi.fn();
+    configureHost({ rangeRefused: refused });
+    const source = await HttpByteSource.open("/film.mkv", SIZE);
+    await expect(source.read(2 * CHUNK, 4)).rejects.toBeInstanceOf(NetworkUnavailable);
+    source.close();
+    expect(refused).toHaveBeenCalledWith(503);
+    // Le moteur a redemandé comme avant : plusieurs refus pour le même morceau.
+    expect(refused.mock.calls.length).toBeGreaterThanOrEqual(4);
+  }, 15_000);
+
+  it("une plage servie ne prévient personne", async () => {
+    stubFetch(206);
+    const refused = vi.fn();
+    configureHost({ rangeRefused: refused });
+    const source = await HttpByteSource.open("/film.mkv", SIZE);
+    await source.read(2 * CHUNK, 4);
+    source.close();
+    expect(refused).not.toHaveBeenCalled();
+  });
+
+  it("un hôte qui lève en l'apprenant ne change pas l'erreur rendue", async () => {
+    stubFetch(500);
+    configureHost({
+      rangeRefused: () => {
+        throw new Error("hôte en panne");
+      },
+    });
+    const source = await HttpByteSource.open("/film.mkv", SIZE);
+    const failure = await source.read(2 * CHUNK, 4).catch((error: unknown) => error);
+    source.close();
+    expect((failure as Error).message).toContain("statut 500");
+  }, 15_000);
+});

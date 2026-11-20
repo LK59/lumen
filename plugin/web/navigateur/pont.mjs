@@ -32,6 +32,13 @@ const context = await browser.newContext({ viewport: { width: 1280, height: 720 
 await context.addInitScript(
   ([url, token, user, server, device]) => {
     localStorage.setItem("_deviceId2", device);
+    // Pas de mesure automatique du débit : jellyfin-web la refait à chaque page, et sur une machine occupée
+    // elle rend parfois un débit si bas que le serveur ne propose plus aucune source pour un fichier un peu
+    // lourd (« Unable to find a valid media source ») — un échec du banc, pas du lecteur.
+    for (const network of ["true", "false"]) {
+      localStorage.setItem(`enableautomaticbitratedetection-${network}-Video`, "false");
+      localStorage.setItem(`maxbitrate-${network}-Video`, "200000000");
+    }
     localStorage.setItem("jellyfin_credentials", JSON.stringify({ Servers: [{ Id: server, Name: "banc", ManualAddress: url, manualAddressOnly: true, LastConnectionMode: 2, DateLastAccessed: Date.now(), AccessToken: token, UserId: user }] }));
   },
   [JF_URL, JF_TOKEN, JF_USERID, JF_SERVERID, DEVICE_ID]

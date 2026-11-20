@@ -2,40 +2,48 @@
 
 # Lumen for Jellyfin
 
-Lumen is a Jellyfin plugin that lets the web client play files the server would otherwise have to remux or
-transcode. The server sends the file as it is, by byte ranges. The browser repackages it on the fly for its own
-`<video>` element and decodes only the audio it cannot play natively.
+Most libraries are MKV. Browsers play MP4. So nearly every time the Jellyfin web client plays an MKV, the server
+has to run ffmpeg, even when the browser could decode the video and the audio as they are. The file only needed
+a different container.
 
-A file Lumen cannot play is handed back to the regular Jellyfin player, with the reason logged.
+Lumen does that part in the browser. The server sends the file as it is, by byte ranges, and the browser
+repackages it on the fly for its own `<video>` element. Audio the browser cannot play is decoded in the browser
+as well. The server stops working for most of what you play:
+
+- **Playback starts sooner**, because nothing waits for ffmpeg to start.
+- **Seeking is faster**, because there is no stream to restart on the server.
+- **The server's CPU stays idle**, since it only serves bytes.
+
+A file Lumen cannot play is handed back to the regular Jellyfin player, with the reason logged. Playback is never
+worse than without the plugin.
 
 ![Lumen settings and playback log](plugin/screenshot.png)
 
-## What it does, step by step
+## Small on purpose
 
-When the Jellyfin web client cannot play a file directly (an MKV container, a DTS or TrueHD track), the server
-starts ffmpeg to produce an HLS stream. That costs a few seconds before the first frame, a restart whenever you
-seek outside what is already produced, and CPU time on the server for as long as you watch.
+Lumen changes the container and nothing else. It has no video decoder, no renderer and no player interface of
+its own, and it does not need WebGPU. The picture is decoded and displayed by the browser's own `<video>`
+element, exactly as in a direct play, so hardware decoding and HDR output remain the browser's business. The
+plugin archive weighs 1.3 MB, most of it audio decoders that are only loaded when a file needs them.
 
-With Lumen, for the same file:
+## How it works
 
 1. The web client asks Lumen whether it can play the file. Lumen opens it over HTTP range requests, reads the
    container header and index, and checks each track against what this browser can decode.
-2. If it can, the server is asked for the raw file (`static=true`), and never starts ffmpeg.
-3. In the browser, Lumen reads the Matroska or MP4 container and rewrites the samples into fragmented MP4,
-   which it feeds to the `<video>` element through Media Source Extensions. The video samples are copied
-   byte for byte: decoding and display are the browser's, exactly as in a direct play.
-4. Audio the browser can play is copied as well. Audio it cannot play is decoded in the browser by FFmpeg
-   decoders compiled to WebAssembly (in a worker), then re-encoded to AAC or Opus with the browser's own
-   `AudioEncoder`.
-5. Seeking reads the container index and fetches the bytes at the target. Nothing is restarted on the server.
+2. If it can, the server is asked for the raw file and never starts ffmpeg.
+3. Lumen reads the Matroska or MP4 container and rewrites the samples into fragmented MP4, fed to the
+   `<video>` element through Media Source Extensions. Video samples are copied byte for byte.
+4. Audio the browser can play is copied too. Audio it cannot play is decoded by FFmpeg decoders compiled to
+   WebAssembly, in a worker, then re-encoded to AAC or Opus with the browser's own `AudioEncoder`.
+5. A seek reads the container index and fetches the bytes at the target.
 
-If Lumen cannot play the file, the web client negotiates with the server as usual and its regular player takes
-over, transcoding included.
+If Lumen cannot play the file, or fails while playing it, the web client negotiates with the server as usual and
+its regular player takes over, transcoding included, at the same position.
 
 ## What it can play
 
-Lumen never decodes video. A file plays through Lumen when the browser can decode its video codec and Lumen can
-carry its container and audio.
+A file plays through Lumen when the browser can decode its video codec and Lumen can carry its container and
+audio. Lumen never decodes video.
 
 | | Played through Lumen | Handed back to the regular player |
 |---|---|---|
@@ -45,25 +53,30 @@ carry its container and audio.
 | Audio copied as it is | AAC, Opus, FLAC, and AC-3 or E-AC-3 where the browser plays them | |
 | Audio decoded in the browser, then re-encoded | TrueHD and MLP, DTS and DTS-HD, AC-3, E-AC-3, multichannel 24-bit FLAC, PCM | MP2 |
 
-Details worth knowing:
+What happens to a given file depends on the browser. Safari plays AC-3, E-AC-3 and HEVC natively, so Lumen
+copies everything. Chrome plays none of the Dolby audio formats, so Lumen decodes them. A browser without an
+HEVC decoder gets the regular player for HEVC files.
 
-- **HDR is not converted.** Lumen does no tone mapping. An HDR file on an SDR screen is shown as the browser
-  shows it, or goes to the server if you rely on the server's tone mapping.
+Good to know:
+
+- **HDR is not converted.** Lumen does no tone mapping. If you rely on the server to tone map HDR for an SDR
+  screen, those files should keep going through the server.
 - **Multichannel audio** that had to be decoded stays multichannel after re-encoding. On Apple devices, 7.1 is
-  folded to 5.1.
-- **Atmos and DTS:X**: the channel bed is decoded, the objects are not rendered.
-- **Audio that starts after the picture** is padded with silence so that playback starts on the first frame.
+  folded to 5.1. For Atmos and DTS:X, the channel bed is decoded and the objects are not rendered.
+- **Audio that starts after the picture** is padded with silence, so playback starts on the first frame.
 - **Changing the audio track** reopens the stream on the new track at the current position.
-- **Subtitles** are the web client's own, fetched from the server as usual.
-- **Quality settings** are respected: if you cap the bitrate below the file's, the server refuses direct play and
-  the regular player takes over. Lumen always reads the file at its original bitrate.
+- **Subtitles** are the web client's own, fetched from the server as usual. Text subtitles are aligned with the
+  picture; ASS and image subtitles (PGS) are drawn by the web client's own renderers and can lead the picture by
+  about 0.2 s.
+- **Quality settings** are respected. Lumen always reads the file at its original bitrate, so if you cap the
+  bitrate below the file's, the regular player takes over.
 
 ## What stays Jellyfin
 
 Lumen is a regular player of the Jellyfin web client. It extends the built-in video player and replaces only its
-source. The player interface, subtitle rendering, track menus, resume position, playback reporting and the
-Playback Info panel are the web client's own, on the same `<video>` element. Playback Info names the player that
-is actually playing and, when it is Lumen, shows what it does with the file.
+source. The player interface, subtitles, track menus, resume position, playback reporting and the Playback Info
+panel are the web client's own. Playback Info names the player that is actually playing and, when it is Lumen,
+shows what it does with the file.
 
 On the server, the plugin does no media processing. It serves the player's files, adds one script tag to the web
 client page and one entry to its `config.json` as they are served, and keeps its settings. It modifies no file
@@ -80,8 +93,15 @@ https://raw.githubusercontent.com/LK59/lumen/main/manifest.json
 
 Then install **Lumen** from the catalog, restart Jellyfin, and reload the web client.
 
-Requires Jellyfin 12.4. The web client must be opened over HTTPS or on `localhost`: browsers only expose the
-audio encoder in a secure context.
+- **Jellyfin 10.10 or later.**
+- The web client must be opened over **HTTPS** or on `localhost`: browsers only expose the audio encoder in a
+  secure context.
+- If your reverse proxy sets a Content Security Policy, decoding audio needs `worker-src blob:` and
+  `script-src 'wasm-unsafe-eval'`. Without them Lumen still plays the files whose audio it can copy and hands
+  the others back.
+
+To update, open the Lumen page: it shows the running version and the latest one, with a button that installs it
+and restarts Jellyfin.
 
 ## Settings
 
@@ -100,11 +120,12 @@ The browser console also says what Lumen is doing (`[Lumen] ...`), including why
 ## Limits and status
 
 - Lumen acts only in the Jellyfin web client. Native apps with their own player are not affected.
-- It was written and tested against Jellyfin 12.4.0, with Chromium and Firefox on desktop. Safari and the mobile
-  apps have not been tried yet.
-- It relies on the internals of the web client's video player, which has no public extension interface. With a
-  version where that player can no longer be extended, Lumen turns itself off and says so in the console.
-- A network outage during playback is reported to the web client as a playback error.
+- Tested with Chromium and Firefox on desktop. Safari and the mobile apps have not been tried yet.
+- It relies on the internals of the web client's video player, which has no public extension interface. If a
+  future version of the web client can no longer be extended this way, Lumen turns itself off and says so in the
+  console, and the web client plays as it does without the plugin.
+- During a network outage Lumen waits for the network to come back for up to 48 seconds, then reports a playback
+  error to the web client.
 
 ## Source
 
@@ -112,7 +133,7 @@ The browser console also says what Lumen is doing (`[Lumen] ...`), including why
 |---|---|
 | [`lumen-core/`](lumen-core/README.md) | The playback engine (TypeScript). It knows nothing about Jellyfin: a URL that honours `Range` in, a playing `<video>` out. Containers, remux, Media Source handling, audio decoding and re-encoding, with its test suite |
 | [`plugin/web/`](plugin/README.md) | The bridge that makes the engine a Jellyfin web player (TypeScript) |
-| [`plugin/server/`](plugin/README.md) | The Jellyfin plugin (C#, .NET 10) |
+| [`plugin/server/`](plugin/README.md) | The Jellyfin plugin (C#) |
 | [`docs/`](docs/pont-jellyfin-web.md) | How the bridge fits into the Jellyfin web client |
 | `tools/test-jellyfin.sh` | A disposable Jellyfin for the browser tests |
 | `manifest.json`, `releases/` | The plugin repository that Jellyfin reads |

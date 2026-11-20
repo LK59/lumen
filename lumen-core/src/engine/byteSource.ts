@@ -1,5 +1,5 @@
 import { noteFetchRetrying, noteFetchSettled } from "../support/networkTrouble";
-import { hostSaysSessionEnded, linkShaper, withHostHeaders } from "../host";
+import { hostSaysSessionEnded, linkShaper, noteRangeRefused, withHostHeaders } from "../host";
 import { trace } from "./trace";
 import { diagInterval, diagNow, diagRequest, diagRequestFailed } from "./playbackDiagnosis";
 import { meterOpeningRequest } from "../support/slowLink";
@@ -859,7 +859,10 @@ export class HttpByteSource implements ByteSource {
         // fin. Le redemander n'y changera rien : il était pris pour une panne réseau, redemandé quatre
         // fois en 2,3 s sous « Connexion perdue ou instable… » (chasse du 18/11/2026).
         if (res.status === 416) throw new Error("La plage demandée est hors du fichier (statut 416).");
-        if (res.status !== 206) throw new Error(`Le serveur a refusé la plage demandée (statut ${res.status}).`);
+        if (res.status !== 206) {
+          noteRangeRefused(res.status);
+          throw new Error(`Le serveur a refusé la plage demandée (statut ${res.status}).`);
+        }
         this.checkTotal(res);
         const headersAt = performance.now();
         metered?.headers();

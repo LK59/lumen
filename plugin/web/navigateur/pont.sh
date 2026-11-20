@@ -10,7 +10,7 @@
 # vérifie donc l'autre moitié du contrat — le refus nommé, et jellyfin-web qui lit à la place.
 set -eu
 cd "$(dirname "$0")/../../.."
-. test-jellyfin/admin.env
+. "${JF_DATA:-test-jellyfin}/admin.env"
 INJECT="${1:-main}"
 OUT="${OUT:-lumen-core/benches/out/pont-$INJECT.jsonl}"
 JF=lumen-test-jellyfin
@@ -48,14 +48,16 @@ while IFS= read -r item; do
   name=$(printf '%s' "$item" | python3 -c 'import sys,json;print(json.load(sys.stdin)["name"])')
   if [ -n "${LUMEN_OFF:-}" ]; then expect=off; elif printf '%s' "$name" | grep -Eqx "$EXPECT_JELLYFIN"; then expect=jellyfin; else expect=lumen; fi
   quiet
-  ffmpeg_before=$(docker exec "$JF" sh -c 'ls /config/log 2>/dev/null | grep -c FFmpeg' || echo 0)
+  # `grep -c` écrit déjà « 0 » quand il ne trouve rien, tout en sortant en échec : sur un serveur neuf,
+  # un « || echo 0 » ici donnait « 0 0 », que le calcul plus bas refusait, et le parcours s'arrêtait là.
+  ffmpeg_before=$(docker exec "$JF" sh -c 'ls /config/log 2>/dev/null | grep -c FFmpeg || true')
   docker run --rm --name lumen-banc-pont --network host --ipc host --cpus=4 --user "$(id -u):$(id -g)" -e HOME=/tmp \
     -v "$PWD/plugin/web:/app:ro" -v "$PWD/$(dirname "$OUT"):/out" -w /app \
     -e ITEM="$item" -e EXPECT="$expect" -e INJECT="$INJECT" -e JF_URL="$URL" -e JF_TOKEN="$JF_TOKEN" -e JF_USERID="$JF_USERID" \
     -e JF_SERVERID="$SERVER_ID" -e DEVICE_ID="$DEVICE" -e OUT="/out/$(basename "$OUT")" \
     -e BRIDGE=/app/dist/lumen-jellyfin.js -e LUMEN_BASE="$URL/web/lumen-test/dist/" \
     "$PW_IMAGE" node navigateur/pont.mjs || failures=$((failures + 1))
-  ffmpeg_after=$(docker exec "$JF" sh -c 'ls /config/log 2>/dev/null | grep -c FFmpeg' || echo 0)
+  ffmpeg_after=$(docker exec "$JF" sh -c 'ls /config/log 2>/dev/null | grep -c FFmpeg || true')
   # Chaque lancement de ffmpeg par Jellyfin laisse un journal : leur nombre pendant le passage.
   echo "      ffmpeg lancés par le serveur pendant ce titre : $((ffmpeg_after - ffmpeg_before))"
 done < "$OUT.titres"

@@ -1,6 +1,13 @@
 <Project>
   <PropertyGroup>
     <!-- La version de Jellyfin que ce plugin vise : celle de ses paquets, et de `targetAbi` dans le manifeste. -->
-    <JellyfinVersion>12.4.0</JellyfinVersion>
+    <!--
+      La plus ancienne version de Jellyfin servie. Un seul assemblage pour toutes : Jellyfin charge un
+      plugin compilé pour une version antérieure à la sienne, et un assemblage .NET 8 tourne sous les
+      .NET suivants (10.10 est en .NET 8, 10.11 en .NET 9, 12 en .NET 10). Ce que le plugin demande au
+      serveur n'a pas changé de forme entre ces versions ; c'est essayé sur chacune avant publication.
+    -->
+    <JellyfinVersion Condition="'$(JellyfinVersion)' == ''">10.10.0</JellyfinVersion>
+    <JellyfinFramework Condition="'$(JellyfinFramework)' == ''">net8.0</JellyfinFramework>
   </PropertyGroup>
 </Project>

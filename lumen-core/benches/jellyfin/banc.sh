@@ -13,7 +13,7 @@
 # Les titres sont lus dans Jellyfin (films, et le premier épisode de chaque série).
 set -eu
 cd "$(dirname "$0")/../../.."
-. test-jellyfin/admin.env
+. "${JF_DATA:-test-jellyfin}/admin.env"
 OUT="${1:-lumen-core/benches/out/face-a-jellyfin.jsonl}"
 JF=lumen-test-jellyfin
 PW_IMAGE="${PW_IMAGE:-mcr.microsoft.com/playwright:v1.63.0-noble}"
