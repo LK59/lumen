@@ -1,0 +1,20 @@
+[
+  {
+    "guid": "6f1b0a3e-52c8-4d0e-9a7b-1c7e5d9a4b20",
+    "name": "Lumen",
+    "description": "Plays files as they are: the browser remuxes them and decodes the audio, the server only sends bytes.",
+    "overview": "Playback without server-side transcoding for the web client.",
+    "owner": "lumen",
+    "category": "General",
+    "versions": [
+      {
+        "version": "0.1.0.0",
+        "changelog": "First version.",
+        "targetAbi": "12.4.0.0",
+        "sourceUrl": "https://raw.githubusercontent.com/LK59/lumen/main/lumen_0.1.0.0.zip",
+        "checksum": "7c78d99038f77d653ce77bc498c89d04",
+        "timestamp": "2026-11-20T13:30:15Z"
+      }
+    ]
+  }
+]
