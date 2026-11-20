@@ -1,0 +1,154 @@
+import { displayIsHdr } from "./hdrDisplay";
+// What this device will actually accept, measured rather than assumed.
+//
+// Every codec decision in this player has one of two answers: what the documentation says, and
+// what the machine in your hand does. They have disagreed twice already in this project — an
+// iPhone that claimed E-AC-3 and decoded silence, a browser that takes a codec in a file and
+// refuses the same codec inside a MediaSource. So the technical panel asks directly.
+//
+// It exists for the DTS question in particular. No browser decodes DTS, so playing it means
+// decoding it here and handing the browser something else — which only works if the browser will
+// encode that something else. Whether it will is exactly what this reports.
+
+function gamutP3(): boolean | null {
+  try {
+    return typeof matchMedia === "function" ? matchMedia("(color-gamut: p3)").matches : null;
+  } catch {
+    return null;
+  }
+}
+
+export interface Capability {
+  label: string;
+  supported: boolean | null;
+  detail?: string;
+}
+
+async function encoderSupport(codec: string, numberOfChannels: number): Promise<Capability> {
+  const label = `Encodage ${codec === "mp4a.40.2" ? "AAC" : codec} ${numberOfChannels === 2 ? "stéréo" : `${numberOfChannels} canaux`}`;
+  const Encoder = (globalThis as { AudioEncoder?: typeof AudioEncoder }).AudioEncoder;
+  // Absent entirely on Safari before 26, where WebCodecs was video-only.
+  if (!Encoder?.isConfigSupported) return { label, supported: null, detail: "AudioEncoder absent" };
+
+  // Asked twice before being believed. A browser may refuse one bitrate and accept the codec, and
+  // reporting "no" for what was really "not at that rate" would send the whole plan down the
+  // wrong path for a platform that could in fact have carried it.
+  const attempts: { config: AudioEncoderConfig; note?: string }[] = [
+    { config: { codec, sampleRate: 48000, numberOfChannels, bitrate: 256_000 } },
+    { config: { codec, sampleRate: 48000, numberOfChannels }, note: "sans débit imposé" },
+  ];
+  let lastError: string | undefined;
+  for (const attempt of attempts) {
+    try {
+      const result = await Encoder.isConfigSupported(attempt.config);
+      if (result.supported) return { label, supported: true, detail: attempt.note };
+    } catch (error) {
+      // A configuration the browser considers malformed rather than unsupported.
+      lastError = error instanceof Error ? error.name : "refusé";
+    }
+  }
+  return { label, supported: false, detail: lastError };
+}
+
+function sourceSupport(mimeType: string, label: string): Capability {
+  const Source =
+    (globalThis as { ManagedMediaSource?: typeof ManagedMediaSource }).ManagedMediaSource ??
+    (typeof MediaSource !== "undefined" ? MediaSource : undefined);
+  if (!Source) return { label, supported: null, detail: "MediaSource absent" };
+  try {
+    return { label, supported: Source.isTypeSupported(mimeType) };
+  } catch {
+    return { label, supported: false };
+  }
+}
+
+let cached: Promise<Capability[]> | null = null;
+
+/**
+ * Asked once per session: none of these answers change while a page is open, and two of them
+ * cost a round trip through the platform's codec registry.
+ */
+export function probeCapabilities(): Promise<Capability[]> {
+  cached ??= (async () => [
+    // Could a DTS track be handed straight to the player? The answer is expected to be no
+    // everywhere, and this is where that stops being an assumption.
+    // What the picture can be handed over as. HEVC decides whether most of this library takes
+    // the native path at all; AV1 decides it for the format that is replacing it, and the answer
+    // differs by device rather than by browser — Apple's own hardware only learned it recently.
+    sourceSupport('video/mp4; codecs="hvc1.1.6.L120.90"', "HEVC 8 bits dans MediaSource"),
+    sourceSupport('video/mp4; codecs="hvc1.2.4.L150.90"', "HEVC 10 bits dans MediaSource"),
+    /**
+     * Le Dolby Vision, posé en question plutôt qu'en supposition.
+     *
+     * Cette bibliothèque compte 191 titres Dolby Vision, dont 188 en profil 8 avec une couche de
+     * base HDR10. Le remultiplexeur les livre aujourd'hui en `hvc1` : l'image est juste, mais la
+     * gradation dynamique — tout ce qui distingue le Dolby Vision du HDR10 — est perdue en
+     * chemin, faute de porter la configuration Dolby jusqu'au navigateur.
+     *
+     * Avant d'écrire une ligne pour la porter, il faut savoir si le navigateur la prendrait. La
+     * règle du dépôt vaut ici comme ailleurs : on demande, on ne suppose pas — et la réponse
+     * s'affiche dans le panneau technique, sur l'appareil, plutôt que dans une déduction.
+     *
+     * Deux questions et non une : le profil 8 est celui de presque toute la bibliothèque et se
+     * dégrade proprement en HDR10 ; le profil 5, lui, n'a pas de repli et concerne deux fichiers,
+     * que le lecteur natif refuse désormais d'ouvrir (voir la route `direct`).
+     *
+     * Une réponse positive ne suffira pas à décider : `isTypeSupported` n'a pas de faux négatif
+     * connu mais de vrais faux positifs, et ce dépôt en porte la cicatrice — Safari acceptait le
+     * remplacement du tampon audio en cours de lecture, puis jouait muet. Elle dit seulement si la question mérite d'être poursuivie.
+     */
+    sourceSupport('video/mp4; codecs="dvh1.08.06"', "Dolby Vision profil 8 dans MediaSource"),
+    sourceSupport('video/mp4; codecs="dvh1.05.06"', "Dolby Vision profil 5 dans MediaSource"),
+    /**
+     * Le témoin, et c'est lui qui donne leur valeur aux deux lignes du dessus.
+     *
+     * Un iPhone a répondu « oui » aux deux profils le 19/09/2026. Reste à savoir ce que ce oui
+     * mesure : la prise en charge réelle du Dolby Vision, ou simplement le fait que la chaîne
+     * `dvh1.PP.LL` se ramène à du HEVC Main 10, que tout appareil décode. Les deux hypothèses
+     * expliquent la même réponse, et l'une des deux rendrait le chantier inutile.
+     *
+     * Le profil 42 n'existe pas — la spécification Dolby en compte huit. Un appareil qui le
+     * déclare pris en charge ne valide pas un profil : il reconnaît une famille de codecs et
+     * répond oui à tout ce qui lui ressemble. Ce témoin-là ne coûte rien et tranche seul, sans
+     * avoir à comparer deux machines.
+     */
+    sourceSupport('video/mp4; codecs="dvh1.42.06"', "Témoin : profil Dolby Vision inexistant"),
+    sourceSupport('video/mp4; codecs="av01.0.08M.08"', "AV1 dans MediaSource"),
+    sourceSupport('video/mp4; codecs="av01.0.12M.10"', "AV1 10 bits dans MediaSource"),
+    sourceSupport('audio/mp4; codecs="dtsc"', "DTS dans MediaSource"),
+    sourceSupport('audio/mp4; codecs="dtse"', "DTS Express dans MediaSource"),
+    // If not, the way through is to re-encode what we decode. These say whether that is possible.
+    await encoderSupport("mp4a.40.2", 2),
+    await encoderSupport("mp4a.40.2", 6),
+    await encoderSupport("opus", 2),
+    await encoderSupport("opus", 6),
+    // Encoding to something the player will not take is no use: these close the loop.
+    sourceSupport('audio/mp4; codecs="mp4a.40.2"', "AAC dans MediaSource"),
+    sourceSupport('audio/mp4; codecs="opus"', "Opus dans MediaSource"),
+    // L'écran, tel que le navigateur le voit : c'est ce qui décide du plafond de lumière HDR sur
+    // Chrome sous Windows (voir hdrDisplay.ts). Une requête média, posée à chaque ouverture.
+    { label: "Écran HDR (dynamic-range: high)", supported: displayIsHdr() },
+    { label: "Couleurs larges (color-gamut: p3)", supported: gamutP3() },
+    // Encoding needs somewhere to put the samples, and this is the class that holds them. It
+    // travels with the encoder, but that is an assumption until it is asked.
+    {
+      label: "AudioData",
+      supported: typeof (globalThis as { AudioData?: unknown }).AudioData === "function",
+    },
+  ])();
+  return cached;
+}
+
+/** The panel's own shape: one line per answer, readable at a glance. */
+export function describeCapabilities(capabilities: Capability[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const capability of capabilities) {
+    out[capability.label] =
+      capability.supported === null
+        ? (capability.detail ?? "indisponible")
+        : capability.supported
+          ? "oui"
+          : `non${capability.detail ? ` (${capability.detail})` : ""}`;
+  }
+  return out;
+}

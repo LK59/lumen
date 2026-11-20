@@ -1,0 +1,61 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+
+// What the player's first « Lire » would otherwise download while the viewer waits. The modules
+// themselves are replaced by markers: importing one is the whole of what warming it means.
+const imported: string[] = [];
+vi.mock("@wasm-audio-decoders/flac", () => (imported.push("libflac"), {}));
+vi.mock("@lumen/engine/truehd/truehdDecoder", () => ({
+  warmTrueHd: async () => void imported.push("truehd"),
+  warmAc3Dts: async () => void imported.push("ac3dts"),
+}));
+
+beforeEach(() => {
+  imported.length = 0;
+  vi.resetModules();
+  vi.useFakeTimers();
+  vi.stubGlobal("window", {});
+});
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
+
+const settle = async () => {
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+};
+
+describe("scheduleDecoderWarmup", () => {
+  // Nos décodeurs (§197) : AC-3/E-AC3/DTS et TrueHD de FFmpeg, libFLAC. mediabunny, préchauffé jusqu'au
+  // 19/11/2026, n'est plus une dépendance.
+  it("fetches every decoder the player may need, FLAC included — after the delay and not before", async () => {
+    vi.stubGlobal("navigator", {});
+    const { scheduleDecoderWarmup } = await import("@lumen/engine/decoderWarmup");
+    scheduleDecoderWarmup(8000);
+    await vi.advanceTimersByTimeAsync(7999);
+    await settle();
+    expect(imported).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    await settle();
+    // FLAC since 21/09/2026: shipped by a deploy that the onboarding screen — the only caller
+    // until then — would have warmed for almost nobody.
+    expect(new Set(imported)).toEqual(new Set(["libflac", "ac3dts", "truehd"]));
+  });
+
+  it("stays quiet on a device asking to save data", async () => {
+    vi.stubGlobal("navigator", { connection: { saveData: true } });
+    const { scheduleDecoderWarmup } = await import("@lumen/engine/decoderWarmup");
+    scheduleDecoderWarmup(0);
+    await vi.advanceTimersByTimeAsync(10);
+    await settle();
+    expect(imported).toEqual([]);
+  });
+
+  it("can be cancelled, so a screen that leaves early leaves nothing behind", async () => {
+    vi.stubGlobal("navigator", {});
+    const { scheduleDecoderWarmup } = await import("@lumen/engine/decoderWarmup");
+    scheduleDecoderWarmup(8000)();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await settle();
+    expect(imported).toEqual([]);
+  });
+});

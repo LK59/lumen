@@ -1,0 +1,3865 @@
+// @vitest-environment jsdom
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { MseSource, playabilityOf } from "@lumen/engine/mseSource";
+import type { Remuxer, RemuxPlan, RemuxSegment } from "@lumen/engine/remuxer";
+import { traceReset, traceText } from "@lumen/engine/trace";
+import { mediaSegment, type MuxTrackInfo } from "@lumen/engine/mp4Muxer";
+import { UnreadableZone } from "@lumen/engine/unreadableZone";
+
+// MediaSource does not exist in jsdom, and the parts of it that matter here — when a buffer
+// signals it is done, when the system asks for data, what happens when it is full — are exactly
+// the parts a real browser would only exercise on a device. So they are modelled explicitly.
+
+class FakeBuffer extends EventTarget {
+  /**
+   * Les tampons du test en cours, arrêtés à sa fin (`afterEach`).
+   *
+   * Un test qui ne détruit pas sa source laisse sa boucle de remplissage tourner : son `updateend`
+   * suivant partait en microtâche après la fin du fichier, une fois l'environnement jsdom démonté,
+   * et `dispatchEvent` refusait un `Event` qui n'était plus le sien — « parameter 1 is not of type
+   * 'Event' », une erreur non gérée qui faisait échouer la construction de l'image une fois de temps
+   * en temps, sous charge (16/10/2026). Arrêté, un tampon ne répond plus : la boucle oubliée attend
+   * pour toujours, sans rien toucher du test suivant.
+   */
+  static live = new Set<FakeBuffer>();
+  halted = false;
+  private emit(type: string) {
+    if (this.halted) return;
+    this.dispatchEvent(new Event(type));
+  }
+  mode = "sequence";
+  updating = false;
+  appended: Uint8Array[] = [];
+  removed: [number, number][] = [];
+  aborted = 0;
+  /** Set to make appends land without ever covering the playhead. */
+  coversNothing = false;
+  /** How far past the point it was pointed at this buffer's media actually begins. */
+  landsLate = 0;
+  /**
+   * Où commence le média, quand ce n'est pas sous la tête.
+   *
+   * Une ouverture en cours de film envoie son média avant de déplacer la tête : le lecteur est
+   * pointé sur 1200 s pendant que la tête est encore à zéro. Ce modèle faisait naître toute
+   * nouvelle plage sous la tête, ce qui était vrai tant que la tête y était déjà — et qui rendait
+   * l'état d'une reprise impossible à écrire ici.
+   */
+  mediaStartsAt: number | null = null;
+  /** Set to make the next append throw as a full buffer does. */
+  quotaOnNextAppend = false;
+  /** Set to make the next append fail the way a segment the decoder rejects does. */
+  failOnNextAppend = false;
+  /** Set to make every append fail, for the case where retrying cannot help. */
+  failAllAppends = false;
+  /** Each media segment carries this much, so the buffer grows as it would in a browser. */
+  secondsPerAppend = 2;
+  /** An initialisation segment carries no media, so it adds no buffered range. */
+  private initSeen = false;
+  /**
+   * How long an operation holds the buffer. A real one takes milliseconds of parsing, and that
+   * window is the only place a second operation can collide with it; the default keeps the
+   * other tests on microtasks so they stay fast.
+   */
+  busyMs = 0;
+
+  private finishSoon() {
+    const done = () => {
+      this.updating = false;
+      if (this.failOnNextAppend || this.failAllAppends) {
+        this.failOnNextAppend = false;
+        this.emit("error");
+      } else {
+        this.emit("updateend");
+      }
+    };
+    if (this.busyMs > 0) setTimeout(done, this.busyMs);
+    else queueMicrotask(done);
+  }
+  private ranges: [number, number][] = [];
+
+  /**
+   * Un tampon de ManagedMediaSource : il a `onbufferedchange`, et dit chaque plage retirée — par
+   * la page comme par le système. Les tests qui l'écoutent l'allument ; les autres restent des
+   * tampons de MediaSource ordinaire, sans l'événement.
+   */
+  static managed = false;
+
+  constructor(readonly type: string) {
+    super();
+    FakeBuffer.live.add(this);
+    if (FakeBuffer.managed) Object.assign(this, { onbufferedchange: null });
+  }
+
+  private announceRemoved(removed: [number, number][]) {
+    if (!("onbufferedchange" in this) || removed.length === 0) return;
+    const ranges = {
+      length: removed.length,
+      start: (i: number) => removed[i][0],
+      end: (i: number) => removed[i][1],
+    } as unknown as TimeRanges;
+    this.dispatchEvent(Object.assign(new Event("bufferedchange"), { addedRanges: { length: 0 }, removedRanges: ranges }));
+  }
+
+  /** Ce que fait Safari quand la mémoire manque : retirer une plage, sans qu'on le lui demande. */
+  systemEvicts(start: number, end: number) {
+    const kept: [number, number][] = [];
+    for (const [s, e] of this.ranges) {
+      if (e <= start || s >= end) kept.push([s, e]);
+      else {
+        if (s < start) kept.push([s, start]);
+        if (e > end) kept.push([end, e]);
+      }
+    }
+    this.ranges = kept;
+    this.announceRemoved([[start, end]]);
+  }
+
+  get buffered() {
+    const ranges = this.ranges;
+    return {
+      length: ranges.length,
+      start: (i: number) => ranges[i][0],
+      end: (i: number) => ranges[i][1],
+    } as unknown as TimeRanges;
+  }
+
+  /** Pretends the appended media covers this span, which is what drives the fill loop's decision. */
+  setBuffered(start: number, end: number) {
+    this.ranges = end > start ? [[start, end]] : [];
+  }
+
+  /** Several disjoint spans, as a browser reports after a seek away and back. */
+  setRanges(ranges: [number, number][]) {
+    this.ranges = ranges;
+  }
+
+  /** A real SourceBuffer permits one operation at a time and throws otherwise. */
+  private refuseIfBusy(what: string) {
+    if (this.updating) throw new DOMException(`${what} while updating`, "InvalidStateError");
+  }
+
+  appendBuffer(data: Uint8Array) {
+    this.refuseIfBusy("appendBuffer");
+    if (this.quotaOnNextAppend) {
+      this.quotaOnNextAppend = false;
+      throw new DOMException("full", "QuotaExceededError");
+    }
+    this.appended.push(data);
+    this.updating = true;
+    // A real buffer does not always cover the playhead the instant it is fed: the sound of a
+    // newly chosen track arrives a little ahead of where the viewer is, and until it lands the
+    // element's ranges — the intersection of the two buffers — hold nothing at all.
+    if (this.coversNothing) {
+      queueMicrotask(() => {
+        this.updating = false;
+        this.emit("updateend");
+      });
+      return;
+    }
+    // A buffer that always reports itself empty would let the fill loop run away; growing it is
+    // what makes "stop once far enough ahead" testable at all. A fresh range begins wherever the
+    // reader was pointed, exactly as a real one does — starting every range at zero would mean
+    // media never reached a seeked-to playhead, and the model would loop rather than the code.
+    if (this.initSeen) {
+      const here = this.mediaStartsAt ?? mediaStartsAtDefault ?? playheadOf();
+      const start = this.ranges.length > 0 ? this.ranges[0][0] : here + this.landsLate;
+      const end = (this.ranges.length > 0 ? this.ranges[0][1] : here + this.landsLate) + this.secondsPerAppend;
+      this.ranges = [[start, end]];
+    }
+    this.initSeen = true;
+    this.finishSoon();
+  }
+
+  remove(start: number, end: number) {
+    this.refuseIfBusy("remove");
+    this.removed.push([start, end]);
+    const had = this.ranges;
+    this.ranges = [];
+    this.updating = true;
+    // Annoncé pendant l'opération, avant `updateend`, comme le fait l'algorithme de retrait.
+    this.announceRemoved(had.map(([s, e]) => [Math.max(s, start), Math.min(e, end)] as [number, number]).filter(([s, e]) => e > s));
+    if (this.busyMs > 0) {
+      setTimeout(() => {
+        this.updating = false;
+        this.emit("updateend");
+      }, this.busyMs);
+    } else {
+      queueMicrotask(() => {
+        this.updating = false;
+        this.emit("updateend");
+      });
+    }
+  }
+
+  abort() {
+    this.aborted += 1;
+  }
+
+  changeType() {
+    this.refuseIfBusy("changeType");
+    this.typeChangedAfter = this.removed.length;
+  }
+  /** How many removals had happened by the time the codec was changed. */
+  typeChangedAfter = -1;
+}
+
+class FakeSource extends EventTarget {
+  static supported = new Set<string>();
+  static instances: FakeSource[] = [];
+  static isTypeSupported(type: string) {
+    return FakeSource.supported.has(type);
+  }
+  readyState: "closed" | "open" | "ended" = "closed";
+  duration = NaN;
+  streaming = true;
+  endedTimes = 0;
+  buffers: FakeBuffer[] = [];
+
+  constructor() {
+    super();
+    FakeSource.instances.push(this);
+    queueMicrotask(() => {
+      this.readyState = "open";
+      this.dispatchEvent(new Event("sourceopen"));
+    });
+  }
+  removed: FakeBuffer[] = [];
+  addSourceBuffer(type: string) {
+    const buffer = new FakeBuffer(type);
+    this.buffers.push(buffer);
+    return buffer as unknown as SourceBuffer;
+  }
+  removeSourceBuffer(buffer: SourceBuffer) {
+    this.removed.push(buffer as unknown as FakeBuffer);
+  }
+  endOfStream() {
+    // Comme un vrai : refusé tant qu'un des tampons travaille. Ce modèle l'acceptait toujours, et
+    // c'est ce qui cachait qu'une fin de flux pouvait tomber pendant un retrait du son.
+    if (this.buffers.some((b) => b.updating)) throw new DOMException("endOfStream while updating", "InvalidStateError");
+    this.endedTimes += 1;
+    this.readyState = "ended";
+  }
+}
+
+/**
+ * La tête de lecture de l'élément le plus récemment créé.
+ *
+ * Elle a longtemps été une simple variable de module, partagée par tous les éléments simulés du
+ * fichier — et c'est ce qui rendait « la reprise repart où le son s'est arrêté » instable une
+ * fois sur six : une source d'un test précédent, jamais fermée, continuait sa boucle de lecture
+ * et poussait *sa* tête de lecture, dont l'écriture atterrissait dans cette variable, c'est-à-dire
+ * dans l'élément du test en cours. Avec cinq cents segments derrière elle, elle y écrivait des
+ * valeurs comme 600 s.
+ *
+ * Chaque élément garde donc désormais la sienne, en fermeture ; seule la lecture — ce dont le
+ * modèle de tampon a besoin pour savoir où commencer une plage — passe encore par ici, et
+ * désigne le dernier élément créé, c'est-à-dire celui du test en cours.
+ */
+let playheadOf: () => number = () => 0;
+/**
+ * Où naît le média quand ce n'est pas sous la tête, pour les tampons pas encore créés.
+ *
+ * Le modèle prenait la tête pour le lecteur, ce qui était vrai tant que l'ouverture d'un film
+ * en cours de route posait la tête tout de suite. Elle attend maintenant que le média la couvre
+ * (voir `pendingStart`), et sans cette distinction le banc ne peut pas écrire l'état d'une
+ * reprise : celui où le lecteur travaille à 1200 s pendant que la tête est encore à zéro.
+ */
+let mediaStartsAtDefault: number | null = null;
+
+/** The intersection of every buffer's ranges, which is what a media element reports. */
+function intersectionOfBuffers(): TimeRanges {
+  const buffers = FakeSource.instances[0]?.buffers ?? [];
+  const lists = buffers.map((b) => b.buffered);
+  // A track with nothing in it empties the intersection rather than being left out of it: an
+  // element plays nowhere if any of its tracks has no media there.
+  if (lists.length === 0 || lists.some((r) => r.length === 0)) return { length: 0 } as unknown as TimeRanges;
+  let ranges: [number, number][] = [];
+  for (let i = 0; i < lists[0].length; i++) ranges.push([lists[0].start(i), lists[0].end(i)]);
+  for (const other of lists.slice(1)) {
+    const next: [number, number][] = [];
+    for (const [s, e] of ranges) {
+      for (let i = 0; i < other.length; i++) {
+        const start = Math.max(s, other.start(i));
+        const end = Math.min(e, other.end(i));
+        if (end > start) next.push([start, end]);
+      }
+    }
+    ranges = next;
+  }
+  return { length: ranges.length, start: (i: number) => ranges[i][0], end: (i: number) => ranges[i][1] } as unknown as TimeRanges;
+}
+
+function fakeVideo() {
+  // Propre à cet élément : une horloge poussée par une source oubliée n'atteint plus les autres.
+  let playhead = 0;
+  playheadOf = () => playhead;
+  const target = new EventTarget();
+  Object.defineProperty(target, "buffered", { get: intersectionOfBuffers, configurable: true });
+  Object.defineProperty(target, "currentTime", {
+    get: () => playhead,
+    set: (v: number) => {
+      playhead = v;
+    },
+    configurable: true,
+  });
+  return Object.assign(target, {
+    paused: false,
+    // The two the hold uses. Recorded rather than simulated: what matters is whether the element
+    // was told to stop and whether it was told to start again.
+    pause: vi.fn(function (this: { paused: boolean }) {
+      this.paused = true;
+    }),
+    play: vi.fn(function (this: { paused: boolean }) {
+      this.paused = false;
+      return Promise.resolve();
+    }),
+    disableRemotePlayback: false,
+    srcObject: null as unknown,
+    src: "",
+    removeAttribute: () => {},
+  }) as unknown as HTMLVideoElement;
+}
+
+const PLAN: RemuxPlan = {
+  videoMimeType: 'video/mp4; codecs="hvc1.2.4.L150.90"',
+  audioMimeType: 'audio/mp4; codecs="ec-3"',
+  videoInit: new Uint8Array([1]),
+  audioInit: new Uint8Array([2]),
+  durationSeconds: 3600,
+};
+
+function fakeRemuxer(segments: number, delay = 0.2, seekable = true, readMs = 0) {
+  let index = 0;
+  const seeks: number[] = [];
+  const remuxer = {
+    seeks,
+    seekable,
+    plan: () => PLAN,
+    // Une image clé toutes les deux secondes, comme les segments.
+    keyframeAtOrBefore: (s: number) => Math.floor(s / 2) * 2,
+    diagnostics: () => ({ presentationDelaySeconds: delay, clampedSamples: 0 }),
+    seekTo: (s: number) => {
+      seeks.push(s);
+      index = 0;
+    },
+    nextSegment: async (): Promise<RemuxSegment | null> => {
+      // Reading takes time in reality, which is what leaves the read loop mid-append while
+      // something else reaches for the same buffer.
+      if (readMs) await new Promise((r) => setTimeout(r, readMs));
+      if (index >= segments) return null;
+      index += 1;
+      // Every segment carries a line, read out of the same stretch of file as the pictures.
+      const subtitles = [
+        { track: 4, startSeconds: index * 2, endSeconds: index * 2 + 1.5, text: `ligne ${index}` },
+      ];
+      return {
+        video: [new Uint8Array([10 + index])],
+        audio: new Uint8Array([20 + index]),
+        subtitles,
+        endSeconds: index * 2,
+      };
+    },
+  };
+  return remuxer as unknown as Remuxer & { seeks: number[] };
+}
+
+beforeEach(() => {
+  // La trace est commune au module : sans remise à zéro, celle d'un test portait les lignes des
+  // précédents — dont les sources, jamais détruites, écrivent encore. Elle ne garde que ses 120
+  // premières et 280 dernières lignes : sous la charge d'un build, la ligne attendue tombait dans
+  // le milieu effacé (« compte ses propres poussées », 05/10/2026).
+  traceReset();
+  FakeBuffer.managed = false;
+  playheadOf = () => 0;
+  mediaStartsAtDefault = null;
+  FakeSource.instances = [];
+  FakeSource.supported = new Set([PLAN.videoMimeType, PLAN.audioMimeType!]);
+  vi.stubGlobal("ManagedMediaSource", FakeSource);
+  vi.stubGlobal("MediaSource", FakeSource);
+  vi.stubGlobal("URL", { createObjectURL: () => "blob:x", revokeObjectURL: () => {} });
+});
+afterEach(() => {
+  for (const buffer of FakeBuffer.live) buffer.halted = true;
+  FakeBuffer.live.clear();
+  vi.unstubAllGlobals();
+});
+
+const flush = () => new Promise((r) => setTimeout(r, 0));
+
+/**
+ * Waits for something to become true rather than for a fixed stretch of time.
+ *
+ * A read loop under load takes as long as it takes: a sleep long enough on an idle machine is a
+ * coin toss on a busy one, and a flaky test here blocks the image build. Fails loudly on the
+ * deadline so a real regression still reads as a failure and not as a hang.
+ */
+async function until(condition: () => boolean, what: string, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (condition()) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  throw new Error(`Toujours faux après ${timeoutMs} ms : ${what}`);
+}
+
+describe("playabilityOf", () => {
+  it("accepts a plan whose codecs the browser declares", () => {
+    expect(playabilityOf(PLAN)).toEqual({ ok: true });
+  });
+
+  // The whole point of this path is that a refusal is visible. A player that silently drops to a
+  // slower route leaves you unable to tell a path that works from one that was never taken.
+  it("names the codec it cannot play instead of failing quietly", () => {
+    FakeSource.supported = new Set([PLAN.audioMimeType!]);
+    const video = playabilityOf(PLAN);
+    expect(video.ok).toBe(false);
+    expect(video.ok === false && video.reason).toContain("hvc1.2.4.L150.90");
+
+    FakeSource.supported = new Set([PLAN.videoMimeType]);
+    const audio = playabilityOf(PLAN);
+    expect(audio.ok).toBe(false);
+    expect(audio.ok === false && audio.reason).toContain("ec-3");
+  });
+
+  it("refuses outright where MediaSource does not exist at all", () => {
+    vi.stubGlobal("ManagedMediaSource", undefined);
+    vi.stubGlobal("MediaSource", undefined);
+    expect(playabilityOf(PLAN)).toEqual({ ok: false, reason: "Ce navigateur ne propose pas MediaSource." });
+  });
+});
+
+describe("MseSource", () => {
+  it("sends each track's initialisation segment before any media of that track", async () => {
+    const video = fakeVideo();
+    const onError = vi.fn();
+    await MseSource.attach(video, fakeRemuxer(2), PLAN, { onError });
+    await flush();
+
+    const source = FakeSource.instances[0];
+    const [videoBuffer, audioBuffer] = source.buffers;
+    expect(videoBuffer.type).toBe(PLAN.videoMimeType);
+    expect(Array.from(videoBuffer.appended[0])).toEqual([1]);
+    expect(Array.from(audioBuffer.appended[0])).toEqual([2]);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("required by Safari before a managed source will attach: remote playback is turned off", async () => {
+    const video = fakeVideo();
+    await MseSource.attach(video, fakeRemuxer(1), PLAN, { onError: vi.fn() });
+    expect(video.disableRemotePlayback).toBe(true);
+  });
+
+  it("stops fetching once enough is buffered ahead of the playhead", async () => {
+    const video = fakeVideo();
+    await MseSource.attach(video, fakeRemuxer(100), PLAN, { onError: vi.fn() });
+    await flush();
+    const buffer = FakeSource.instances[0].buffers[0];
+    // Two seconds per segment against a thirty-second target: it must stop well short of the
+    // hundred available, or a two-hour film would be pulled into memory in one go.
+    expect(buffer.buffered.end(0)).toBeGreaterThanOrEqual(30);
+    expect(buffer.appended.length).toBeLessThan(20);
+  });
+
+  it("resumes fetching as the playhead advances into what is buffered", async () => {
+    const video = fakeVideo();
+    await MseSource.attach(video, fakeRemuxer(100), PLAN, { onError: vi.fn() });
+    await flush();
+    const buffer = FakeSource.instances[0].buffers[0];
+    const atRest = buffer.appended.length;
+
+    (video as unknown as { currentTime: number }).currentTime = 25;
+    video.dispatchEvent(new Event("timeupdate"));
+    await flush();
+    expect(buffer.appended.length).toBeGreaterThan(atRest);
+  });
+
+  it("declares the media as ending later than the file, by the presentation delay", async () => {
+    const video = fakeVideo();
+    await MseSource.attach(video, fakeRemuxer(1, 0.25), PLAN, { onError: vi.fn() });
+    await flush();
+    expect(FakeSource.instances[0].duration).toBe(3600.25);
+  });
+
+  it("ends the stream when the file runs out, exactly once", async () => {
+    const video = fakeVideo();
+    await MseSource.attach(video, fakeRemuxer(2), PLAN, { onError: vi.fn() });
+    await flush();
+    const source = FakeSource.instances[0];
+    expect(source.endedTimes).toBe(1);
+    source.dispatchEvent(new Event("startstreaming"));
+    await flush();
+    expect(source.endedTimes).toBe(1);
+  });
+
+  // `endOfStream` lève si l'un *ou l'autre* tampon travaille ; la fin ne passait que par la file de
+  // l'image, et un retrait du son jamais attendu (`trimBehind`, `evict`) pouvait encore occuper son
+  // tampon : l'erreur était avalée et le flux jamais déclaré fini (27/09/2026).
+  it("attend le tampon du son avant de déclarer la fin du flux", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(2);
+    const next = remuxer.nextSegment.bind(remuxer);
+    let openGate: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (openGate = resolve));
+    remuxer.nextSegment = async () => {
+      const segment = await next();
+      if (!segment) await gate;
+      return segment;
+    };
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await flush();
+    const source = FakeSource.instances[0];
+    const audio = source.buffers[1];
+    // Un retrait du son en cours au moment où le fichier s'achève, par sa file, comme `trimBehind`.
+    audio.busyMs = 30;
+    const audioOps = (mse as unknown as { audioOps: { enqueue(op: () => void): Promise<void> } }).audioOps;
+    void audioOps.enqueue(() => audio.remove(0, 1));
+    openGate();
+    await until(() => source.endedTimes === 1, "le flux déclaré fini", 1000);
+    expect(source.readyState).toBe("ended");
+  });
+
+  it("takes the presentation delay off a seek, because the file's clock is behind the player's", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(50, 0.2);
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await flush();
+
+    await mse.seek(600);
+    // The remuxer works on the file's clock. Seeking it to the player's time would land a fifth
+    // of a second late on every seek — small, constant, and exactly the kind of error that is
+    // never noticed until someone compares a subtitle to the sound.
+    expect(remuxer.seeks).toEqual([599.8]);
+    expect(video.currentTime).toBe(600);
+  });
+
+  it("never asks the file for a negative time, however early the seek", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(50, 0.2);
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await flush();
+    await mse.seek(0.05);
+    expect(remuxer.seeks).toEqual([0]);
+  });
+
+  it("clears both buffers on a seek so the old media cannot be played back", async () => {
+    const video = fakeVideo();
+    const mse = await MseSource.attach(video, fakeRemuxer(50), PLAN, { onError: vi.fn() });
+    await flush();
+    const [videoBuffer, audioBuffer] = FakeSource.instances[0].buffers;
+    videoBuffer.setBuffered(0, 20);
+    audioBuffer.setBuffered(0, 20);
+
+    await mse.seek(600);
+    expect(videoBuffer.removed[0][0]).toBe(0);
+    expect(videoBuffer.removed[0][1]).toBeGreaterThan(PLAN.durationSeconds);
+    expect(audioBuffer.removed[0][0]).toBe(0);
+  });
+
+  it("vide l'image et le son en même temps sur un saut, pas l'un après l'autre", async () => {
+    const video = fakeVideo();
+    const mse = await MseSource.attach(video, fakeRemuxer(50), PLAN, { onError: vi.fn() });
+    await flush();
+    const [videoBuffer, audioBuffer] = FakeSource.instances[0].buffers;
+    videoBuffer.setBuffered(0, 20);
+    audioBuffer.setBuffered(0, 20);
+    // Un retrait qui prend du temps, comme sur Safari (119 ms et 68 ms relevés sur un iPhone).
+    videoBuffer.busyMs = 60;
+    audioBuffer.busyMs = 60;
+    const startedAt = new Map<FakeBuffer, number>();
+    for (const buffer of [videoBuffer, audioBuffer]) {
+      const remove = buffer.remove.bind(buffer);
+      buffer.remove = (start: number, end: number) => {
+        if (!startedAt.has(buffer)) startedAt.set(buffer, performance.now());
+        remove(start, end);
+      };
+    }
+    await mse.seek(600);
+    expect(videoBuffer.removed).toHaveLength(1);
+    expect(audioBuffer.removed).toHaveLength(1);
+    // L'un après l'autre, le son attendait la fin de l'image : 60 ms au moins.
+    expect(Math.abs(startedAt.get(audioBuffer)! - startedAt.get(videoBuffer)!)).toBeLessThan(30);
+    mse.destroy();
+  });
+
+  it("drops played media when the buffer is full rather than reporting a failure", async () => {
+    const video = fakeVideo();
+    const onError = vi.fn();
+    const remuxer = fakeRemuxer(200);
+    await MseSource.attach(video, remuxer, PLAN, { onError });
+    await flush();
+
+    const buffer = FakeSource.instances[0].buffers[0];
+    (video as unknown as { currentTime: number }).currentTime = 100;
+    buffer.setBuffered(0, 110);
+    buffer.quotaOnNextAppend = true;
+    video.dispatchEvent(new Event("timeupdate"));
+    await flush();
+    await flush();
+
+    // A full buffer is a condition to manage, not a fault to surface.
+    expect(onError).not.toHaveBeenCalled();
+    expect(buffer.removed.some(([start, end]) => start === 0 && end === 70)).toBe(true);
+    // Et le segment refusé est redemandé, depuis la tête : il était perdu, et le tampon gardait un
+    // trou que la lecture trouvait plus tard (relu le 23/09/2026).
+    expect(remuxer.seeks.length).toBeGreaterThan(0);
+  });
+
+  /**
+   * Une piste audio qui s'arrête avant l'image n'est pas un navigateur qui ne retient rien.
+   *
+   * La profondeur jouable est l'intersection des deux tampons : le son fini, elle ne grandit plus,
+   * et huit segments plus tard la boucle déclarait le navigateur défaillant — le film était
+   * reconstruit au lieu de finir (relu le 23/09/2026).
+   */
+  it("continue de remplir quand seule l'image avance encore", async () => {
+    const video = fakeVideo();
+    const onError = vi.fn();
+    const remuxer = fakeRemuxer(40);
+    await MseSource.attach(video, remuxer, PLAN, { onError });
+    FakeSource.instances[0].buffers[1].secondsPerAppend = 0;
+    for (let i = 0; i < 10; i++) await flush();
+
+    expect(onError).not.toHaveBeenCalled();
+    expect(remuxer.seeks).toEqual([]);
+  });
+
+  it("recovers from a rejected segment instead of declaring playback over", async () => {
+    const video = fakeVideo();
+    const onError = vi.fn();
+    const onWarning = vi.fn();
+    const remuxer = fakeRemuxer(200);
+    await MseSource.attach(video, remuxer, PLAN, { onError, onWarning });
+    await flush();
+
+    const buffer = FakeSource.instances[0].buffers[0];
+    buffer.failOnNextAppend = true;
+    (video as unknown as { currentTime: number }).currentTime = 30;
+    video.dispatchEvent(new Event("timeupdate"));
+    await flush();
+
+    // Reported from a device as a freeze that a second seek undid — so nothing was lost, and
+    // ending playback was the wrong answer to a segment that simply needed sending again.
+    expect(onError).not.toHaveBeenCalled();
+    expect(remuxer.seeks.length).toBeGreaterThan(0);
+    // And the viewer is not told: they saw nothing, because it was fixed before they could. A
+    // banner here interrupts somebody about a problem that no longer exists — it goes to the
+    // record instead, which is where the technical panel reads it from.
+    expect(onWarning).not.toHaveBeenCalled();
+    expect(traceText()).toContain("segment refusé, repris");
+  });
+
+  it("pousses a clock that has stopped while media sits in front of it", async () => {
+    // The stall nothing could see: the element reports itself as playing, the playhead is on the
+    // media, twenty seconds are buffered ahead — and the clock does not move. Reported from a
+    // phone, on an episode opened from the beginning, frozen at 0:00. Every other check here
+    // watches for a playhead standing on nothing, which this is the opposite of.
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(200);
+    const source = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await flush();
+
+    (video as unknown as { currentTime: number }).currentTime = 0.25;
+    const before = video.currentTime;
+    const frozen = source as unknown as { watchForFrozenClock: (at: number) => void; frozenSince: number | null };
+
+    // And a resume is movement: an element just given back to the viewer is never pushed.
+    (video as unknown as { paused: boolean }).paused = false;
+    video.dispatchEvent(new Event("play"));
+    frozen.watchForFrozenClock(before);
+    expect(frozen.frozenSince).not.toBeNull();
+
+    // Seen once: noted, not acted on. A clock that has just stopped is not a stall.
+    frozen.watchForFrozenClock(before);
+    expect(video.currentTime).toBe(before);
+
+    // Still there a second and a half later, with media in front of it: pushed.
+    frozen.frozenSince = Date.now() - 5000;
+    frozen.watchForFrozenClock(before);
+    expect(video.currentTime).toBeGreaterThan(before);
+  });
+
+  it("baisse sa cible quand le navigateur refuse, au lieu de jeter des segments en silence", async () => {
+    // Refused media used to be dropped and nothing more. That works while there is something
+    // behind the playhead to free — and in the first half-minute of a film there never is, so
+    // every segment was refused, dropped, and after eight of them the loop concluded the browser
+    // was keeping nothing at all. The cause and the diagnosis had nothing to do with each other.
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500);
+    const source = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await flush();
+
+    const inner = source as unknown as { targetBuffer: number; quotaHit: () => void; lead: number };
+    expect(inner.targetBuffer).toBe(30);
+    inner.quotaHit();
+
+    expect(inner.targetBuffer).toBeLessThan(30);
+    // Never below the floor the film needs to play at all.
+    expect(inner.targetBuffer).toBeGreaterThanOrEqual(8);
+  });
+
+  it("garde sa cible quand le refus arrive sans rien devant la tête", async () => {
+    // Mac, 24/09/2026 : « tampon plein à 0.0 s : on vise 8 s pour ce fichier ». Une avance nulle au
+    // moment du refus ne mesure pas ce que le navigateur peut tenir, et le film finissait à 8 s.
+    const video = fakeVideo();
+    const source = await MseSource.attach(video, fakeRemuxer(500), PLAN, { onError: vi.fn() });
+    await flush();
+    const inner = source as unknown as { targetBuffer: number; quotaHit: () => void };
+    Object.defineProperty(inner, "lead", { get: () => 0, configurable: true });
+    traceReset();
+    inner.quotaHit();
+    expect(inner.targetBuffer).toBe(30);
+    expect(traceText()).toContain("cible gardée à 30 s");
+  });
+
+  describe("budget en octets selon le moteur (25/09/2026)", () => {
+    const IPAD = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.3 Safari/605.1.15";
+    afterEach(() => {
+      vi.restoreAllMocks();
+      Object.defineProperty(navigator, "maxTouchPoints", { value: 0, configurable: true });
+    });
+
+    /** Un remultiplexeur 4K : chaque segment de 2 s pèse 8 Mo d'image, 32 Mb/s. */
+    function heavyRemuxer(segments: number) {
+      const remuxer = fakeRemuxer(segments);
+      const next = remuxer.nextSegment.bind(remuxer);
+      remuxer.nextSegment = async () => {
+        const segment = await next();
+        if (!segment) return segment;
+        const picture = new Uint8Array(1);
+        Object.defineProperty(picture, "byteLength", { value: 8e6 });
+        return { ...segment, video: [picture] };
+      };
+      return remuxer;
+    }
+
+    it("sur un iPad, vise moins de trente secondes d'avance en 4K, et l'écrit", async () => {
+      vi.spyOn(navigator, "userAgent", "get").mockReturnValue(IPAD);
+      Object.defineProperty(navigator, "maxTouchPoints", { value: 5, configurable: true });
+      traceReset();
+      const video = fakeVideo();
+      await MseSource.attach(video, heavyRemuxer(200), PLAN, { onError: vi.fn() });
+      await until(() => traceText().includes("budget WebKit mobile"), "le budget écrit dans la trace");
+      await new Promise((r) => setTimeout(r, 50));
+      // 105 Mo à 4 Mo/s : ~26 s en tout. L'avance s'arrête bien avant les trente secondes.
+      expect(video.buffered.end(0)).toBeLessThan(24);
+      expect(traceText()).toMatch(/budget WebKit mobile : 110 Mo d'image, 6 Mo de son/);
+    });
+
+    it("retire lui-même ce qui dépasse derrière la tête, au lieu de le laisser à Safari", async () => {
+      vi.spyOn(navigator, "userAgent", "get").mockReturnValue(IPAD);
+      Object.defineProperty(navigator, "maxTouchPoints", { value: 5, configurable: true });
+      const video = fakeVideo();
+      await MseSource.attach(video, heavyRemuxer(200), PLAN, { onError: vi.fn() });
+      await until(() => video.buffered.length > 0 && video.buffered.end(0) > 12, "du média chargé");
+      const [videoBuffer] = FakeSource.instances[0].buffers;
+      // La lecture avance de 30 s : tout ce qui précède 30 s moins le budget arrière est de trop.
+      (video as unknown as { currentTime: number }).currentTime = 30;
+      videoBuffer.setBuffered(0, 36);
+      video.dispatchEvent(new Event("timeupdate"));
+      await until(() => videoBuffer.removed.some(([s, e]) => s === 0 && e > 15 && e < 30), "un retrait derrière la tête");
+    });
+
+    it("ne lève rien en élaguant l'arrière d'une source fermée", async () => {
+      // iPhone, 21/10/2026 : le décodeur tombé ferme la source, le battement suivant élaguait
+      // l'arrière, et `buffered` d'un tampon retiré levait InvalidStateError — un rejet non géré
+      // remonté au journal comme erreur navigateur, pour une panne que la reconstruction réparait.
+      vi.spyOn(navigator, "userAgent", "get").mockReturnValue(IPAD);
+      Object.defineProperty(navigator, "maxTouchPoints", { value: 5, configurable: true });
+      traceReset();
+      const video = fakeVideo();
+      const mse = await MseSource.attach(video, heavyRemuxer(200), PLAN, { onError: vi.fn(), onWarning: vi.fn() });
+      await until(() => traceText().includes("budget WebKit mobile"), "le budget écrit dans la trace");
+      FakeSource.instances[0].readyState = "closed";
+      // L'élément, lui, répond encore : ce sont les tampons retirés qui lèvent.
+      const kept = video.buffered;
+      const frozen = { length: kept.length, start: (i: number) => kept.start(i), end: (i: number) => kept.end(i) };
+      Object.defineProperty(video, "buffered", { get: () => frozen, configurable: true });
+      for (const buffer of FakeSource.instances[0].buffers) {
+        Object.defineProperty(buffer, "buffered", {
+          get: () => {
+            throw new DOMException("The object is in an invalid state.", "InvalidStateError");
+          },
+          configurable: true,
+        });
+      }
+      (video as unknown as { currentTime: number }).currentTime = 60;
+      await expect((mse as unknown as { fill(): Promise<void> }).fill()).resolves.toBeUndefined();
+    });
+
+    it("ne lève rien non plus quand la source se dit encore ouverte mais que ses tampons sont retirés", async () => {
+      // iPhone, 12/11/2026 : *The Circle* repris après 38 min en arrière-plan — iOS avait retiré les tampons,
+      // la source n'était pas encore `closed`, et l'élagage levait InvalidStateError en rejet non géré.
+      vi.spyOn(navigator, "userAgent", "get").mockReturnValue(IPAD);
+      Object.defineProperty(navigator, "maxTouchPoints", { value: 5, configurable: true });
+      traceReset();
+      const video = fakeVideo();
+      const mse = await MseSource.attach(video, heavyRemuxer(200), PLAN, { onError: vi.fn(), onWarning: vi.fn() });
+      await until(() => traceText().includes("budget WebKit mobile"), "le budget écrit dans la trace");
+      expect(FakeSource.instances[0].readyState).not.toBe("closed");
+      const kept = video.buffered;
+      const frozen = { length: kept.length, start: (i: number) => kept.start(i), end: (i: number) => kept.end(i) };
+      Object.defineProperty(video, "buffered", { get: () => frozen, configurable: true });
+      for (const buffer of FakeSource.instances[0].buffers) {
+        Object.defineProperty(buffer, "buffered", {
+          get: () => {
+            throw new DOMException("The object is in an invalid state.", "InvalidStateError");
+          },
+          configurable: true,
+        });
+      }
+      (video as unknown as { currentTime: number }).currentTime = 60;
+      await expect((mse as unknown as { trimBehind(): void }).trimBehind()).toBeUndefined();
+    });
+
+    it("ne retire jamais le groupe d'images où se trouve la tête", async () => {
+      // La norme MSE prolonge un retrait jusqu'à l'image clé suivante : avec un groupe de 28 s
+      // ouvert à 10 s et la tête à 30 s, un retrait jusqu'à 30 − budget emportait l'image sous la
+      // tête (banc du 25/09/2026). Il doit s'arrêter avant 10 s.
+      vi.spyOn(navigator, "userAgent", "get").mockReturnValue(IPAD);
+      Object.defineProperty(navigator, "maxTouchPoints", { value: 5, configurable: true });
+      const video = fakeVideo();
+      const remuxer = Object.assign(heavyRemuxer(200), { keyframeAtOrBefore: (s: number) => (s >= 10 && s < 38 ? 10 : Math.floor(s / 2) * 2) });
+      await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+      await until(() => video.buffered.length > 0 && video.buffered.end(0) > 12, "du média chargé");
+      const [videoBuffer] = FakeSource.instances[0].buffers;
+      (video as unknown as { currentTime: number }).currentTime = 30;
+      videoBuffer.setBuffered(0, 36);
+      video.dispatchEvent(new Event("timeupdate"));
+      await until(() => videoBuffer.removed.some(([s]) => s === 0), "un retrait derrière la tête");
+      const ends = videoBuffer.removed.filter(([s]) => s === 0).map(([, e]) => e);
+      // Délai de présentation de 0,2 s : l'image clé est à 10,2 s sur l'horloge du lecteur.
+      for (const end of ends) expect(end).toBeLessThanOrEqual(10.2);
+    });
+
+    /** *Forrest Gump* sur l'iPad de Lucas : 4K légère, son à 0,09 Mo/s — 180 ko par segment de 2 s. */
+    function forrestGumpRemuxer(segments: number, keyframeAtOrBefore?: (s: number) => number) {
+      const remuxer = fakeRemuxer(segments);
+      const next = remuxer.nextSegment.bind(remuxer);
+      remuxer.nextSegment = async () => {
+        const segment = await next();
+        if (!segment) return segment;
+        const picture = new Uint8Array(1);
+        Object.defineProperty(picture, "byteLength", { value: 2e6 });
+        const sound = new Uint8Array(1);
+        Object.defineProperty(sound, "byteLength", { value: 180e3 });
+        return { ...segment, video: [picture], audio: sound };
+      };
+      return keyframeAtOrBefore ? Object.assign(remuxer, { keyframeAtOrBefore }) : remuxer;
+    }
+
+    it("après un saut en avant, ne refait pas toute l'avance du son tant que son arrière n'est pas retiré", async () => {
+      // 30/09/2026 : +10 s, l'arrière du son pas encore retiré (le retrait attend la fin du saut),
+      // l'avance refaite en entier — 60 s de son pour un plafond qui en tenait à peine autant, et
+      // WebKit a retiré lui-même le son sous la tête.
+      vi.spyOn(navigator, "userAgent", "get").mockReturnValue(IPAD);
+      Object.defineProperty(navigator, "maxTouchPoints", { value: 5, configurable: true });
+      traceReset();
+      const video = fakeVideo();
+      await MseSource.attach(video, forrestGumpRemuxer(400), PLAN, { onError: vi.fn() });
+      await until(() => traceText().includes("budget WebKit mobile"), "le budget écrit dans la trace");
+      await until(() => video.buffered.length > 0 && video.buffered.end(0) >= 20, "l'avance faite");
+      await new Promise((r) => setTimeout(r, 50));
+      const [videoBuffer, audioBuffer] = FakeSource.instances[0].buffers;
+      // La tête vient de sauter à 40 s, encore `seeking` : 30 s derrière, 20 s devant.
+      Object.assign(video, { seeking: true });
+      (video as unknown as { currentTime: number }).currentTime = 40;
+      videoBuffer.setBuffered(10, 60);
+      audioBuffer.setBuffered(10, 60);
+      const sent = audioBuffer.appended.length;
+      video.dispatchEvent(new Event("timeupdate"));
+      await new Promise((r) => setTimeout(r, 50));
+      // 5,5 Mo × 0,75 à 0,09 Mo/s, moins la marge : ~39 s en tout, dont 30 déjà derrière — il ne
+      // reste pas de quoi aller au-delà des 20 s déjà devant.
+      expect(audioBuffer.appended.length).toBe(sent);
+      expect(audioBuffer.buffered.end(0)).toBe(60);
+    });
+
+    it("retire le son derrière la tête jusqu'à son budget, sans attendre l'image clé de l'image", async () => {
+      // Un groupe de 28 s ouvert à 10 s : l'image ne peut rien retirer après 10 s, le son si.
+      vi.spyOn(navigator, "userAgent", "get").mockReturnValue(IPAD);
+      Object.defineProperty(navigator, "maxTouchPoints", { value: 5, configurable: true });
+      const video = fakeVideo();
+      const remuxer = forrestGumpRemuxer(400, (s: number) => (s >= 10 && s < 38 ? 10 : Math.floor(s / 2) * 2));
+      await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+      await until(() => video.buffered.length > 0 && video.buffered.end(0) > 12, "du média chargé");
+      const [videoBuffer, audioBuffer] = FakeSource.instances[0].buffers;
+      (video as unknown as { currentTime: number }).currentTime = 30;
+      videoBuffer.setBuffered(0, 36);
+      audioBuffer.setBuffered(0, 36);
+      video.dispatchEvent(new Event("timeupdate"));
+      await until(() => audioBuffer.removed.some(([s, e]) => s === 0 && e > 10.2 && e < 30), "le son retiré au-delà de l'image clé");
+      for (const [, end] of videoBuffer.removed.filter(([s]) => s === 0)) expect(end).toBeLessThanOrEqual(10.2);
+    });
+
+    it("sur Chrome, borne aussi l'avance à ses 150 Mio", async () => {
+      vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36");
+      traceReset();
+      const video = fakeVideo();
+      await MseSource.attach(video, heavyRemuxer(200), PLAN, { onError: vi.fn() });
+      await until(() => traceText().includes("budget Chromium"), "le budget de Chromium écrit dans la trace");
+      await new Promise((r) => setTimeout(r, 50));
+      // 157 Mo à 4 Mo/s : ~39 s en tout, dont environ 24 devant.
+      expect(video.buffered.end(0)).toBeLessThan(28);
+      expect(traceText()).toMatch(/budget Chromium : 157 Mo d'image, 13 Mo de son/);
+    });
+
+    it("sur Firefox, borne l'avance à ses 150 Mio", async () => {
+      vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Mozilla/5.0 (X11; Linux x86_64; rv:154.0) Gecko/20100101 Firefox/154.0");
+      traceReset();
+      const video = fakeVideo();
+      await MseSource.attach(video, heavyRemuxer(200), PLAN, { onError: vi.fn() });
+      await until(() => traceText().includes("budget Gecko"), "le budget de Gecko écrit dans la trace");
+      await new Promise((r) => setTimeout(r, 50));
+      expect(video.buffered.end(0)).toBeLessThan(28);
+      expect(traceText()).toMatch(/budget Gecko : 157 Mo d'image, 21 Mo de son/);
+    });
+
+    it("ne change rien pour un moteur qu'on ne connaît pas", async () => {
+      vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.2; Trident/6.0)");
+      traceReset();
+      const video = fakeVideo();
+      await MseSource.attach(video, heavyRemuxer(200), PLAN, { onError: vi.fn() });
+      await until(() => video.buffered.length > 0 && video.buffered.end(0) >= 30, "les trente secondes d'avant");
+      expect(traceText()).not.toContain("budget ");
+    });
+  });
+
+  it("ne touche à rien tant que le navigateur accepte ce qu'on lui donne", async () => {
+    // Which is every browser tested here: the cost of the rule above is zero until it is needed.
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500);
+    const source = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await flush();
+    expect((source as unknown as { targetBuffer: number }).targetBuffer).toBe(30);
+  });
+
+  it("stops pretending when the refusals do not let up", async () => {
+    const video = fakeVideo();
+    const onError = vi.fn();
+    await MseSource.attach(video, fakeRemuxer(200), PLAN, { onError, onWarning: vi.fn() });
+    await flush();
+
+    const buffer = FakeSource.instances[0].buffers[0];
+    buffer.failAllAppends = true;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      (video as unknown as { currentTime: number }).currentTime = 30 + attempt * 100;
+      video.dispatchEvent(new Event("timeupdate"));
+      await flush();
+    }
+    // Retrying forever would be its own kind of freeze, quieter than the one it replaced.
+    expect(onError).toHaveBeenCalled();
+  });
+
+  // The bug this whole group exists for: the transport controls write straight to the element on
+  // this path, exactly as they would for any <video>. Without acting on that, the element waits
+  // at a time nothing will ever be appended to while the reader grinds forward from where it was.
+  it("serves a seek the viewer made on the element itself", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500, 0.2);
+    await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await flush();
+    expect(remuxer.seeks).toEqual([]);
+
+    (video as unknown as { currentTime: number }).currentTime = 1800;
+    video.dispatchEvent(new Event("seeking"));
+    await flush();
+
+    expect(remuxer.seeks).toEqual([1799.8]);
+    expect(FakeSource.instances[0].buffers[0].removed.length).toBeGreaterThan(0);
+  });
+
+  it("does no work for a step inside what is already buffered", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500);
+    await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await flush();
+    const buffer = FakeSource.instances[0].buffers[0];
+    buffer.setBuffered(0, 40);
+    buffer.removed.length = 0;
+
+    (video as unknown as { currentTime: number }).currentTime = 12;
+    video.dispatchEvent(new Event("seeking"));
+    await flush();
+    // Re-reading the file to reach media the browser is already holding would turn a free step
+    // into a network round trip.
+    expect(remuxer.seeks).toEqual([]);
+    expect(buffer.removed).toEqual([]);
+  });
+
+  // 28/10/2026, Braveheart sur Firefox au banc : un « −10 s » juste après un saut retombe sur le
+  // début de la zone chargée — l'image clé de ce saut — à 30 ms près, et toute la zone était relue.
+  it("pose la tête sur le début du chargé quand le saut tombe à moins d'une image avant", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500);
+    await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await flush();
+    const buffers = FakeSource.instances[0].buffers;
+    for (const b of buffers) b.setBuffered(100.6, 140);
+    const buffer = buffers[0];
+    buffer.removed.length = 0;
+
+    (video as unknown as { currentTime: number }).currentTime = 100.57;
+    video.dispatchEvent(new Event("seeking"));
+    await flush();
+    expect(video.currentTime).toBeCloseTo(100.6, 5);
+    // Le `seeking` que ce déplacement provoque : sur du chargé, rien à relire.
+    video.dispatchEvent(new Event("seeking"));
+    await flush();
+    expect(remuxer.seeks).toEqual([]);
+    expect(buffer.removed).toEqual([]);
+  });
+
+  it("au-delà d'une image avant le chargé, c'est un vrai saut : la cible n'est pas déplacée", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500, 0.2);
+    await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await flush();
+    for (const b of FakeSource.instances[0].buffers) b.setBuffered(100.6, 140);
+
+    (video as unknown as { currentTime: number }).currentTime = 100.5;
+    video.dispatchEvent(new Event("seeking"));
+    await flush();
+    expect(remuxer.seeks).toEqual([100.3]);
+  });
+
+  it("does not serve its own seek twice", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500);
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await flush();
+
+    await mse.seek(900);
+    // The element fires seeking in response to that move; acting on it again would clear the
+    // buffers currently being refilled.
+    video.dispatchEvent(new Event("seeking"));
+    await flush();
+    expect(remuxer.seeks).toEqual([899.8]);
+  });
+
+  it("measures the buffer from the playhead's own range, not the last one left over", async () => {
+    const video = fakeVideo();
+    await MseSource.attach(video, fakeRemuxer(500), PLAN, { onError: vi.fn() });
+    await flush();
+    const buffer = FakeSource.instances[0].buffers[0];
+    const before = buffer.appended.length;
+
+    // What a browser reports after seeking back: a stale span far ahead, and the playhead sitting
+    // in front of almost nothing. Measuring against the far one reports a deep buffer and the
+    // player quietly stops fetching.
+    buffer.setRanges([[100, 101], [900, 940]]);
+    (video as unknown as { currentTime: number }).currentTime = 100.5;
+    video.dispatchEvent(new Event("timeupdate"));
+    await flush();
+    expect(buffer.appended.length).toBeGreaterThan(before);
+  });
+
+  it("refuses a seek a file without an index cannot serve, and says so without stopping", async () => {
+    const video = fakeVideo();
+    const onWarning = vi.fn();
+    const onError = vi.fn();
+    const remuxer = fakeRemuxer(500, 0.2, false);
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError, onWarning });
+    await flush();
+
+    await mse.seek(1800);
+    // Starting over from the beginning and reading forward — which is what the fallback did —
+    // looks like the player thinking very hard and arriving minutes later.
+    expect(remuxer.seeks).toEqual([]);
+    expect(onWarning).toHaveBeenCalledWith({ code: "noIndexSeek" });
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("starts reading where the viewer is resuming, not at the beginning of the file", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500);
+    // Le média naît là où le lecteur est pointé, pas sous la tête restée en arrière.
+    mediaStartsAtDefault = 1200;
+    await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() }, 1200);
+    // Rien n'a encore été envoyé : c'est le seul instant où la tête ne peut pas être posée, et
+    // c'est celui que WebKit ne pardonne pas.
+    expect(video.currentTime).toBe(0);
+    await flush();
+    // Filling thirty seconds from zero and then discarding all of it is what made resuming a
+    // part-watched episode feel slow.
+    expect(remuxer.seeks).toEqual([1200]);
+    // Et elle finit par être posée, sur le média qui la couvre — jamais avant qu'il existe.
+    expect(video.currentTime).toBeCloseTo(1200, 1);
+  });
+
+  it("pose la tête à l'ouverture dès que le média la couvre", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500);
+    await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() }, 1200);
+    await flush();
+
+    // Les deux pistes, parce qu'un élément ne joue que là où toutes ont du média.
+    FakeSource.instances[0].buffers[0].setBuffered(1199, 1230);
+    FakeSource.instances[0].buffers[1].setBuffered(1199, 1230);
+    video.dispatchEvent(new Event("timeupdate"));
+    await flush();
+
+    expect(video.currentTime).toBeCloseTo(1200, 1);
+  });
+
+  it("ne prend pas une ouverture différée pour un lecteur égaré", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(2000);
+    mediaStartsAtDefault = 1197;
+    await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() }, 1200);
+    // L'état exact rapporté par un iPhone : le remultiplexeur ouvre bien à la position demandée,
+    // mais le média qu'il produit commence à l'image-clé qui précède et n'a couvert que deux
+    // secondes — il ne contient donc pas encore 1200 s. La tête, elle, est restée à zéro : c'est
+    // `pendingStart` qui l'y garde tant que le média ne la couvre pas, parce que WebKit ne
+    // résout jamais un `seeking` posé sur un tampon vide.
+    await flush();
+
+    // Lu comme un lecteur égaré — du média à 1197 s, une tête à 0 — cet écart déclenchait un
+    // saut vers la tête, c'est-à-dire vers zéro : on cliquait « Reprendre », et le film repartait
+    // du début. Deux fois sur trois, selon la vitesse à laquelle l'élément publie ses plages.
+    expect(remuxer.seeks).toEqual([1200]);
+    // Et la tête finit par être posée, une fois le média assez long pour la couvrir.
+    expect(video.currentTime).toBeCloseTo(1200, 1);
+  });
+
+  it("à l'ouverture, pose la tête un pas dans le média qui commence après elle, comme après un saut", async () => {
+    // Audit du 22/09/2026 : l'ouverture posait la tête pile au bord du média — ce qui laisse WebKit
+    // dans un saut qu'il ne résout pas, déjà corrigé pour les sauts (LANDING_INSET) — et ne
+    // l'atteignait qu'à moins d'une seconde, contre quinze après un saut.
+    const video = fakeVideo();
+    mediaStartsAtDefault = 1200.3;
+    await MseSource.attach(video, fakeRemuxer(500), PLAN, { onError: vi.fn() }, 1200);
+    await flush();
+    expect(video.currentTime).toBeCloseTo(1200.34, 3);
+  });
+
+  it("à l'ouverture, rejoint aussi un média qui commence plusieurs secondes après la position, comme un saut", async () => {
+    // Un index creux : le média produit commence 3,5 s après la position demandée. Avant, la tête
+    // restait à zéro jusqu'à ce que la détection « rien retenu » s'en mêle.
+    const video = fakeVideo();
+    mediaStartsAtDefault = 1203.5;
+    const remuxer = fakeRemuxer(500);
+    await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() }, 1200);
+    await flush();
+    expect(video.currentTime).toBeCloseTo(1203.54, 3);
+    // Directement : pas par une reprise qui relit le fichier.
+    expect(remuxer.seeks).toEqual([1200]);
+  });
+
+  it("laisse un saut remplacer l'ouverture au lieu de s'y ajouter", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500);
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() }, 1200);
+    await flush();
+
+    // Sauter avant que la tête soit posée : sans quoi elle serait ensuite ramenée au point
+    // d'ouverture, et le film repartirait tout seul là où on venait de le quitter.
+    await mse.seek(300);
+    await flush();
+    FakeSource.instances[0].buffers[0].setBuffered(1199, 1230);
+    FakeSource.instances[0].buffers[1].setBuffered(1199, 1230);
+    video.dispatchEvent(new Event("timeupdate"));
+    await flush();
+
+    expect(video.currentTime).not.toBeCloseTo(1200, 1);
+  });
+
+  it("steps the playhead onto media that begins just after it", async () => {
+    const video = fakeVideo();
+    await MseSource.attach(video, fakeRemuxer(500), PLAN, { onError: vi.fn() });
+    await flush();
+    const buffer = FakeSource.instances[0].buffers[0];
+
+    // What a seek onto an index point produces: the media begins one presentation delay later
+    // than the playhead, and the element would otherwise wait there indefinitely. Both tracks are
+    // set, because an element plays only where all of them have media.
+    (video as unknown as { currentTime: number }).currentTime = 600;
+    buffer.setBuffered(600.2, 620);
+    FakeSource.instances[0].buffers[1].setBuffered(600.2, 620);
+    video.dispatchEvent(new Event("timeupdate"));
+    await flush();
+    // Landed a frame inside the media rather than on its first instant — see LANDING_INSET.
+    expect(video.currentTime).toBeCloseTo(600.24, 3);
+  });
+
+  it("leaves a real hole in the stream alone rather than skipping over it", async () => {
+    const video = fakeVideo();
+    await MseSource.attach(video, fakeRemuxer(500), PLAN, { onError: vi.fn() });
+    await flush();
+    const buffer = FakeSource.instances[0].buffers[0];
+
+    (video as unknown as { currentTime: number }).currentTime = 600;
+    buffer.setBuffered(640, 660);
+    FakeSource.instances[0].buffers[1].setBuffered(640, 660);
+    video.dispatchEvent(new Event("timeupdate"));
+    await flush();
+    // Jumping forty seconds without being asked would hide a genuine fault behind a silent skip.
+    expect(video.currentTime).toBe(600);
+  });
+
+  it("serves only the last of a burst of seeks", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500, 0.2);
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await flush();
+
+    // A finger dragging across a scrub bar. Serving each in turn means every one is stale before
+    // its media arrives, and the picture never catches up.
+    void mse.seek(300);
+    void mse.seek(900);
+    await mse.seek(1500);
+    await flush();
+
+    expect(remuxer.seeks).toEqual([1499.8]);
+  });
+
+  it("sert le dernier saut d'une rafale arrivée pendant qu'une lecture réseau finissait", async () => {
+    // Banc du 22/09/2026, serveur distant : cinq sauts en 0,6 s arrivaient au dernier en 6,5 s.
+    // Le premier attendait la fin de la lecture en cours, puis lisait sa propre position — déjà
+    // abandonnée — et le dernier attendait à son tour cette lecture-là.
+    //
+    // La lecture en cours est tenue par le test, et non par une minuterie (05/10/2026) : avec une
+    // lecture de 40 ms et des attentes de 20 et 5 ms, une machine chargée finissait la lecture avant
+    // la rafale, servait deux sauts, et faisait échouer la construction de l'image.
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500, 0.2, true);
+    const next = remuxer.nextSegment.bind(remuxer);
+    let release: () => void = () => {};
+    // Tenue dès la deuxième lecture : la boucle remplit son tampon en un instant sans attente
+    // réseau, et il n'y aurait plus de lecture en cours au moment de la rafale.
+    let held = true;
+    let reading = false;
+    let reads = 0;
+    remuxer.nextSegment = async () => {
+      reads += 1;
+      if (held && reads > 1) {
+        reading = true;
+        await new Promise<void>((r) => (release = r));
+        reading = false;
+      }
+      return next();
+    };
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await until(() => reading, "une lecture réseau en cours");
+
+    void mse.seek(300);
+    // Le premier saut est parti, et attend la lecture en cours — qui ne finit pas tant qu'on ne la
+    // libère pas.
+    await flush();
+    void mse.seek(900);
+    const last = mse.seek(1500);
+    await flush();
+    held = false;
+    release();
+    await last;
+    await flush();
+
+    // Un seul saut servi, le dernier (moins le retard de présentation s'il est déjà connu).
+    expect(remuxer.seeks).toHaveLength(1);
+    expect(remuxer.seeks[0]).toBeGreaterThan(1499);
+    mse.destroy();
+  });
+
+  it("n'attend plus la lecture en cours : un saut la coupe, sans la prendre pour une panne", async () => {
+    // 22/09/2026, serveur lointain : un saut attendait jusqu'à deux secondes la fin d'une lecture
+    // réseau de la position quittée. Il la coupe maintenant (`prepareSeek` → `ByteSource.abandon`),
+    // et la boucle de lecture s'efface sans compter d'échec ni lancer de reprise.
+    const { ReadAbandoned } = await import("@lumen/engine/byteSource");
+    traceReset();
+    const video = fakeVideo();
+    const onError = vi.fn();
+    const remuxer = fakeRemuxer(500, 0.2);
+    let hang: ((error: unknown) => void) | null = null;
+    const nextSegment = remuxer.nextSegment.bind(remuxer);
+    let slow = false;
+    Object.assign(remuxer, {
+      // Une lecture qui ne revient pas d'elle-même : dix secondes de réseau, disons.
+      nextSegment: () => (slow ? new Promise((_, reject) => (hang = reject)) : nextSegment()),
+      prepareSeek: () => hang?.(new ReadAbandoned()),
+    });
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError });
+    await flush();
+    slow = true;
+    // La tête avance : la boucle repart chercher, et reste suspendue à sa lecture.
+    (video as unknown as { currentTime: number }).currentTime = 25;
+    video.dispatchEvent(new Event("timeupdate"));
+    (mse as unknown as { fill: () => Promise<void> }).fill();
+    await flush();
+    expect(hang).not.toBeNull();
+
+    slow = false;
+    const started = Date.now();
+    await mse.seek(1200);
+    await flush();
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(remuxer.seeks).toEqual([1199.8]);
+    expect(onError).not.toHaveBeenCalled();
+    expect(traceText()).not.toContain("segment refusé");
+    mse.destroy();
+  });
+
+  it("rend la lecture en avance entière dès que le saut a sa première image", async () => {
+    // Voir `SEEK_PREFETCH_CHUNKS` : bridée pendant le saut, elle doit reprendre — sinon toute la
+    // suite du film se lirait avec deux morceaux d'avance.
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500, 0.2);
+    const settled = vi.fn();
+    Object.assign(remuxer, { seekSettled: settled });
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await flush();
+    expect(settled).not.toHaveBeenCalled();
+    await mse.seek(1200);
+    await flush();
+    expect(settled).toHaveBeenCalledTimes(1);
+    mse.destroy();
+  });
+
+  describe("sauts qui partent ailleurs (banc iPhone du 22/09/2026)", () => {
+    const CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
+    const onBrowser = (ua: string) => vi.spyOn(navigator, "userAgent", "get").mockReturnValue(ua);
+    afterEach(() => vi.restoreAllMocks());
+    const withRate = (video: HTMLVideoElement) => Object.assign(video, { playbackRate: 1, seeking: false });
+
+    it("redemande la cible d'un saut dont la tête part ailleurs, et l'écrit", async () => {
+      onBrowser(CHROME);
+      const video = withRate(fakeVideo());
+      const remuxer = fakeRemuxer(200);
+      const onStall = vi.fn();
+      const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn(), onStall });
+      const internals = mse as unknown as { watchdog: () => void; watchdogTimer: ReturnType<typeof setInterval> | null };
+      await until(() => video.buffered.length > 0 && video.buffered.end(0) > 20, "du média devant la tête");
+      if (internals.watchdogTimer) clearInterval(internals.watchdogTimer);
+      const seeksBefore = remuxer.seeks.length;
+
+      // Un saut vers 5 s, dans ce qui est déjà là…
+      (video as unknown as { currentTime: number }).currentTime = 5;
+      video.dispatchEvent(new Event("seeking"));
+      // …et la tête file à 20 s sans être jamais arrivée.
+      (video as unknown as { currentTime: number }).currentTime = 20;
+      internals.watchdog();
+      await flush();
+
+      expect(remuxer.seeks.length).toBe(seeksBefore + 1);
+      expect(remuxer.seeks.at(-1)).toBeCloseTo(5 - 0.2, 1);
+      expect(onStall).toHaveBeenCalledWith(expect.objectContaining({ runaway: true, seekTarget: 5 }));
+      expect(traceText()).toContain("saut parti ailleurs");
+      mse.destroy();
+    });
+
+    it("laisse passer une tête encore en train de sauter", async () => {
+      // Banc iPhone du 22/09/2026, Titanic : cinq sauts en 0,4 s. Le navigateur applique
+      // `currentTime` tout de suite et n'émet `seeking` qu'ensuite — dans cet intervalle, la tête
+      // est déjà au cinquième saut alors que la cible connue est encore celle du quatrième. Le
+      // détecteur y voyait une fuite et ramenait la tête 935 s en arrière, défaisant le dernier
+      // saut du spectateur. Une tête en route ne s'est pas égarée : elle n'est pas encore arrivée.
+      onBrowser(CHROME);
+      const video = withRate(fakeVideo());
+      const remuxer = fakeRemuxer(200);
+      const onStall = vi.fn();
+      const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn(), onStall });
+      const internals = mse as unknown as { watchdog: () => void; watchdogTimer: ReturnType<typeof setInterval> | null };
+      await until(() => video.buffered.length > 0 && video.buffered.end(0) > 20, "du média devant la tête");
+      if (internals.watchdogTimer) clearInterval(internals.watchdogTimer);
+      const seeksBefore = remuxer.seeks.length;
+
+      (video as unknown as { currentTime: number }).currentTime = 5;
+      video.dispatchEvent(new Event("seeking"));
+      // Le saut suivant : la tête y est déjà, son `seeking` n'est pas encore arrivé.
+      (video as unknown as { currentTime: number }).currentTime = 20;
+      Object.assign(video, { seeking: true });
+      internals.watchdog();
+      await flush();
+
+      expect(remuxer.seeks.length).toBe(seeksBefore);
+      expect(onStall).not.toHaveBeenCalled();
+      mse.destroy();
+    });
+
+    it("rattrape quand même une tête restée en plein saut au-delà de six secondes", async () => {
+      // La garde du dessus ne doit pas désarmer le filet : un saut qui ne se pose jamais, la tête
+      // ailleurs que sa cible, est toujours ramené — seulement après l'attente d'une horloge figée
+      // pendant un saut.
+      onBrowser(CHROME);
+      const video = withRate(fakeVideo());
+      const remuxer = fakeRemuxer(200);
+      const onStall = vi.fn();
+      const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn(), onStall });
+      const internals = mse as unknown as { watchdog: () => void; watchdogTimer: ReturnType<typeof setInterval> | null };
+      await until(() => video.buffered.length > 0 && video.buffered.end(0) > 20, "du média devant la tête");
+      if (internals.watchdogTimer) clearInterval(internals.watchdogTimer);
+      const seeksBefore = remuxer.seeks.length;
+
+      const t0 = Date.now();
+      const clock = vi.spyOn(Date, "now").mockReturnValue(t0);
+      (video as unknown as { currentTime: number }).currentTime = 5;
+      video.dispatchEvent(new Event("seeking"));
+      (video as unknown as { currentTime: number }).currentTime = 20;
+      Object.assign(video, { seeking: true });
+
+      clock.mockReturnValue(t0 + 5_000);
+      internals.watchdog();
+      await flush();
+      expect(remuxer.seeks.length).toBe(seeksBefore);
+
+      clock.mockReturnValue(t0 + 6_500);
+      internals.watchdog();
+      await flush();
+      expect(remuxer.seeks.length).toBe(seeksBefore + 1);
+      expect(onStall).toHaveBeenCalledWith(expect.objectContaining({ runaway: true, seekTarget: 5 }));
+      mse.destroy();
+    });
+
+    it("fait reconstruire à la cible, pas là où la tête s'est enfuie, quand les reprises n'y suffisent plus", async () => {
+      // Audit du 22/09/2026 : la reconstruction partait de `position`, c'est-à-dire de la tête
+      // partie ailleurs.
+      onBrowser(CHROME);
+      const video = withRate(fakeVideo());
+      const onError = vi.fn();
+      const mse = await MseSource.attach(video, fakeRemuxer(200), PLAN, { onError });
+      const internals = mse as unknown as { recover: (t: number) => boolean; watchdog: () => void; watchdogTimer: ReturnType<typeof setInterval> | null };
+      await until(() => video.buffered.length > 0 && video.buffered.end(0) > 20, "du média devant la tête");
+      if (internals.watchdogTimer) clearInterval(internals.watchdogTimer);
+      // Plus aucune reprise possible : la main passe à l'hôte.
+      internals.recover = () => false;
+
+      (video as unknown as { currentTime: number }).currentTime = 5;
+      video.dispatchEvent(new Event("seeking"));
+      (video as unknown as { currentTime: number }).currentTime = 20;
+      internals.watchdog();
+
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(mse.lost).toBe(true);
+      expect(mse.position).toBe(5);
+      mse.destroy();
+    });
+
+    it("laisse jouer un saut arrivé : la tête qui avance ensuite n'est pas un départ", async () => {
+      onBrowser(CHROME);
+      const video = withRate(fakeVideo());
+      const remuxer = fakeRemuxer(200);
+      const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+      const internals = mse as unknown as { watchdog: () => void; watchdogTimer: ReturnType<typeof setInterval> | null };
+      await until(() => video.buffered.length > 0 && video.buffered.end(0) > 20, "du média devant la tête");
+      if (internals.watchdogTimer) clearInterval(internals.watchdogTimer);
+      const seeksBefore = remuxer.seeks.length;
+
+      (video as unknown as { currentTime: number }).currentTime = 5;
+      video.dispatchEvent(new Event("seeking"));
+      video.dispatchEvent(new Event("seeked"));
+      (video as unknown as { currentTime: number }).currentTime = 9;
+      internals.watchdog();
+      await flush();
+      expect(remuxer.seeks.length).toBe(seeksBefore);
+      mse.destroy();
+    });
+  });
+
+  describe("chasse aux bugs du 22/09/2026 au soir", () => {
+    it("libère un saut ramené dans la durée du film — +30 s dans les dernières secondes ne fige plus rien", async () => {
+      // La cible était ramenée à la fin du média, puis comparée ainsi corrigée à la demande
+      // d'origine pour la libérer : elles ne correspondaient plus, la demande restait pendante,
+      // et le remplissage comme le chien de garde s'arrêtaient devant elle.
+      const video = fakeVideo();
+      const remuxer = fakeRemuxer(500);
+      const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+      await flush();
+      await mse.seek(3630);
+      await flush();
+      expect(mse.seekPending).toBe(false);
+      expect(remuxer.seeks.at(-1)).toBeGreaterThan(3590);
+      mse.destroy();
+    });
+
+    it("libère un saut refusé sur un fichier sans index, et rend la tête là où elle jouait", async () => {
+      const video = fakeVideo();
+      const onWarning = vi.fn();
+      const mse = await MseSource.attach(video, fakeRemuxer(500, 0.2, false), PLAN, { onError: vi.fn(), onWarning });
+      const internals = mse as unknown as { watchdog: () => void; watchdogTimer: ReturnType<typeof setInterval> | null };
+      await until(() => video.buffered.length > 0 && video.buffered.end(0) > 10, "du média");
+      if (internals.watchdogTimer) clearInterval(internals.watchdogTimer);
+      (video as unknown as { currentTime: number }).currentTime = 5;
+      internals.watchdog();
+
+      (video as unknown as { currentTime: number }).currentTime = 1800;
+      video.dispatchEvent(new Event("seeking"));
+      await flush();
+      expect(onWarning).toHaveBeenCalledWith({ code: "noIndexSeek" });
+      expect(mse.seekPending).toBe(false);
+      expect(video.currentTime).toBe(5);
+      mse.destroy();
+    });
+
+    it("ne prend pas pour son propre déplacement un saut du spectateur, longtemps après, au même endroit", async () => {
+      // « Revoir » à la fin d'un film restait figé à 0:00 : la source avait posé la tête à 0,24 s
+      // à l'ouverture, et tout saut à moins de 0,25 s de là passait pour le sien, des heures après.
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        const video = fakeVideo();
+        const remuxer = fakeRemuxer(500);
+        const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+        await flush();
+        const timer = (mse as unknown as { watchdogTimer: ReturnType<typeof setInterval> | null }).watchdogTimer;
+        if (timer) clearInterval(timer);
+        (mse as unknown as { seekState: { moved: (t: number) => void } }).seekState.moved(1000.2);
+        vi.setSystemTime(Date.now() + 60_000);
+        traceReset();
+        (video as unknown as { currentTime: number }).currentTime = 1000;
+        video.dispatchEvent(new Event("seeking"));
+        // Servi tout de suite, par le saut lui-même — pas rattrapé plus tard par une reprise.
+        expect(traceText()).toContain("saut demandé vers 1000.0 s (le viseur)");
+        mse.destroy();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("renvoie un lecteur égaré vers la cible du saut en cours, pas vers la tête partie ailleurs", async () => {
+      // Deux relectures pour un seul saut : d'abord vers la tête enfuie, puis vers la cible.
+      const video = fakeVideo();
+      const remuxer = fakeRemuxer(500, 0.2, true, 20);
+      const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+      await flush();
+      // Le contrôle d'égarement de la boucle de lecture seul : le chien de garde, qui le
+      // rattraperait vers la bonne cible, est arrêté.
+      const timer = (mse as unknown as { watchdogTimer: ReturnType<typeof setInterval> | null }).watchdogTimer;
+      if (timer) clearInterval(timer);
+      (video as unknown as { currentTime: number }).currentTime = 1000;
+      video.dispatchEvent(new Event("seeking"));
+      // Le média du saut commence d'arriver, là où il a été demandé.
+      await until(() => video.buffered.length > 0 && video.buffered.start(0) < 1100 && video.buffered.start(0) > 900, "le média du saut");
+      // La tête s'en va sans que l'élément le dise.
+      (video as unknown as { currentTime: number }).currentTime = 1600;
+      await new Promise((r) => setTimeout(r, 300));
+      expect(remuxer.seeks.some((t) => Math.abs(t - 1599.8) < 0.01)).toBe(false);
+      mse.destroy();
+    });
+  });
+
+  it("un saut loin dans un long groupe d'images n'est pas un lecteur égaré : il lit jusqu'à la cible", async () => {
+    // WALL·E, 28/09/2026 : générique en un seul groupe de 35 s, saut à la dernière seconde. Le
+    // premier média arrivait 33 s derrière la tête, trois reprises relançaient la même lecture, puis
+    // l'abandon laissait la tête sans image — chargement sans fin au lieu de l'écran de fin.
+    const video = fakeVideo();
+    let base = 0;
+    let index = 0;
+    const seeks: number[] = [];
+    const remuxer = {
+      seeks,
+      seekable: true,
+      plan: () => PLAN,
+      // Une image clé toutes les quarante secondes.
+      keyframeAtOrBefore: (t: number) => Math.floor(t / 40) * 40,
+      diagnostics: () => ({ presentationDelaySeconds: 0.2, clampedSamples: 0 }),
+      seekTo: (t: number) => {
+        seeks.push(t);
+        base = Math.floor(t / 40) * 40;
+        index = 0;
+      },
+      nextSegment: async (): Promise<RemuxSegment | null> => {
+        index += 1;
+        if (base + index * 2 > 3600) return null;
+        return { video: [new Uint8Array([10])], audio: new Uint8Array([20]), subtitles: [], endSeconds: base + index * 2 };
+      },
+    } as unknown as Remuxer & { seeks: number[] };
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await flush();
+    const timer = (mse as unknown as { watchdogTimer: ReturnType<typeof setInterval> | null }).watchdogTimer;
+    if (timer) clearInterval(timer);
+    // La lecture de l'ouverture finie d'abord : un de ses envois jugé après le saut serait un autre sujet.
+    await until(() => video.buffered.length > 0 && video.buffered.end(0) >= 12, "l'ouverture");
+    await new Promise((r) => setTimeout(r, 100));
+    traceReset();
+    // Le média du saut commence à l'image clé de 1000 s ; la tête attend à 1033 s.
+    mediaStartsAtDefault = 1000;
+    Object.defineProperty(video, "seeking", { value: true, configurable: true });
+    (video as unknown as { currentTime: number }).currentTime = 1033;
+    video.dispatchEvent(new Event("seeking"));
+    await until(() => video.buffered.length > 0 && video.buffered.end(0) >= 1034, "le média jusqu'à la cible");
+    // Une seule lecture vers la cible : sans le correctif, trois reprises relançaient la même. Pas
+    // la trace, commune à tout le fichier — une source d'un test précédent peut encore y écrire.
+    expect(seeks.filter((t) => t > 1000)).toHaveLength(1);
+    mse.destroy();
+  });
+
+  it("relance sur place un saut encore en cours quand la fin du flux est déclarée", async () => {
+    // WALL·E et Là-haut, 28/09/2026, iPhone : 30 s de son sans image à la fin. Un saut à la
+    // dernière seconde demandé avant la fin du flux restait `seeking` pour toujours : seule la fin
+    // du flux rend cette queue lisible, et WebKit ne réexamine pas un saut déjà en cours.
+    traceReset();
+    const video = fakeVideo();
+    let playhead = 0;
+    const sets: number[] = [];
+    Object.defineProperty(video, "currentTime", {
+      get: () => playhead,
+      set: (v: number) => {
+        sets.push(v);
+        playhead = v;
+      },
+      configurable: true,
+    });
+    Object.defineProperty(video, "seeking", { value: true, configurable: true });
+    const mse = await MseSource.attach(video, fakeRemuxer(3), PLAN, { onError: vi.fn() });
+    await until(() => traceText().includes("saut relancé sur place"), "la relance");
+    expect(sets.at(-1)).toBe(playhead);
+    mse.destroy();
+  });
+
+  it("ne relance rien quand la fin du flux arrive sans saut en cours", async () => {
+    traceReset();
+    const video = fakeVideo();
+    const mse = await MseSource.attach(video, fakeRemuxer(3), PLAN, { onError: vi.fn() });
+    await until(() => traceText().includes("fin du fichier"), "la fin");
+    await flush();
+    expect(traceText()).not.toContain("saut relancé");
+    mse.destroy();
+  });
+
+  it("ne signale pas une seconde erreur après avoir passé la main à l'hôte", async () => {
+    const video = fakeVideo();
+    const onError = vi.fn();
+    const mse = await MseSource.attach(video, fakeRemuxer(500), PLAN, { onError });
+    await flush();
+    const internals = mse as unknown as { handOver: (at: number) => void; recover: () => boolean; seek: (t: number) => Promise<void>; performSeek: () => Promise<void> };
+    internals.handOver(12);
+    expect(onError).toHaveBeenCalledTimes(1);
+    internals.recover = () => false;
+    internals.performSeek = async () => {
+      throw new Error("refusé");
+    };
+    await internals.seek(40);
+    await flush();
+    expect(onError).toHaveBeenCalledTimes(1);
+    mse.destroy();
+  });
+
+  it("keeps a playable amount of media even while the system says it wants none", async () => {
+    const video = fakeVideo();
+    class NeverStreaming extends FakeSource {
+      streaming = false;
+    }
+    vi.stubGlobal("ManagedMediaSource", NeverStreaming);
+    await MseSource.attach(video, fakeRemuxer(500), PLAN, { onError: vi.fn() });
+    await flush();
+
+    const buffer = FakeSource.instances[0].buffers[0];
+    // Obeying the system unconditionally means that if it says "stop" while the buffer in front
+    // of the playhead is empty, nothing is ever fetched again and the player loads forever.
+    expect(buffer.buffered.length).toBeGreaterThan(0);
+    expect(buffer.buffered.end(0)).toBeGreaterThanOrEqual(8);
+    // But it is a floor, not a licence to ignore the request: it stops well short of the target.
+    expect(buffer.buffered.end(0)).toBeLessThan(30);
+  });
+
+  it("recovers a playhead that moved without the element ever saying so", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500, 0.2);
+    await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await flush();
+    expect(remuxer.seeks).toEqual([]);
+
+    // Everything else here reacts to an event, and any of them can fail to arrive. The symptom
+    // is always the same: the playhead is somewhere no media is, and the reader is elsewhere.
+    (video as unknown as { currentTime: number }).currentTime = 1500;
+    await new Promise((r) => setTimeout(r, 1200));
+    expect(remuxer.seeks).toEqual([1499.8]);
+  }, 10_000);
+
+  it("stops reading a place the viewer has left, and goes to where they are", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500, 0.2);
+    await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await flush();
+    const buffer = FakeSource.instances[0].buffers[0];
+
+    // The playhead is far from the media being fetched and nothing said so. Reading its way
+    // there one segment at a time is exactly what a seek looks like when it appears to
+    // recalculate the entire film — and the watchdog cannot catch it, because media *is*
+    // arriving, just nowhere useful.
+    (video as unknown as { currentTime: number }).currentTime = 1500;
+    buffer.setBuffered(0, 40);
+    video.dispatchEvent(new Event("timeupdate"));
+    await flush();
+
+    expect(remuxer.seeks).toEqual([1499.8]);
+  });
+
+  it("never runs two operations on one buffer at once, however they arrive", async () => {
+    const video = fakeVideo();
+    const onError = vi.fn();
+    const mse = await MseSource.attach(video, fakeRemuxer(500, 0.2, true, 3), PLAN, { onError, onWarning: vi.fn() });
+    await flush();
+    for (const buffer of FakeSource.instances[0].buffers) buffer.busyMs = 6;
+
+    // MediaSource permits exactly one operation per buffer, and the things that touch one are
+    // driven by unrelated events: a seek, the read loop, eviction. Firing them into the same
+    // instant is what produced a freeze that a second seek then undid.
+    await Promise.all([
+      mse.seek(600),
+      mse.seek(900),
+      (async () => {
+        video.dispatchEvent(new Event("timeupdate"));
+        video.dispatchEvent(new Event("waiting"));
+      })(),
+    ]);
+    await flush();
+    await flush();
+
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("clamps a seek past the end to the media, instead of chasing a place that is not there", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500, 0.2);
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn(), onWarning: vi.fn() });
+    await flush();
+
+    // PLAN runs an hour. Asking for two would send the reader somewhere there is nothing to
+    // read, and the recovery machinery would then keep trying to reach a time that does not exist.
+    await mse.seek(7200);
+    expect(remuxer.seeks[0]).toBeLessThanOrEqual(PLAN.durationSeconds);
+    expect(video.currentTime).toBeLessThanOrEqual(PLAN.durationSeconds + 0.2);
+  });
+
+  it("empties the queued sound the instant pause is pressed, not a second later", async () => {
+    const video = fakeVideo();
+    const mse = await MseSource.attach(video, fakeRemuxer(500), PLAN, { onError: vi.fn(), onWarning: vi.fn() });
+    await flush();
+    (video as unknown as { currentTime: number }).currentTime = 12;
+    (video as unknown as { paused: boolean }).paused = true;
+
+    video.dispatchEvent(new Event("pause"));
+
+    // No waiting: a pause followed straight away by a play is precisely the case a delay leaves
+    // untouched, and it is the one where the delay is most obvious.
+    expect(mse.debug["Dernière pause"]).toContain("recalé");
+    expect(video.currentTime).toBe(12);
+  });
+
+  it("lets a resume land where the sound actually stopped, half a second on", async () => {
+    const video = fakeVideo();
+    // Dix segments, soit vingt secondes de média, et non cinq cents.
+    //
+    // La boucle de lecture n'est pas commandée par des minuteurs : figer le temps ne l'arrête
+    // pas. Avec cinq cents segments elle continuait donc de remplir le tampon pendant que le
+    // test observait la reprise, et les surveillances de la source, voyant une horloge immobile
+    // devant un tampon qui s'allonge, poussaient la tête de lecture loin en avant — 600 s, une
+    // fois sur six, selon la charge de la machine. Un média borné retire la course : le tampon
+    // couvre les vingt secondes attendues et cesse de croître.
+    const remuxer = fakeRemuxer(10, 0.2);
+    await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn(), onWarning: vi.fn() });
+    await flush();
+    const setTime = (t: number) => ((video as unknown as { currentTime: number }).currentTime = t);
+    // Waited for rather than assumed: how far the reader has got by now depends on the machine,
+    // and this case is about a playhead standing on media. On a loaded machine it was sometimes
+    // standing on nothing instead, which is a different test and an occasional red build.
+    await until(() => video.buffered.length > 0 && video.buffered.end(0) > 13, "le tampon couvre 13 s");
+
+    setTime(12);
+    (video as unknown as { paused: boolean }).paused = true;
+    video.dispatchEvent(new Event("pause"));
+
+    // Measured on a device: the picture freezes at the button, the sound the hardware already
+    // held plays on, and the clock reports that half-second at the moment of resuming. Nothing
+    // was skipped — it was heard while the picture stood still — so pulling it back would replay
+    // it and show the wrong frame for a moment.
+    // Le temps est figé le temps de la reprise, et lui seul.
+    //
+    // L'horloge de cet élément n'avance jamais toute seule — rien dans une vidéo simulée ne le
+    // fait — donc dès qu'il joue avec du média devant lui, il est indiscernable d'un élément
+    // réellement bloqué : les surveillances de la source ont le droit de le pousser, et sur une
+    // machine chargée elles en ont le temps. Le test devenait alors rouge pour la raison même
+    // qu'il ne teste pas. Avec des minuteurs simulés, aucune d'elles ne se déclenche, et ce qui
+    // reste mesuré est ce qui était visé : la reprise ne recule pas.
+    vi.useFakeTimers();
+    try {
+      setTime(12.49);
+      (video as unknown as { paused: boolean }).paused = false;
+      video.dispatchEvent(new Event("play"));
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(video.currentTime).toBeGreaterThanOrEqual(12.49);
+      expect(video.currentTime).toBeLessThan(12.8);
+    } finally {
+      vi.useRealTimers();
+    }
+    // The behaviour under test is that the resume is not pulled *back* to where the pause was.
+    // Asserting that nothing in the whole source asked for any seek at all made this fail on a
+    // loaded machine for a reason that had nothing to do with it — the watchdog doing its job.
+    expect(remuxer.seeks.filter((at) => at < 12.4)).toEqual([]);
+  });
+
+  it("fetches the position back when the system reclaimed it during the pause", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500, 0.2);
+    await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn(), onWarning: vi.fn() });
+    await flush();
+    const setTime = (t: number) => ((video as unknown as { currentTime: number }).currentTime = t);
+    const buffers = FakeSource.instances[0].buffers;
+
+    setTime(12);
+    (video as unknown as { paused: boolean }).paused = true;
+    video.dispatchEvent(new Event("pause"));
+
+    // ManagedMediaSource is allowed to reclaim buffered media while nothing is playing, and on a
+    // phone it does. The element then comes back to find nothing where it was and carries on
+    // from the nearest media it still holds — which is the jump forward, not a drift.
+    for (const b of buffers) b.setBuffered(40, 70);
+    setTime(40); // seconds ahead: a real discontinuity, not the sound playing on
+    (video as unknown as { paused: boolean }).paused = false;
+    video.dispatchEvent(new Event("play"));
+    await flush();
+
+    // Restoring is impossible without reading again, and giving up would leave the jump in place.
+    expect(remuxer.seeks).toEqual([11.8]);
+  });
+
+  it("still puts it back when the jump happens a moment after playback resumes", async () => {
+    const video = fakeVideo();
+    await MseSource.attach(video, fakeRemuxer(500), PLAN, { onError: vi.fn(), onWarning: vi.fn() });
+    await flush();
+    const setTime = (t: number) => ((video as unknown as { currentTime: number }).currentTime = t);
+
+    setTime(12);
+    (video as unknown as { paused: boolean }).paused = true;
+    video.dispatchEvent(new Event("pause"));
+    (video as unknown as { paused: boolean }).paused = false;
+    // The play event fires before the element has actually resumed, so nothing has moved yet.
+    video.dispatchEvent(new Event("play"));
+    await flush();
+    expect(video.currentTime).toBe(12);
+
+    // Far beyond the half-second the sound plays on for: a real discontinuity, arriving after the
+    // play event rather than at it, which is why the guard has to keep looking for a moment.
+    setTime(19);
+    video.dispatchEvent(new Event("playing"));
+    await flush();
+    // Same range and same reason as above: what is under test is that the position was put back
+    // at all rather than left at nineteen, and the frozen-clock check may have pushed it on a
+    // little while the test was still running.
+    expect(video.currentTime).toBeGreaterThanOrEqual(12);
+    expect(video.currentTime).toBeLessThan(12.5);
+  });
+
+  it("lets playback simply carry on after resuming, without pulling it back", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500, 0.2);
+    await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn(), onWarning: vi.fn() });
+    await flush();
+    const setTime = (t: number) => ((video as unknown as { currentTime: number }).currentTime = t);
+
+    setTime(12);
+    (video as unknown as { paused: boolean }).paused = true;
+    video.dispatchEvent(new Event("pause"));
+    (video as unknown as { paused: boolean }).paused = false;
+    video.dispatchEvent(new Event("play"));
+
+    // Playback passes the pause position within a tenth of a second of resuming. Reading that as
+    // a jump is a yank backwards, and — where the media there has been reclaimed — a full re-read
+    // for nothing: a resume that lands a second out with a stutter, which is what was reported.
+    await new Promise((r) => setTimeout(r, 120));
+    setTime(12.1);
+    video.dispatchEvent(new Event("timeupdate"));
+    await flush();
+
+    expect(video.currentTime).toBe(12.1);
+    expect(remuxer.seeks).toEqual([]);
+  });
+
+  it("anchors where the sound actually stopped, not where the button was pressed", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500, 0.2);
+    await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn(), onWarning: vi.fn() });
+    await flush();
+    const setTime = (t: number) => ((video as unknown as { currentTime: number }).currentTime = t);
+
+    setTime(12);
+    (video as unknown as { paused: boolean }).paused = true;
+    video.dispatchEvent(new Event("pause"));
+    // The clock keeps going for a fraction of a second: the sound already handed to the hardware
+    // plays out, and it was heard. Anchoring before it makes resuming replay it.
+    for (const t of [12.2, 12.4, 12.5]) {
+      setTime(t);
+      await new Promise((r) => setTimeout(r, 90));
+    }
+
+    // Resuming from where it truly stopped: nothing to undo, and nothing replayed.
+    setTime(12.5);
+    (video as unknown as { paused: boolean }).paused = false;
+    video.dispatchEvent(new Event("play"));
+    await flush();
+    expect(video.currentTime).toBe(12.5);
+    expect(remuxer.seeks).toEqual([]);
+  }, 10_000);
+
+  it("does not undo its own step onto the media when resuming", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500, 0.2);
+    await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn(), onWarning: vi.fn() });
+    await flush();
+    const setTime = (t: number) => ((video as unknown as { currentTime: number }).currentTime = t);
+    const buffers = FakeSource.instances[0].buffers;
+
+    setTime(12);
+    (video as unknown as { paused: boolean }).paused = true;
+    video.dispatchEvent(new Event("pause"));
+
+    // Resuming just short of the media: the step onto it is deliberate and small. Reading that
+    // step as a jump and undoing it shows a frame from further on and then the right one, which
+    // is the flicker reported — and which way round it looks depends on when the eye catches it.
+    for (const b of buffers) b.setBuffered(12.2, 40);
+    (video as unknown as { paused: boolean }).paused = false;
+    video.dispatchEvent(new Event("play"));
+    await flush();
+    expect(video.currentTime).toBeCloseTo(12.24, 3);
+
+    setTime(12.3);
+    video.dispatchEvent(new Event("timeupdate"));
+    await flush();
+    expect(video.currentTime).toBe(12.3);
+    expect(remuxer.seeks).toEqual([]);
+  });
+
+  it("leaves a playhead the viewer moved while paused exactly where they put it", async () => {
+    const video = fakeVideo();
+    await MseSource.attach(video, fakeRemuxer(500), PLAN, { onError: vi.fn(), onWarning: vi.fn() });
+    await flush();
+    const setTime = (t: number) => ((video as unknown as { currentTime: number }).currentTime = t);
+
+    setTime(12);
+    (video as unknown as { paused: boolean }).paused = true;
+    video.dispatchEvent(new Event("pause"));
+    // Backwards, and far: a deliberate move, not a fraction of a second of drift.
+    setTime(5);
+    (video as unknown as { paused: boolean }).paused = false;
+    video.dispatchEvent(new Event("play"));
+    await flush();
+
+    expect(video.currentTime).toBe(5);
+  });
+
+  it("garde un saut en avant fait pendant la pause, dans ce qui est déjà chargé", async () => {
+    // Audit du 22/09/2026 : le raccourci « saut dans le tampon » sortait sans prévenir la garde de
+    // pause. Pause, saut en avant plus d'une seconde après, Lecture : la garde voyait la tête « trop
+    // loin » de sa position de pause et l'y ramenait. Seul le saut en arrière était couvert.
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500);
+    await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn(), onWarning: vi.fn() });
+    await until(() => video.buffered.length > 0 && video.buffered.end(0) > 26, "du média devant la tête");
+    const setTime = (t: number) => ((video as unknown as { currentTime: number }).currentTime = t);
+
+    setTime(12);
+    (video as unknown as { paused: boolean }).paused = true;
+    video.dispatchEvent(new Event("pause"));
+    // Plus que la fenêtre où la garde adopte d'elle-même la position.
+    await new Promise((r) => setTimeout(r, 1200));
+    setTime(25);
+    video.dispatchEvent(new Event("seeking"));
+    video.dispatchEvent(new Event("seeked"));
+    (video as unknown as { paused: boolean }).paused = false;
+    video.dispatchEvent(new Event("play"));
+    await flush();
+    video.dispatchEvent(new Event("timeupdate"));
+    await flush();
+
+    expect(video.currentTime).toBe(25);
+    expect(remuxer.seeks).toEqual([]);
+  }, 10_000);
+
+  it("ne remplit pas la trace d'un saut de lignes « après envoi »", async () => {
+    // Écrite à chaque segment, elle occupait les quarante étapes des lignes `seek` et `stall`.
+    const video = fakeVideo();
+    const mse = await MseSource.attach(video, fakeRemuxer(500), PLAN, { onError: vi.fn() });
+    await flush();
+    traceReset();
+    await mse.seek(1200);
+    await until(() => video.buffered.length > 0 && video.buffered.end(0) > 1215, "vingt secondes de média");
+    // Les lignes de ce lecteur-ci : d'autres sources de la suite, encore vivantes, écrivent dans
+    // la même trace — leur tête n'est pas à 1 200 s.
+    const lines = traceText()
+      .split("\n")
+      .filter((l) => l.includes("après envoi") && Number(/tête à ([\d.]+)/.exec(l)?.[1] ?? 0) >= 1199);
+    expect(lines.length).toBeGreaterThan(0);
+    expect(lines.length).toBeLessThanOrEqual(6);
+    mse.destroy();
+  });
+
+  it("does not move the picture under a viewer who has paused", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500);
+    await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn(), onWarning: vi.fn() });
+    await flush();
+
+    (video as unknown as { currentTime: number }).currentTime = 1500;
+    (video as unknown as { paused: boolean }).paused = true;
+    await new Promise((r) => setTimeout(r, 1200));
+    // Stranded, but paused: the frame on screen is already drawn and needs nothing. Seeking here
+    // would move the picture on its own and land the resume somewhere else.
+    expect(remuxer.seeks).toEqual([]);
+  }, 10_000);
+
+  it("clears the starting state on the very first play, before anything has been paused", async () => {
+    const video = fakeVideo();
+    const onStarting = vi.fn();
+    await MseSource.attach(video, fakeRemuxer(500), PLAN, { onError: vi.fn(), onWarning: vi.fn(), onStarting });
+    await flush();
+
+    // The automatic play at the start, with no pause ever having happened. Tying the clearing to
+    // the pause trace left this raised for ever: a spinner that never went away, and controls
+    // that hide the button behind it — so playback could not even be paused to recover.
+    video.dispatchEvent(new Event("play"));
+    expect(onStarting).toHaveBeenLastCalledWith(expect.any(Number));
+
+    (video as unknown as { currentTime: number }).currentTime = 0.5;
+    video.dispatchEvent(new Event("timeupdate"));
+    await flush();
+    expect(onStarting).toHaveBeenLastCalledWith(null);
+  });
+
+  it("waits for a picture to be presented, not for the event that precedes one", async () => {
+    const video = fakeVideo();
+    const onStarting = vi.fn();
+    // Frame-accurate notification, as Safari and Chromium both provide.
+    // Held in an object rather than a bare variable: assigning only from inside the callbacks
+    // lets TypeScript narrow the variable to never, and the calls below stop compiling.
+    const frame: { next: ((now: number, meta: { mediaTime: number }) => void) | null } = { next: null };
+    Object.assign(video, {
+      requestVideoFrameCallback: (cb: (now: number, meta: { mediaTime: number }) => void) => {
+        frame.next = cb;
+        return 1;
+      },
+      cancelVideoFrameCallback: () => {
+        frame.next = null;
+      },
+    });
+    await MseSource.attach(video, fakeRemuxer(500), PLAN, { onError: vi.fn(), onWarning: vi.fn(), onStarting });
+    await flush();
+
+    (video as unknown as { currentTime: number }).currentTime = 12;
+    video.dispatchEvent(new Event("play"));
+    expect(onStarting).toHaveBeenLastCalledWith(expect.any(Number));
+
+    // This one fires as soon as play is called, before the pipeline has begun. Treating it as
+    // the answer means nothing is ever shown at all.
+    video.dispatchEvent(new Event("playing"));
+    expect(onStarting).toHaveBeenLastCalledWith(expect.any(Number));
+
+    // A frame still at the old position: the picture has not moved.
+    frame.next?.(0, { mediaTime: 12 });
+    expect(onStarting).toHaveBeenLastCalledWith(expect.any(Number));
+
+    // And one that has.
+    frame.next?.(0, { mediaTime: 12.04 });
+    expect(onStarting).toHaveBeenLastCalledWith(null);
+  });
+
+  it("says when it has been asked to start and has not yet, and when it has", async () => {
+    const video = fakeVideo();
+    const onStarting = vi.fn();
+    await MseSource.attach(video, fakeRemuxer(500), PLAN, { onError: vi.fn(), onWarning: vi.fn(), onStarting });
+    await flush();
+    const setTime = (t: number) => ((video as unknown as { currentTime: number }).currentTime = t);
+
+    setTime(12);
+    (video as unknown as { paused: boolean }).paused = true;
+    video.dispatchEvent(new Event("pause"));
+    onStarting.mockClear();
+
+    (video as unknown as { paused: boolean }).paused = false;
+    video.dispatchEvent(new Event("play"));
+    // Reported as a fact, not as a platform: a caller can show that something is happening
+    // without asking which browser it is in, and a desktop clears this within a frame.
+    expect(onStarting).toHaveBeenLastCalledWith(expect.any(Number));
+
+    setTime(12.1);
+    video.dispatchEvent(new Event("timeupdate"));
+    await flush();
+    expect(onStarting).toHaveBeenLastCalledWith(null);
+  });
+
+  it("lands the playhead on the media a seek actually produced", async () => {
+    // An index is not exact. Asking a real file for 1568 s produced media beginning at 1570.6,
+    // and no amount of waiting or asking again could ever make it cover 1568: the recovery asked
+    // three times, was served three times, and the playhead stood on nothing until the reader
+    // concluded the browser was keeping nothing and declared playback over. A media element
+    // seeking into a gap lands on the nearest media it has, and so does this.
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500, 0.2);
+    const onError = vi.fn();
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError, onWarning: vi.fn() });
+    await flush();
+    for (const buffer of FakeSource.instances[0].buffers) buffer.landsLate = 2.6;
+
+    await mse.seek(100);
+    await until(() => video.currentTime > 100, "la tête rejoint le média");
+
+    expect(video.currentTime).toBeGreaterThanOrEqual(102.6);
+    expect(video.currentTime).toBeLessThan(104);
+    expect(onError).not.toHaveBeenCalled();
+
+    // And the licence expires with the landing. Left standing, it let a pause much later step
+    // fifteen seconds forward on its own — which is exactly what it did.
+    const settled = video.currentTime;
+    (video as unknown as { paused: boolean }).paused = true;
+    for (const buffer of FakeSource.instances[0].buffers) buffer.landsLate = 8;
+    (video as unknown as { currentTime: number }).currentTime = settled + 1;
+    video.dispatchEvent(new Event("timeupdate"));
+    await new Promise((r) => setTimeout(r, 120));
+    expect(video.currentTime).toBeCloseTo(settled + 1, 1);
+  });
+
+  it("says a source has been lost, rather than only failing on it later", async () => {
+    // Everything a report ever showed of a closed source was the consequence: some later
+    // operation tripping over the wreckage. The caller needs to be able to ask directly, because
+    // a source the platform closed is not a fault to report — it is a pipeline to build again.
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500, 0.2);
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn(), onWarning: vi.fn() });
+    await flush();
+    expect(mse.lost).toBe(false);
+
+    FakeSource.instances[0].readyState = "closed";
+    expect(mse.lost).toBe(true);
+    // And where to come back to.
+    (video as unknown as { currentTime: number }).currentTime = 42;
+    expect(mse.position).toBe(42);
+  });
+
+  it("gives a refused seek the same second chance as a refused append", async () => {
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500, 0.2);
+    const onError = vi.fn();
+    const onWarning = vi.fn();
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError, onWarning });
+    await flush();
+
+    // Reading the ranges of a buffer whose source has closed throws, and a seek reads them before
+    // it can clear anything. Declaring playback over on the first of these is what turned "one
+    // seek too many" into a dead player.
+    const [videoBuffer] = FakeSource.instances[0].buffers;
+    const own = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(videoBuffer), "buffered");
+    let refused = false;
+    Object.defineProperty(videoBuffer, "buffered", {
+      configurable: true,
+      get() {
+        if (!refused) {
+          refused = true;
+          throw Object.assign(new Error("The object is in an invalid state."), { name: "InvalidStateError" });
+        }
+        return own?.get?.call(this) ?? { length: 0 };
+      },
+    });
+
+    await mse.seek(40);
+    await flush();
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("is ready without waiting for the buffer to fill", async () => {
+    const video = fakeVideo();
+    // A remuxer that never returns: attaching must still complete, or a slow or unhelpful
+    // browser holds the whole session hostage behind a spinner with no reason to stop.
+    const stuck = { plan: () => PLAN, seekable: true, seeks: [], diagnostics: () => ({ presentationDelaySeconds: 0.2, clampedSamples: 0 }), seekTo: () => {}, nextSegment: () => new Promise(() => {}) };
+    await expect(
+      MseSource.attach(video, stuck as never, PLAN, { onError: vi.fn(), onWarning: vi.fn() })
+    ).resolves.toBeDefined();
+  });
+
+  it("stops reading a film the browser is keeping nothing from", async () => {
+    const video = fakeVideo();
+    const onError = vi.fn();
+    await MseSource.attach(video, fakeRemuxer(5000), PLAN, { onError, onWarning: vi.fn() });
+    await flush();
+
+    const buffers = FakeSource.instances[0].buffers;
+    // Accepted and discarded: every append succeeds, and the depth never moves. Reading the rest
+    // of the film to discover that is the worst possible answer.
+    for (const b of buffers) b.secondsPerAppend = 0;
+    (video as unknown as { currentTime: number }).currentTime = 5;
+    video.dispatchEvent(new Event("timeupdate"));
+    await new Promise((r) => setTimeout(r, 100));
+
+    const appendsWhileFruitless = buffers[0].appended.length;
+    await new Promise((r) => setTimeout(r, 100));
+    expect(buffers[0].appended.length).toBe(appendsWhileFruitless);
+  }, 10_000);
+
+  it("detaches cleanly, leaving nothing listening", async () => {
+    const video = fakeVideo();
+    const mse = await MseSource.attach(video, fakeRemuxer(50), PLAN, { onError: vi.fn() });
+    await flush();
+    mse.destroy();
+    const source = FakeSource.instances[0];
+    const before = source.buffers[0].appended.length;
+    source.dispatchEvent(new Event("startstreaming"));
+    await flush();
+    expect(source.buffers[0].appended.length).toBe(before);
+    expect((video as unknown as { srcObject: unknown }).srcObject).toBeNull();
+  });
+});
+
+/**
+ * Le démontage sur la branche à URL, c'est-à-dire chez tout le monde.
+ *
+ * `fakeVideo` accepte n'importe quoi dans `srcObject` et prend donc la branche préférée, celle
+ * qui n'a pas d'URL à révoquer. Aucun navigateur de la bibliothèque ne fait cela : Chrome — le
+ * seul que le journal du lecteur montre sur le chemin `remux` — refuse `srcObject = MediaSource`
+ * et se rabat sur `createObjectURL`. Ce banc modélise cet élément-là, y compris le détail qui
+ * faisait le défaut : écrire `srcObject`, même avec `null`, relance l'algorithme de chargement,
+ * lequel retombe sur l'attribut `src` quand il ne trouve pas de `srcObject`.
+ */
+function videoRefusingSrcObject(fetched: string[]): HTMLVideoElement {
+  const video = fakeVideo() as unknown as { src: string; removeAttribute: (name: string) => void };
+  Object.defineProperty(video, "srcObject", {
+    get: () => null,
+    set: (value: unknown) => {
+      if (value !== null) throw new TypeError("srcObject n'accepte qu'un MediaStream");
+      if (video.src) fetched.push(video.src);
+    },
+    configurable: true,
+  });
+  video.removeAttribute = (name: string) => {
+    if (name === "src") video.src = "";
+  };
+  return video as unknown as HTMLVideoElement;
+}
+
+/**
+ * L'échelle des reprises, et ce qu'elle écrit au journal.
+ *
+ * 22/09/2026, sur un iPhone : un saut de −10 s tombé juste avant une image clé (espacées de 10,43 s
+ * dans ce film), `seeked`, puis une horloge tenue entre 166 et 167 s pendant dix-neuf secondes sous
+ * l'indicateur de chargement — jusqu'à ce que le spectateur saute ailleurs. Deux verrous : la
+ * fenêtre des reprises rafraîchie par les appels *abandonnés* (le chien de garde appelle toutes les
+ * 250 ms, elle n'expirait donc jamais), et l'horloge figée laissée seule après trois poussées.
+ */
+describe("l'échelle des reprises", () => {
+  /** Les parties privées que ces tests pilotent à la main, pour ne dépendre d'aucune horloge réelle. */
+  type Internals = {
+    watchdog: () => void;
+    watchdogTimer: ReturnType<typeof setInterval> | null;
+    fill: () => Promise<void>;
+    fillTask: Promise<void> | null;
+    watchForFrozenClock: (at: number) => void;
+    watchForStall: () => void;
+    ladder: { escalation: number; unplayedAttempts: number };
+    frozenSince: number | null;
+    frozenNudges: number;
+  };
+  const internalsOf = (mse: MseSource) => mse as unknown as Internals;
+  /** Les images clés du fichier, sur son horloge. */
+  const withKeyframes = <T extends object>(remuxer: T, times: number[]) =>
+    Object.assign(remuxer, { keyframeAfter: (s: number) => times.find((t) => t > s) ?? null });
+  const setTime = (video: HTMLVideoElement, t: number) => ((video as unknown as { currentTime: number }).currentTime = t);
+
+  afterEach(() => vi.useRealTimers());
+
+  it("ne s'arrête plus après trois reprises : image clé suivante, puis reconstruction demandée", async () => {
+    const video = fakeVideo();
+    const remuxer = withKeyframes(fakeRemuxer(500, 0.2), [156.4, 166.9, 177.3]);
+    const onError = vi.fn();
+    const onStall = vi.fn();
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError, onWarning: vi.fn(), onStall });
+    const internals = internalsOf(mse);
+    await until(() => internals.fillTask === null && video.buffered.length > 0, "le premier remplissage est fini");
+
+    // Le chien de garde est mené à la main, 250 ms par 250 ms, sur une horloge simulée : c'est
+    // exactement la cadence qui gardait la fenêtre des reprises ouverte pour toujours.
+    if (internals.watchdogTimer) clearInterval(internals.watchdogTimer);
+    // Et rien n'arrive jamais sous la tête : c'est le cas où redemander la position ne sert à rien.
+    internals.fill = () => Promise.resolve();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const tick = async () => {
+      vi.setSystemTime(Date.now() + 250);
+      internals.watchdog();
+      await flush();
+    };
+
+    setTime(video, 166);
+    for (let i = 0; i < 60 && onError.mock.calls.length === 0; i++) await tick();
+
+    // Trois demandes de la même position, comme avant…
+    expect(remuxer.seeks.filter((at) => Math.abs(at - 165.8) < 0.01)).toHaveLength(3);
+    // …puis l'image clé suivante (166,9 s du fichier, donc 167,1 s du lecteur, un peu dedans)…
+    expect(remuxer.seeks.some((at) => Math.abs(at - 167.0) < 0.01)).toBe(true);
+    // …puis, elle aussi sans effet, la main passée à l'hôte comme pour une source perdue.
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError.mock.calls[0][1]).toBe("playback");
+    expect(mse.lost).toBe(true);
+
+    // Borné : plus rien ne part d'ici, l'hôte reconstruit.
+    const seeksSoFar = remuxer.seeks.length;
+    for (let i = 0; i < 40; i++) await tick();
+    expect(remuxer.seeks).toHaveLength(seeksSoFar);
+    expect(onError).toHaveBeenCalledTimes(1);
+
+    // Et le blocage s'est écrit au journal, une fois — le chien de garde le surveille même après
+    // avoir passé la main, puisque c'est précisément là que tout le reste s'est tu.
+    expect(onStall).toHaveBeenCalledTimes(1);
+    expect(onStall.mock.calls[0][0]).toMatchObject({ recoveries: 6, filling: false });
+    // Et ce que le réseau disait à cet instant, et où en était la relance (15/10/2026, LECTEUR-4).
+    expect(onStall.mock.calls[0][0]).toMatchObject({ onLine: true, netTrouble: false, relaunch: "garde 0/4 · échecs 0/3" });
+  });
+
+  it("compte ses propres poussées : une horloge qui n'a bougé que d'elles reste figée", async () => {
+    // 22/09/2026, 1917 sur iPhone : douze poussées en quarante secondes, aucune reprise. Chaque
+    // poussée avance l'horloge de 0,08 s — plus que le seuil de mouvement — et remettait donc le
+    // compteur à zéro : le troisième barreau n'était jamais atteint.
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(200);
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    const internals = internalsOf(mse);
+    await until(() => video.buffered.length > 0 && video.buffered.end(0) > 5, "du média devant la tête");
+    if (internals.watchdogTimer) clearInterval(internals.watchdogTimer);
+    // Le remplissage écrit encore dans la trace en arrière-plan : on la vide juste avant le geste
+    // observé, pour que la ligne attendue soit parmi les dernières, jamais dans le milieu effacé.
+    traceReset();
+
+    setTime(video, 0.25);
+    video.dispatchEvent(new Event("play"));
+    internals.watchForFrozenClock(video.currentTime);
+    for (let i = 0; i < 4; i++) {
+      internals.frozenSince = Date.now() - 5000;
+      // L'horloge est là où la poussée l'a mise, et n'en bouge pas.
+      internals.watchForFrozenClock(video.currentTime);
+    }
+    await flush();
+    // Trois poussées, puis une vraie reprise : la position redemandée à la source, tampons vidés
+    // et relus — là où l'horloge était, un pas plus loin.
+    expect(remuxer.seeks).toHaveLength(1);
+    expect(remuxer.seeks[0]).toBeCloseTo(0.25 + 4 * 0.08 - 0.2, 2);
+    expect(traceText()).toContain("malgré 3 poussées");
+  });
+
+  it("laisse un saut en cours finir de décoder avant de le pousser", async () => {
+    // Même soirée : Safari restait `seeking` avec trente secondes en tampon. Un saut au milieu
+    // d'un groupe d'images oblige à décoder depuis l'image clé précédente — neuf secondes de 4K
+    // pour 1917 —, et la poussée arrivait au bout d'une seconde et demie : elle relançait le
+    // saut, qui repartait de l'image clé, et ainsi de suite. « Une seconde de lecture pour deux
+    // de chargement », jusqu'à ce qu'un saut finisse par passer entre deux poussées.
+    // La tête à neuf secondes du début du média, comme la cible de 1917 à neuf secondes de son
+    // image clé : c'est ce que le décodeur doit traverser.
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(200);
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    const internals = internalsOf(mse);
+    await until(() => video.buffered.length > 0 && video.buffered.end(0) > 12, "du média devant la tête");
+    if (internals.watchdogTimer) clearInterval(internals.watchdogTimer);
+    const head = video.buffered.start(0) + 9;
+
+    setTime(video, head);
+    video.dispatchEvent(new Event("play"));
+    Object.assign(video, { seeking: true });
+    internals.watchForFrozenClock(head);
+    internals.frozenSince = Date.now() - 2000;
+    internals.watchForFrozenClock(head);
+    expect(video.currentTime).toBe(head);
+
+    // Un saut qui ne se résout vraiment jamais est poussé quand même, plus tard.
+    internals.frozenSince = Date.now() - 8000;
+    internals.watchForFrozenClock(head);
+    expect(video.currentTime).toBeGreaterThan(head);
+  });
+
+  it("pousse plus tôt un saut qui n'a que quelques secondes à décoder", async () => {
+    // Journal du 24/09/2026 : un +10 s dans une zone relue depuis une image clé à 2,8 s de la
+    // cible, Safari figé en `seeking` six secondes, débloqué aussitôt par la poussée. Deux fois
+    // dans la même séance sur un Mac, une fois sur un iPhone.
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(200);
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    const internals = internalsOf(mse);
+    await until(() => video.buffered.length > 0 && video.buffered.end(0) > 12, "du média devant la tête");
+    if (internals.watchdogTimer) clearInterval(internals.watchdogTimer);
+    const head = video.buffered.start(0) + 2.8;
+
+    setTime(video, head);
+    video.dispatchEvent(new Event("play"));
+    Object.assign(video, { seeking: true });
+    internals.watchForFrozenClock(head);
+    // Encore dans le délai : 1,5 s plus 0,5 s par seconde à décoder, soit 2,9 s.
+    internals.frozenSince = Date.now() - 2500;
+    internals.watchForFrozenClock(head);
+    expect(video.currentTime).toBe(head);
+    internals.frozenSince = Date.now() - 3200;
+    internals.watchForFrozenClock(head);
+    expect(video.currentTime).toBeGreaterThan(head);
+  });
+
+  it("pousse tôt une ouverture figée au bord du média, une seule fois", async () => {
+    // Her sur iPhone (10/10/2026) : un tiers des ouvertures depuis le début restaient figées sur
+    // l'instant d'atterrissage jusqu'à la poussée de 1,5 s — un « second chargement ».
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(200);
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    const internals = internalsOf(mse);
+    await until(() => video.buffered.length > 0 && video.buffered.end(0) > 12, "du média devant la tête");
+    if (internals.watchdogTimer) clearInterval(internals.watchdogTimer);
+    const head = video.buffered.start(0) + 0.04;
+
+    setTime(video, head);
+    video.dispatchEvent(new Event("play"));
+    internals.watchForFrozenClock(head);
+    internals.frozenSince = Date.now() - 300;
+    internals.watchForFrozenClock(head);
+    expect(video.currentTime).toBe(head);
+    internals.frozenSince = Date.now() - 450;
+    internals.watchForFrozenClock(head);
+    expect(video.currentTime).toBeGreaterThan(head);
+    // La suivante garde le délai ordinaire.
+    const pushed = video.currentTime;
+    internals.frozenSince = Date.now() - 450;
+    internals.watchForFrozenClock(pushed);
+    expect(video.currentTime).toBe(pushed);
+  });
+
+  it("la poussée de l'ouverture laisse 600 ms à un élément tout juste reparti", async () => {
+    // Même trace : un élément qui vient d'émettre `playing` produit encore sa première image.
+    const video = fakeVideo();
+    const mse = await MseSource.attach(video, fakeRemuxer(200), PLAN, { onError: vi.fn() });
+    const internals = internalsOf(mse) as ReturnType<typeof internalsOf> & { lastPlayingAt: number };
+    await until(() => video.buffered.length > 0 && video.buffered.end(0) > 12, "du média devant la tête");
+    if (internals.watchdogTimer) clearInterval(internals.watchdogTimer);
+    const head = video.buffered.start(0) + 0.04;
+    setTime(video, head);
+    video.dispatchEvent(new Event("play"));
+    video.dispatchEvent(new Event("playing"));
+    internals.watchForFrozenClock(head);
+    internals.frozenSince = Date.now() - 450;
+    internals.watchForFrozenClock(head);
+    expect(video.currentTime).toBe(head);
+    // Le délai passé, la poussée revient.
+    internals.lastPlayingAt = Date.now() - 700;
+    internals.frozenSince = Date.now() - 450;
+    internals.watchForFrozenClock(head);
+    expect(video.currentTime).toBeGreaterThan(head);
+  });
+
+  describe("la position redemandée 100 ms après l'atterrissage de l'ouverture", () => {
+    // 8.30.9, un iPhone (10/10/2026) : WarGames, La Flamme, Drive ouverts en 14 à 373 ms, puis
+    // figés sur l'atterrissage jusqu'à la poussée de 400 ms — que le chien de garde ne livrait qu'à 500.
+    type Opening = Internals & {
+      armOpeningReassert: (at: number) => void;
+      guard: { opened: (at: number, owed?: boolean) => void; playing: () => void };
+    };
+    const tick = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    async function opened() {
+      const video = fakeVideo();
+      const mse = await MseSource.attach(video, fakeRemuxer(200), PLAN, { onError: vi.fn() });
+      const internals = mse as unknown as Opening;
+      await until(() => video.buffered.length > 0 && video.buffered.end(0) > 12, "du média devant la tête");
+      if (internals.watchdogTimer) clearInterval(internals.watchdogTimer);
+      return { video, internals };
+    }
+
+    it("redemande la position une fois, à ~100 ms, sur une ouverture figée au bord du média", async () => {
+      const { video, internals } = await opened();
+      const head = video.buffered.start(0) + 0.04;
+      internals.guard.opened(head);
+      setTime(video, head);
+      internals.armOpeningReassert(head);
+      await tick(60);
+      expect(video.currentTime).toBe(head);
+      await tick(80);
+      expect(video.currentTime).toBeCloseTo(head + 0.08, 5);
+      // Une seule fois : armée de nouveau, elle ne repart pas.
+      const pushed = video.currentTime;
+      internals.armOpeningReassert(pushed);
+      await tick(150);
+      expect(video.currentTime).toBe(pushed);
+    });
+
+    it("ne touche pas une reprise posée loin derrière son image clé", async () => {
+      const { video, internals } = await opened();
+      const head = video.buffered.start(0) + 2.8;
+      internals.guard.opened(head);
+      setTime(video, head);
+      internals.armOpeningReassert(head);
+      await tick(150);
+      expect(video.currentTime).toBe(head);
+    });
+
+    it("ne relance pas un placement que Safari vient d'achever (playing avant la minuterie)", async () => {
+      // Mathis, iPhone, 8.32.9 (10/10/2026) : « repart à 0,27 s » et « position redemandée » à la même
+      // milliseconde — le pas relançait le saut et refigeait l'élément jusqu'à la poussée de 400 ms.
+      const { video, internals } = await opened();
+      const head = video.buffered.start(0) + 0.04;
+      internals.guard.opened(head);
+      setTime(video, head);
+      internals.armOpeningReassert(head);
+      await tick(40);
+      video.dispatchEvent(new Event("playing"));
+      await tick(120);
+      expect(video.currentTime).toBe(head);
+    });
+
+    // 26/10/2026 : la poussée de l'ouverture attendait le passage suivant du chien de garde — 750 ms
+    // en médiane après `playing` sur iPhone au lieu des 600 voulus. Elle a désormais sa minuterie.
+    it("après `playing`, une ouverture figée est poussée au bout du délai de grâce, sans attendre le chien de garde", async () => {
+      const { video, internals } = await opened();
+      const head = video.buffered.start(0) + 0.04;
+      internals.guard.opened(head);
+      setTime(video, head);
+      video.dispatchEvent(new Event("playing"));
+      await tick(450);
+      expect(video.currentTime).toBe(head);
+      await tick(250);
+      expect(video.currentTime).toBeCloseTo(head + 0.08, 5);
+    });
+
+    it("un élément parti pendant le délai de grâce n'est pas poussé", async () => {
+      const { video, internals } = await opened();
+      const head = video.buffered.start(0) + 0.04;
+      internals.guard.opened(head);
+      setTime(video, head);
+      video.dispatchEvent(new Event("playing"));
+      await tick(300);
+      setTime(video, head + 0.3);
+      await tick(400);
+      expect(video.currentTime).toBe(head + 0.3);
+    });
+
+    it("une reprise posée loin de son image clé n'a pas cette poussée", async () => {
+      const { video, internals } = await opened();
+      const head = video.buffered.start(0) + 2.8;
+      internals.guard.opened(head);
+      setTime(video, head);
+      video.dispatchEvent(new Event("playing"));
+      await tick(700);
+      expect(video.currentTime).toBe(head);
+    });
+
+    it("ne relance pas non plus un élément qui a de quoi avancer et ne saute plus quand elle tombe en retard", async () => {
+      const { video, internals } = await opened();
+      const head = video.buffered.start(0) + 0.04;
+      internals.guard.opened(head);
+      setTime(video, head);
+      Object.assign(video, { seeking: false, readyState: 4 });
+      internals.armOpeningReassert(head);
+      await tick(150);
+      expect(video.currentTime).toBe(head);
+    });
+
+    it("relance une fois un placement vraiment resté en suspens (toujours en saut à 100 ms)", async () => {
+      const { video, internals } = await opened();
+      const head = video.buffered.start(0) + 0.04;
+      internals.guard.opened(head);
+      setTime(video, head);
+      Object.assign(video, { seeking: true, readyState: 1 });
+      internals.armOpeningReassert(head);
+      await tick(150);
+      expect(video.currentTime).toBeCloseTo(head + 0.08, 5);
+    });
+
+    it("un seeked après l'atterrissage annule la relance", async () => {
+      const { video, internals } = await opened();
+      const head = video.buffered.start(0) + 0.04;
+      internals.guard.opened(head);
+      setTime(video, head);
+      internals.armOpeningReassert(head);
+      video.dispatchEvent(new Event("seeked"));
+      await tick(150);
+      expect(video.currentTime).toBe(head);
+    });
+
+    it("ne fait rien quand l'horloge est partie d'elle-même", async () => {
+      const { video, internals } = await opened();
+      const head = video.buffered.start(0) + 0.04;
+      internals.guard.opened(head);
+      setTime(video, head);
+      internals.armOpeningReassert(head);
+      setTime(video, head + 0.3);
+      await tick(150);
+      expect(video.currentTime).toBeCloseTo(head + 0.3, 5);
+    });
+  });
+
+  it("écrit un blocage une fois, avec de quoi le comprendre, et pas davantage", async () => {
+    const video = fakeVideo();
+    Object.assign(video, { readyState: 2, networkState: 2, seeking: false });
+    const onStall = vi.fn();
+    const mse = await MseSource.attach(video, fakeRemuxer(500), PLAN, { onError: vi.fn(), onStall });
+    const internals = internalsOf(mse);
+    await until(() => internals.fillTask === null && video.buffered.length > 0, "le premier remplissage est fini");
+    if (internals.watchdogTimer) clearInterval(internals.watchdogTimer);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const after = (ms: number) => {
+      vi.setSystemTime(Date.now() + ms);
+      internals.watchForStall();
+    };
+
+    setTime(video, 5);
+    internals.watchForStall();
+    // Trois secondes : rien encore — les reprises ont le temps d'agir avant que ce soit un fait.
+    after(3000);
+    expect(onStall).not.toHaveBeenCalled();
+    after(2500);
+    expect(onStall).toHaveBeenCalledTimes(1);
+    const facts = onStall.mock.calls[0][0] as Record<string, unknown>;
+    expect(facts).toMatchObject({
+      position: 5,
+      readyState: 2,
+      networkState: 2,
+      seeking: false,
+      source: "open",
+      filling: false,
+      recoveryStreak: 0,
+      frozenNudges: 0,
+      recoveries: 0,
+      streaming: true,
+    });
+    expect(facts.stalledMs).toBeGreaterThanOrEqual(5000);
+    expect(facts.videoBuffered).toMatch(/^0\.00–\d+\.\d\d$/);
+    expect(facts.audioBuffered).toMatch(/–/);
+    expect(facts.lead).toBeGreaterThan(0);
+    expect(typeof facts.sinceAppendMs).toBe("number");
+    // Rien d'imbriqué au-delà d'un niveau : `clean()` aplatit un objet (`diag.*`), et jetterait le reste.
+    const nested = (value: unknown) => typeof value === "object" && value !== null;
+    for (const value of Object.values(facts)) {
+      if (nested(value)) for (const inner of Object.values(value as object)) expect(nested(inner)).toBe(false);
+    }
+    // Hors séance, le diagnostic est vide ; la ligne le porte quand même.
+    expect(facts).toHaveProperty("diag");
+    expect(facts.steps).toContain("lecture bloquée");
+
+    // Le même blocage qui dure : pas une ligne de plus.
+    after(10_000);
+    expect(onStall).toHaveBeenCalledTimes(1);
+    // Il repart, se refige aussitôt : un nouvel épisode, mais dans la minute — toujours rien.
+    setTime(video, 7);
+    after(250);
+    after(6000);
+    expect(onStall).toHaveBeenCalledTimes(1);
+    // Passé la minute, un nouveau blocage s'écrit.
+    after(60_000);
+    setTime(video, 9);
+    after(250);
+    after(6000);
+    expect(onStall).toHaveBeenCalledTimes(2);
+
+    // Et une pause n'est pas un blocage.
+    (video as unknown as { paused: boolean }).paused = true;
+    after(120_000);
+    after(6000);
+    expect(onStall).toHaveBeenCalledTimes(2);
+  });
+  it("ne prend pas l'attente réseau d'un saut pour un blocage, mais garde le saut qui ne se résout pas", async () => {
+    // Banc du 22/09/2026, serveur lointain : quatre lignes `stall`, toutes des sauts qui
+    // attendaient leur média — la ligne `seek` en porte déjà la durée.
+    const video = fakeVideo();
+    const onStall = vi.fn();
+    const mse = await MseSource.attach(video, fakeRemuxer(500), PLAN, { onError: vi.fn(), onStall });
+    const internals = internalsOf(mse);
+    await until(() => internals.fillTask === null && video.buffered.length > 0, "le premier remplissage est fini");
+    if (internals.watchdogTimer) clearInterval(internals.watchdogTimer);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const after = (ms: number) => {
+      vi.setSystemTime(Date.now() + ms);
+      internals.watchForStall();
+    };
+
+    // Tête loin de tout média, `seeking` : le réseau travaille.
+    Object.assign(video, { seeking: true });
+    setTime(video, 900);
+    internals.watchForStall();
+    after(3000);
+    after(3000);
+    expect(onStall).not.toHaveBeenCalled();
+
+    // Le même `seeking`, média sous la tête : ce n'est plus le réseau, c'est un saut qui ne se
+    // résout pas, et il s'écrit.
+    setTime(video, 5);
+    internals.watchForStall();
+    after(3000);
+    after(2500);
+    expect(onStall).toHaveBeenCalledTimes(1);
+  });
+
+  it("écrit une horloge qui avance sans rien sous la tête", async () => {
+    // 22/09/2026, iPhone : « le temps avance de plusieurs dizaines de secondes, pas d'image, et ça
+    // ne s'arrête pas tant que je ne ressaute pas ». Une horloge qui court n'est pas un blocage aux
+    // yeux de la ligne `stall` : rien ne l'écrivait.
+    const video = fakeVideo();
+    Object.assign(video, { seeking: false });
+    const onStall = vi.fn();
+    const remuxer = fakeRemuxer(500);
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn(), onStall });
+    const internals = internalsOf(mse);
+    await until(() => internals.fillTask === null && video.buffered.length > 0, "le premier remplissage est fini");
+    if (internals.watchdogTimer) clearInterval(internals.watchdogTimer);
+    vi.useFakeTimers({ toFake: ["Date"] });
+
+    // Bien au-delà du média, et l'horloge avance.
+    let at = 400;
+    setTime(video, at);
+    internals.watchForStall();
+    for (let i = 0; i < 20; i++) {
+      vi.setSystemTime(Date.now() + 250);
+      at += 0.25;
+      setTime(video, at);
+      internals.watchForStall();
+    }
+    expect(onStall).toHaveBeenCalledTimes(1);
+    expect(onStall.mock.calls[0][0]).toMatchObject({ runaway: true });
+    expect(onStall.mock.calls[0][0].steps).toContain("horloge qui avance sans média");
+    // Et ce n'est plus seulement écrit : la position est redemandée, tampons vidés et relus.
+    // Aucune autre surveillance ne le voyait — une lecture était en cours, la tête était « au
+    // bord » du média, et l'horloge bougeait.
+    await flush();
+    expect(remuxer.seeks.length).toBeGreaterThan(0);
+  });
+
+  it("une horloge qui court sans média ne compte pas comme de la lecture pour l'échelle", async () => {
+    // Chasse du 18/11/2026 : les trois secondes « jouées » qui remettent l'échelle à zéro étaient
+    // comptées même sans rien sous la tête — exactement le temps qu'il faut à la tête partie pour se
+    // déclarer. Chaque reprise d'une horloge qui s'enfuit effaçait donc l'échelle, et le moteur
+    // reprenait sans fin au lieu de monter jusqu'au passage de main.
+    const video = fakeVideo();
+    Object.assign(video, { seeking: false });
+    const remuxer = fakeRemuxer(500);
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn(), onStall: vi.fn() });
+    const internals = internalsOf(mse);
+    await until(() => internals.fillTask === null && video.buffered.length > 0, "le premier remplissage est fini");
+    if (internals.watchdogTimer) clearInterval(internals.watchdogTimer);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    internals.ladder.escalation = 1;
+    internals.ladder.unplayedAttempts = 7;
+
+    let at = 400;
+    setTime(video, at);
+    internals.watchForStall();
+    for (let i = 0; i < 20; i++) {
+      vi.setSystemTime(Date.now() + 250);
+      at += 0.25;
+      setTime(video, at);
+      internals.watchForStall();
+    }
+    expect(internals.ladder.escalation).toBeGreaterThanOrEqual(1);
+    expect(internals.ladder.unplayedAttempts).toBeGreaterThanOrEqual(7);
+  });
+});
+
+describe("MseSource sur un élément qui refuse srcObject", () => {
+  let created: string[];
+  let revoked: string[];
+
+  beforeEach(() => {
+    created = [];
+    revoked = [];
+    vi.stubGlobal("URL", {
+      createObjectURL: () => {
+        const url = `blob:mse-${created.length}`;
+        created.push(url);
+        return url;
+      },
+      revokeObjectURL: (url: string) => revoked.push(url),
+    });
+  });
+
+  // Le symptôme tel qu'il se lisait en production : `GET blob:https://…/<uuid>
+  // net::ERR_FILE_NOT_FOUND` dans la console, à chaque fermeture du lecteur natif. Ce n'était
+  // pas quelque chose qui revenait tardivement sur une URL morte — c'était le nettoyage
+  // lui-même qui la redemandait, ayant révoqué avant de retirer l'attribut.
+  it("ne redemande pas l'URL qu'il vient de révoquer", async () => {
+    const fetched: string[] = [];
+    const video = videoRefusingSrcObject(fetched);
+    const mse = await MseSource.attach(video, fakeRemuxer(50), PLAN, { onError: vi.fn() });
+    await flush();
+
+    // Sans cela le banc passerait en ne prouvant rien : c'est la branche à URL qui est en cause.
+    expect(created).toHaveLength(1);
+    expect((video as unknown as { src: string }).src).toBe(created[0]);
+
+    mse.destroy();
+
+    expect(revoked).toEqual(created);
+    expect(fetched.filter((url) => revoked.includes(url))).toEqual([]);
+    expect((video as unknown as { src: string }).src).toBe("");
+  });
+});
+
+
+// Trois « Media failed to decode » sur un iPhone 12 (23/09/2026) n'ont laissé au journal que leur
+// motif : la ligne `rebuild` est écrite au prochain envoi refusé, quand les tampons sont déjà
+// détachés. L'état est donc relevé à l'erreur de l'élément, et c'est celui-là qu'on rapporte.
+describe("lossReport", () => {
+  it("rapporte les tampons tels qu'ils étaient à l'erreur, et la trace qui y mène", async () => {
+    const video = fakeVideo();
+    const mse = await MseSource.attach(video, fakeRemuxer(40), PLAN, { onError: vi.fn() });
+    await until(() => video.buffered.length > 0 && video.buffered.end(0) > 4, "du média devant la tête");
+
+    video.dispatchEvent(new Event("error"));
+    // Puis la plateforme ferme la source : les tampons ne se lisent plus.
+    const source = FakeSource.instances.at(-1)!;
+    source.readyState = "closed";
+    for (const buffer of source.buffers) {
+      Object.defineProperty(buffer, "buffered", {
+        get: () => {
+          throw new DOMException("removed", "InvalidStateError");
+        },
+      });
+    }
+
+    const report = mse.lossReport();
+    expect(report.videoBuffered).toMatch(/^0\.00–/);
+    expect(report.source).toBe("open");
+    expect(String(report.steps)).toContain("l'élément a échoué");
+    mse.destroy();
+  });
+
+  it("se contente de l'état présent quand aucune erreur n'a été vue", async () => {
+    const video = fakeVideo();
+    const mse = await MseSource.attach(video, fakeRemuxer(40), PLAN, { onError: vi.fn() });
+    await until(() => video.buffered.length > 0, "du média");
+    expect(mse.lossReport()).toEqual(expect.objectContaining({ position: expect.any(Number), steps: expect.any(String) }));
+    mse.destroy();
+  });
+});
+
+// 14/10/2026 : un « Media failed to decode » après un saut arrière (iPhone, Lucifer S01E05) n'a
+// laissé que « illisible (source fermée) » — la source était déjà fermée quand l'élément a signalé
+// l'erreur. Les faits d'un échec sont désormais relevés avant, et chacun dans sa garde.
+describe("faits d'un échec de décodage", () => {
+  /** Des fragments fMP4 véritables : deux secondes chacun, première image montrée 42 ms après. */
+  function fragmentRemuxer(segments: number) {
+    const base = fakeRemuxer(segments);
+    let index = 0;
+    const track = { id: 1 } as MuxTrackInfo;
+    return Object.assign(base, {
+      seekTo: (s: number) => {
+        base.seeks.push(s);
+        index = 0;
+      },
+      nextSegment: async (): Promise<RemuxSegment | null> => {
+        if (index >= segments) return null;
+        index += 1;
+        const at = (index - 1) * 2_000_000;
+        const sample = { data: new Uint8Array([1, 2, 3]), decodeTime: at, duration: 2_000_000, isKeyframe: true, compositionOffset: 42_000 };
+        return { video: [mediaSegment(track, index, [sample])], audio: new Uint8Array([20 + index]), subtitles: [], endSeconds: index * 2 };
+      },
+    });
+  }
+
+  /**
+   * La plateforme ferme la source : les tampons ne se lisent plus, et l'élément — comme un vrai,
+   * détaché de sa source — n'a plus aucune plage.
+   */
+  function closeSource(video: HTMLVideoElement) {
+    Object.defineProperty(video, "buffered", { get: () => ({ length: 0 }) as unknown as TimeRanges, configurable: true });
+    const source = FakeSource.instances.at(-1)!;
+    source.readyState = "closed";
+    for (const buffer of source.buffers) {
+      Object.defineProperty(buffer, "buffered", {
+        get: () => {
+          throw new DOMException("removed", "InvalidStateError");
+        },
+      });
+    }
+  }
+
+  it("rapporte les tampons du dernier envoi, les images, le message et le fragment sous la tête", async () => {
+    const video = fakeVideo();
+    Object.assign(video, {
+      getVideoPlaybackQuality: () => ({ totalVideoFrames: 120, droppedVideoFrames: 2, corruptedVideoFrames: 1 }),
+    });
+    const mse = await MseSource.attach(video, fragmentRemuxer(8), PLAN, { onError: vi.fn() });
+    await until(() => video.buffered.length > 0 && video.buffered.end(0) >= 6, "trois fragments au moins");
+    video.currentTime = 3.5;
+
+    // Dans l'ordre de WebKit : la source se ferme d'abord, l'élément signale ensuite.
+    closeSource(video);
+    Object.defineProperty(video, "error", { value: { code: 3, message: "PIPELINE_ERROR_DECODE" }, configurable: true });
+    video.dispatchEvent(new Event("error"));
+
+    const report = mse.lossReport();
+    expect(report.videoBuffered).toBe("illisible (source fermée)");
+    expect(report.lastBuffered).toMatch(/^vidéo 0\.00–\d+\.00 · audio 0\.00–\d+\.00 — après envoi (vidéo|audio), \d+ ms avant$/);
+    expect(report.videoQuality).toBe("total 120 · perdues 2 · corrompues 1");
+    expect(report.mediaError).toBe("3 « PIPELINE_ERROR_DECODE »");
+    expect(report.lastFragment).toMatch(/^n°\d+ \(\d+e depuis le saut\) dts \d+\.000 pts \d+\.042 · tête -?[\d.+-]+ s · envoyé \d+ ms avant$/);
+    // La tête à 3,5 s est dans le deuxième fragment, qui commence à 2,042 s.
+    expect(report.headFragment).toBe("n°2 (2e) pts 2.042 · tête +1.46 s");
+    // `steps` reste le dernier champ de la ligne.
+    expect(Object.keys(report).at(-1)).toBe("steps");
+    mse.destroy();
+  });
+
+  it("n'ajoute rien de ce qu'il ne sait pas", async () => {
+    // L'élément simulé n'a ni compteur d'images ni erreur ; les fragments ne sont pas des moof.
+    const video = fakeVideo();
+    const mse = await MseSource.attach(video, fakeRemuxer(40), PLAN, { onError: vi.fn() });
+    await until(() => video.buffered.length > 0, "du média");
+    const report = mse.lossReport();
+    expect(report).not.toHaveProperty("videoQuality");
+    expect(report).not.toHaveProperty("mediaError");
+    expect(report).not.toHaveProperty("lastFragment");
+    expect(report).not.toHaveProperty("headFragment");
+    expect(report.lastBuffered).toEqual(expect.any(String));
+    mse.destroy();
+  });
+
+  it("une lecture qui lève perd ce fait-là, jamais les autres ni la ligne", async () => {
+    const video = fakeVideo();
+    Object.assign(video, {
+      getVideoPlaybackQuality: () => {
+        throw new Error("indisponible");
+      },
+    });
+    Object.defineProperty(video, "error", {
+      get: () => {
+        throw new Error("illisible");
+      },
+      configurable: true,
+    });
+    const onError = vi.fn();
+    const mse = await MseSource.attach(video, fragmentRemuxer(8), PLAN, { onError });
+    await until(() => video.buffered.length > 0 && video.buffered.end(0) >= 4, "du média");
+    video.currentTime = 1;
+    closeSource(video);
+    // Directement, sans l'événement : `elementState`, qui lit aussi `error` pour la trace, n'est
+    // pas l'objet de ce test.
+    (mse as unknown as { noteLoss: () => void }).noteLoss();
+    const report = mse.lossReport();
+    expect(report).not.toHaveProperty("videoQuality");
+    expect(report).not.toHaveProperty("mediaError");
+    expect(report.lastFragment).toEqual(expect.stringMatching(/^n°/));
+    expect(report.steps).toEqual(expect.any(String));
+    expect(onError).not.toHaveBeenCalled();
+    mse.destroy();
+  });
+
+  it("un état illisible n'emporte plus les faits de l'échec ni la trace", async () => {
+    const video = fakeVideo();
+    const mse = await MseSource.attach(video, fragmentRemuxer(8), PLAN, { onError: vi.fn() });
+    await until(() => video.buffered.length > 0 && video.buffered.end(0) >= 4, "du média");
+    closeSource(video);
+    // L'élément lui-même lève à son tour : `stateFacts` ne peut rien relever.
+    Object.defineProperty(video, "buffered", {
+      get: () => {
+        throw new DOMException("removed", "InvalidStateError");
+      },
+      configurable: true,
+    });
+    const report = mse.lossReport();
+    expect(report).not.toHaveProperty("position");
+    expect(report.lastBuffered).toEqual(expect.stringMatching(/^vidéo 0\.00–/));
+    expect(report.lastFragment).toEqual(expect.stringMatching(/^n°/));
+    expect(report.steps).toEqual(expect.any(String));
+    mse.destroy();
+  });
+
+  it("trace le vidage d'un saut : durée de chaque piste et ce qui reste", async () => {
+    const video = fakeVideo();
+    const mse = await MseSource.attach(video, fragmentRemuxer(40), PLAN, { onError: vi.fn() });
+    await until(() => video.buffered.length > 0, "du média");
+    await mse.seek(600);
+    expect(traceText()).toMatch(/vidage fait \(vidéo \d+ ms, audio \d+ ms\) — reste vidéo vide · audio vide/);
+    mse.destroy();
+  });
+
+  it("ne garde, après un saut, que les fragments envoyés depuis le vidage", async () => {
+    const video = fakeVideo();
+    const remuxer = fragmentRemuxer(3);
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await until(() => (mse as unknown as { sentFragments: unknown[] }).sentFragments.length === 3, "trois fragments");
+    await mse.seek(1200);
+    await until(() => (mse as unknown as { fragmentsSinceSeek: number }).fragmentsSinceSeek > 0, "un fragment après le saut");
+    const kept = (mse as unknown as { sentFragments: { n: number }[] }).sentFragments;
+    expect(kept[0].n).toBe(1);
+    mse.destroy();
+  });
+
+  it("n'est pas porté par les lignes `stall`", async () => {
+    const video = fakeVideo();
+    const mse = await MseSource.attach(video, fragmentRemuxer(4), PLAN, { onError: vi.fn() });
+    await until(() => video.buffered.length > 0, "du média");
+    const stall = (mse as unknown as { stallReport: (now: number, ms: number) => Record<string, unknown> }).stallReport(1, 5000);
+    for (const key of ["lastBuffered", "videoQuality", "mediaError", "lastFragment", "headFragment"]) expect(stall).not.toHaveProperty(key);
+    mse.destroy();
+  });
+});
+
+// Chasse aux bugs du 24/09/2026.
+describe("relu le 24/09/2026", () => {
+  type Internals = {
+    watchdogTimer: ReturnType<typeof setInterval> | null;
+    watchForStall: () => void;
+    pendingStart: number | null;
+  };
+
+  // Une ouverture en cours de film attend son premier média la tête à zéro : ce n'est pas un
+  // blocage, c'est le réseau (Love Story, 23/09 : un « stall » à 0 s pour une ouverture lente).
+  it("n'écrit pas de blocage pendant qu'une ouverture attend son média", async () => {
+    const video = fakeVideo();
+    Object.assign(video, { readyState: 0, networkState: 2, seeking: false });
+    const onStall = vi.fn();
+    // Rien n'arrive : le lecteur est pointé sur 1200 s et n'a encore rien envoyé.
+    const remuxer = Object.assign(fakeRemuxer(500), { nextSegment: () => new Promise<null>(() => {}) });
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn(), onStall }, 1200);
+    const internals = mse as unknown as Internals;
+    if (internals.watchdogTimer) clearInterval(internals.watchdogTimer);
+    expect(internals.pendingStart).toBe(1200);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    internals.watchForStall();
+    for (let i = 0; i < 10; i++) {
+      vi.setSystemTime(Date.now() + 1000);
+      internals.watchForStall();
+    }
+    expect(onStall).not.toHaveBeenCalled();
+    vi.useRealTimers();
+    mse.destroy();
+  });
+
+  // Un saut qui attend une lecture réseau pendant qu'une reconstruction détruit la source : il ne
+  // doit plus toucher l'élément, que le lecteur suivant est en train d'ouvrir.
+  it("ne déplace plus l'élément une fois détruite", async () => {
+    const video = fakeVideo();
+    // Le saut attend la lecture en cours : c'est pendant cette attente que la source part. La
+    // lecture est tenue jusqu'à la destruction plutôt que de durer 30 ms — sous la charge de la
+    // construction de l'image, 30 ms s'écoulaient avant la destruction et le test échouait sans que
+    // rien n'ait changé (24/09/2026).
+    // Le premier segment passe ; la lecture du deuxième reste en cours jusqu'à la destruction.
+    const remuxer = fakeRemuxer(500, 0.2, true);
+    const read = remuxer.nextSegment.bind(remuxer);
+    let reads = 0;
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => (release = resolve));
+    remuxer.nextSegment = async () => {
+      reads += 1;
+      if (reads > 1) await held;
+      return read();
+    };
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await until(() => video.buffered.length > 0 && reads > 1, "du média, et une lecture en cours");
+    const seeking = mse.seek(900);
+    await flush();
+    mse.destroy();
+    release();
+    await seeking;
+    expect(video.currentTime).not.toBeCloseTo(900, 0);
+  });
+});
+
+// Le média lu avant la cible d'un saut ne la couvre pas, et n'a pas à le faire : il n'est pas
+// « rien retenu » (relu le 24/09/2026).
+describe("la lecture d'avance d'un saut", () => {
+  it("ne compte pas comme un refus du navigateur", async () => {
+    const video = fakeVideo();
+    // Un saut qui repart 18 s avant sa cible — un index qui ment — et lit par tranches de 2 s.
+    let base = 0;
+    let index = 0;
+    const seeks: number[] = [];
+    const remuxer = Object.assign(fakeRemuxer(500), {
+      seeks,
+      seekTo: (at: number) => {
+        seeks.push(at);
+        base = Math.max(0, at - 18);
+        index = 0;
+      },
+      nextSegment: async () => {
+        index += 1;
+        const endSeconds = base + index * 2;
+        // Passé la cible, le média la couvre, comme dans un vrai tampon.
+        if (endSeconds > 100) for (const buffer of FakeSource.instances[0].buffers) buffer.coversNothing = false;
+        return { video: [new Uint8Array([index])], audio: new Uint8Array([index]), subtitles: [], endSeconds };
+      },
+    });
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await until(() => video.buffered.length > 0, "du média");
+    // Rien ne couvre la cible tant que la lecture d'avance ne l'a pas atteinte.
+    for (const buffer of FakeSource.instances[0].buffers) buffer.coversNothing = true;
+    await mse.seek(100);
+    await until(() => index >= 14, "la lecture d'avance, puis la cible");
+    // Pas de reprise : une seule demande de lecture, celle du saut.
+    expect(seeks.filter((at) => at > 50)).toHaveLength(1);
+    mse.destroy();
+  });
+});
+
+// Une image figée, média sous la tête : l'échelle doit monter, pas recommencer ses poussées après
+// chaque reprise (relu le 24/09/2026 — 62 s avant le lecteur serveur, 21 s une fois corrigé).
+describe("une image figée qui ne repart pas", () => {
+  it("gravit l'échelle jusqu'à céder la main en moins de 40 s", async () => {
+    const video = fakeVideo();
+    const remuxer = Object.assign(fakeRemuxer(5000, 0.2), { keyframeAfter: (s: number) => s + 3 });
+    const onError = vi.fn();
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError, onWarning: vi.fn() });
+    const internals = mse as unknown as { watchdog: () => void; watchdogTimer: ReturnType<typeof setInterval> | null; fillTask: Promise<void> | null };
+    await until(() => internals.fillTask === null && video.buffered.length > 0 && video.buffered.end(0) > 5, "le remplissage");
+    if (internals.watchdogTimer) clearInterval(internals.watchdogTimer);
+    Object.assign(video, { seeking: false });
+    (video as unknown as { currentTime: number }).currentTime = 0.25;
+    video.dispatchEvent(new Event("play"));
+    vi.useFakeTimers({ toFake: ["Date"] });
+    let ms = 0;
+    for (; ms < 40_000 && onError.mock.calls.length === 0; ms += 250) {
+      vi.setSystemTime(Date.now() + 250);
+      internals.watchdog();
+      await flush();
+      await flush();
+      await until(() => internals.fillTask === null, "le remplissage d'après reprise");
+    }
+    vi.useRealTimers();
+    expect(onError).toHaveBeenCalled();
+    mse.destroy();
+  }, 60_000);
+});
+
+// Une coupure réseau pendant qu'il reste de l'avance : le tampon est gardé, la lecture reprend là
+// où elle s'était arrêtée (relu le 24/09/2026 — un redéploiement vidait trente secondes d'image).
+describe("une coupure réseau avec de l'avance", () => {
+  const networkError = () => Object.assign(new Error("Load failed"), { network: true });
+  afterEach(() => vi.useRealTimers());
+
+  it("garde le tampon, retire seulement ce qui sera relu, et reprend", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const video = fakeVideo();
+    const onError = vi.fn();
+    let index = 0;
+    let failOnce = false;
+    const seeks: number[] = [];
+    const remuxer = Object.assign(fakeRemuxer(500), {
+      seeks,
+      seekTo: (at: number) => {
+        seeks.push(at);
+        index = Math.floor(at / 2);
+      },
+      diagnostics: () => ({ presentationDelaySeconds: 0.2, clampedSamples: 0, segmentStartSeconds: index * 2 }),
+      nextSegment: async () => {
+        if (failOnce) {
+          failOnce = false;
+          throw networkError();
+        }
+        index += 1;
+        return { video: [new Uint8Array([index])], audio: new Uint8Array([index]), subtitles: [], endSeconds: index * 2 };
+      },
+    });
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError });
+    await vi.waitFor(() => expect(video.buffered.length > 0 && video.buffered.end(0) > 10).toBe(true));
+    const buffers = FakeSource.instances[0].buffers;
+    const removedBefore = buffers.map((b) => b.removed.length);
+    const seeksBefore = seeks.length;
+
+    // La prochaine lecture échoue, avec largement plus de 5 s d'avance sous la tête.
+    failOnce = true;
+    (video as unknown as { currentTime: number }).currentTime = 1;
+    await (mse as unknown as { fill: () => Promise<void> }).fill();
+    // Rien de vidé, pas de saut : le film continue sur ce qu'il a.
+    expect(buffers.map((b) => b.removed.length)).toEqual(removedBefore);
+    expect(seeks.length).toBe(seeksBefore);
+    // Et rien n'est lu avant le nouvel essai, qui repositionne d'abord le lecteur de fichier.
+    const readsBefore = index;
+    await (mse as unknown as { fill: () => Promise<void> }).fill();
+    expect(index).toBe(readsBefore);
+
+    await vi.advanceTimersByTimeAsync(1100);
+    // La lecture a repris là où elle s'était arrêtée, sans passer par une reprise…
+    expect(seeks.length).toBe(seeksBefore + 1);
+    // …et seul ce qui allait être relu a été retiré, jamais depuis zéro.
+    const removals = buffers.flatMap((b) => b.removed.slice(removedBefore[buffers.indexOf(b)]));
+    expect(removals.length).toBeGreaterThan(0);
+    for (const [from] of removals) expect(from).toBeGreaterThan(1);
+    expect(onError).not.toHaveBeenCalled();
+    mse.destroy();
+    vi.useRealTimers();
+  });
+
+  // Le groupe relu commence sous la tête (un groupe de 25 s, un nouvel essai tardif) : le retirer
+  // enlèverait l'image en cours. La reprise habituelle, plutôt.
+  it("ne retire jamais le média sous la tête", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const video = fakeVideo();
+    let index = 0;
+    let failOnce = false;
+    const seeks: number[] = [];
+    const remuxer = Object.assign(fakeRemuxer(500), {
+      seeks,
+      seekTo: (at: number) => {
+        seeks.push(at);
+        index = Math.floor(at / 2);
+      },
+      // Le groupe relu commence au tout début : bien avant la tête.
+      diagnostics: () => ({ presentationDelaySeconds: 0.2, clampedSamples: 0, segmentStartSeconds: 0 }),
+      nextSegment: async () => {
+        if (failOnce) {
+          failOnce = false;
+          throw networkError();
+        }
+        index += 1;
+        return { video: [new Uint8Array([index])], audio: new Uint8Array([index]), subtitles: [], endSeconds: index * 2 };
+      },
+    });
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await vi.waitFor(() => expect(video.buffered.length > 0 && video.buffered.end(0) > 10).toBe(true));
+    const buffers = FakeSource.instances[0].buffers;
+    const removedBefore = buffers.map((b) => b.removed.length);
+    failOnce = true;
+    (video as unknown as { currentTime: number }).currentTime = 5;
+    await (mse as unknown as { fill: () => Promise<void> }).fill();
+    await vi.advanceTimersByTimeAsync(1100);
+    // Aucun retrait partiel sous la tête : soit rien, soit le vidage complet d'une reprise.
+    const removals = buffers.flatMap((b, i) => b.removed.slice(removedBefore[i]));
+    for (const [from] of removals) expect(from === 0 || from > 5).toBe(true);
+    expect(traceText()).toContain("sous la tête — reprise habituelle");
+    mse.destroy();
+  });
+
+  it("vide et reprend comme avant quand il ne reste presque rien", async () => {
+    const video = fakeVideo();
+    let failNext = false;
+    const remuxer = Object.assign(fakeRemuxer(500), {
+      nextSegment: async () => {
+        if (failNext) {
+          failNext = false;
+          throw networkError();
+        }
+        return { video: [new Uint8Array([1])], audio: new Uint8Array([1]), subtitles: [], endSeconds: 2 };
+      },
+    });
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await until(() => video.buffered.length > 0, "du média");
+    const internals = mse as unknown as { lead: number; fill: () => Promise<void>; fillTask: Promise<void> | null };
+    await until(() => internals.fillTask === null, "le remplissage");
+    // La tête au bout du média : moins de 5 s d'avance.
+    (video as unknown as { currentTime: number }).currentTime = video.buffered.end(0) - 1;
+    const seeksBefore = remuxer.seeks.length;
+    failNext = true;
+    await internals.fill();
+    await flush();
+    expect(remuxer.seeks.length).toBeGreaterThan(seeksBefore);
+    mse.destroy();
+  });
+
+  // `readUpTo` est sur l'horloge du fichier : le nouvel essai lui retirait pourtant le décalage de
+  // présentation une seconde fois. Arrêtée pile sur une image clé, la lecture repartait alors du
+  // groupe précédent, qui commence sous la tête — et la « reprise habituelle » vidait les deux
+  // tampons, exactement ce que ce mécanisme existe pour éviter (audit du 29/09/2026).
+  it("reprend au groupe qui commence là où la lecture s'était arrêtée, même pile sur une image clé", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const video = fakeVideo();
+    const onError = vi.fn();
+    // Des groupes de 8 s livrés en segments de 2 s, comme le vrai remultiplexeur livre un groupe en
+    // plusieurs fragments ; `seekTo` repart de l'image clé à l'instant demandé ou avant.
+    const GROUP = 8;
+    let next = 0;
+    let groupStart = 0;
+    let failOnce = false;
+    const seeks: number[] = [];
+    const remuxer = Object.assign(fakeRemuxer(500), {
+      seeks,
+      keyframeAtOrBefore: (s: number) => Math.floor(s / GROUP) * GROUP,
+      seekTo: (at: number) => {
+        seeks.push(at);
+        groupStart = Math.floor(at / GROUP) * GROUP;
+        next = groupStart / 2;
+      },
+      diagnostics: () => ({ presentationDelaySeconds: 0.2, clampedSamples: 0, segmentStartSeconds: groupStart }),
+      nextSegment: async () => {
+        if (failOnce) {
+          failOnce = false;
+          throw networkError();
+        }
+        next += 1;
+        groupStart = Math.floor(((next - 1) * 2) / GROUP) * GROUP;
+        return { video: [new Uint8Array([next])], audio: new Uint8Array([next]), subtitles: [], endSeconds: next * 2 };
+      },
+    });
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError });
+    await vi.waitFor(() => expect(video.buffered.length > 0 && video.buffered.end(0) >= 30).toBe(true));
+    const internals = mse as unknown as { fill: () => Promise<void>; readUpTo: number; lead: number };
+    // Un segment de plus, qui ferme un groupe : la lecture s'arrête pile sur une image clé (32 s).
+    (video as unknown as { currentTime: number }).currentTime = 1;
+    await internals.fill();
+    expect(internals.readUpTo).toBe(32);
+    const buffers = FakeSource.instances[0].buffers;
+    const removedBefore = buffers.map((b) => b.removed.length);
+
+    // La tête à 25 s : 7 s d'avance, au-dessus des 5 s qui font garder le tampon.
+    (video as unknown as { currentTime: number }).currentTime = 25;
+    expect(internals.lead).toBeGreaterThanOrEqual(5);
+    failOnce = true;
+    const seeksBefore = seeks.length;
+    await internals.fill();
+    await vi.advanceTimersByTimeAsync(1100);
+
+    // Le nouvel essai repart de 32 s, l'image clé où la lecture s'était arrêtée…
+    expect(seeks[seeksBefore]).toBeGreaterThanOrEqual(32 - 0.01);
+    // …et le tampon d'avant est gardé : aucun vidage depuis zéro.
+    const removals = buffers.flatMap((b, i) => b.removed.slice(removedBefore[i]));
+    for (const [from] of removals) expect(from).toBeGreaterThan(25);
+    expect(onError).not.toHaveBeenCalled();
+    mse.destroy();
+  });
+});
+
+// Fuzz du 24/09/2026 (graine 30054481) : pendant qu'un saut est servi, le spectateur saute dans une
+// zone encore dans le tampon. Le raccourci « déjà chargé » ne demandait rien, puis le saut en cours
+// vidait les tampons et ramenait la tête sur sa propre cible : le dernier geste était perdu.
+describe("un saut dans le tampon pendant qu'un autre est servi", () => {
+  it("laisse le dernier geste l'emporter", async () => {
+    const video = fakeVideo();
+    // Comme un vrai élément : écrire `currentTime` — y compris quand c'est la source qui le fait —
+    // déclenche `seeking`. C'est ce `seeking`-là qui effaçait la cible du spectateur.
+    let head = 0;
+    Object.defineProperty(video, "currentTime", {
+      get: () => head,
+      set: (t: number) => {
+        head = t;
+        queueMicrotask(() => video.dispatchEvent(new Event("seeking")));
+      },
+      configurable: true,
+    });
+    const mse = await MseSource.attach(video, fakeRemuxer(500, 0.2, true, 30), PLAN, { onError: vi.fn() });
+    const internals = mse as unknown as { watchdogTimer: ReturnType<typeof setInterval> | null };
+    // Sans le chien de garde : c'est le saut lui-même qui doit servir le dernier geste, pas un
+    // rattrapage une demi-seconde plus tard.
+    if (internals.watchdogTimer) clearInterval(internals.watchdogTimer);
+    await until(() => video.buffered.length > 0 && video.buffered.end(0) > 8, "du média");
+    const setTime = (t: number) => ((video as unknown as { currentTime: number }).currentTime = t);
+
+    // Un saut loin, hors du tampon : il attend la lecture en cours avant d'être servi…
+    setTime(900);
+    await Promise.resolve();
+    // …et le doigt revient aussitôt dans ce qui est encore chargé.
+    setTime(5);
+
+    await until(() => !mse.seekPending || video.currentTime !== 900, "le saut servi", 3000);
+    await new Promise((r) => setTimeout(r, 200));
+    expect(video.currentTime).toBeCloseTo(5, 0);
+    mse.destroy();
+  });
+});
+
+/**
+ * Ce que Safari retire de lui-même (24/09/2026).
+ *
+ * Trois sauts « dans le chargé » ont trouvé leur cible vide 0,7 s plus tard, sans qu'on puisse
+ * dire si c'était le système ou ce lecteur. ManagedMediaSource le dit par `bufferedchange` : le
+ * lecteur l'écrit, le compte, et relit tout de suite ce qui manque devant la tête.
+ */
+describe("les évictions du navigateur", () => {
+  type Facts = { recoveryFacts: { evictions: number; evictionsAhead: number } };
+  const setTime = (video: HTMLVideoElement, t: number) => ((video as unknown as { currentTime: number }).currentTime = t);
+
+  it("écrit ce que le navigateur retire, et ne compte pas ses propres retraits", async () => {
+    FakeBuffer.managed = true;
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(200);
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await until(() => video.buffered.length > 0 && video.buffered.end(0) > 20, "du média devant la tête");
+    // Un saut : ce lecteur vide ses deux tampons, et le système l'annonce comme tout retrait.
+    await mse.seek(40);
+    await until(() => video.buffered.length > 0 && video.buffered.end(0) > 60, "le saut rempli");
+    expect((mse as unknown as Facts).recoveryFacts.evictions).toBe(0);
+    expect(traceText()).not.toContain("le navigateur a retiré");
+
+    // Derrière la tête : noté, rien à relire.
+    setTime(video, 50);
+    const seeks = remuxer.seeks.length;
+    FakeSource.instances[0].buffers[0].systemEvicts(40, 45);
+    await flush();
+    expect(traceText()).toContain("le navigateur a retiré vidéo 40.00–45.00 — tête à 50.0 s");
+    expect((mse as unknown as Facts).recoveryFacts).toMatchObject({ evictions: 1, evictionsAhead: 0 });
+    expect(remuxer.seeks).toHaveLength(seeks);
+    mse.destroy();
+  });
+
+  it("relit tout de suite ce qui manque devant la tête, sans toucher à ce qui est dessous", async () => {
+    FakeBuffer.managed = true;
+    const video = fakeVideo();
+    const onError = vi.fn();
+    let index = 0;
+    const seeks: number[] = [];
+    const remuxer = Object.assign(fakeRemuxer(500), {
+      seeks,
+      seekTo: (at: number) => {
+        seeks.push(at);
+        index = Math.floor(at / 2);
+      },
+      diagnostics: () => ({ presentationDelaySeconds: 0.2, clampedSamples: 0, segmentStartSeconds: index * 2 }),
+      nextSegment: async () => {
+        index += 1;
+        return { video: [new Uint8Array([index])], audio: new Uint8Array([index]), subtitles: [], endSeconds: index * 2 };
+      },
+    });
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError });
+    const internals = mse as unknown as { fillTask: Promise<void> | null };
+    await until(() => internals.fillTask === null && video.buffered.length > 0 && video.buffered.end(0) >= 30, "le premier remplissage est fini");
+    setTime(video, 2);
+    const buffers = FakeSource.instances[0].buffers;
+    const removedBefore = buffers.map((b) => b.removed.length);
+
+    // Le système retire les douze dernières secondes de l'image : l'avance tombe de 30 à 18 s.
+    buffers[0].systemEvicts(20, 40);
+    await until(() => seeks.length > 0, "le lecteur de fichier renvoyé au trou");
+    // Au début du trou, sur l'horloge du fichier…
+    expect(seeks[0]).toBeCloseTo(19.8, 5);
+    expect(traceText()).toContain("devant elle dès 20.0 s");
+    expect(traceText()).toContain("relecture de ce que le navigateur a retiré, depuis 20.0 s");
+    await until(() => internals.fillTask === null && buffers[0].appended.length > 20, "la relecture envoyée");
+    // …et rien n'a été retiré sous la tête : seulement ce qui allait être relu.
+    const removals = buffers.flatMap((b, i) => b.removed.slice(removedBefore[i]));
+    expect(removals.length).toBeGreaterThan(0);
+    for (const [from] of removals) expect(from).toBeGreaterThan(2);
+    // Le retrait de la relecture est le sien : il ne compte pas comme une éviction.
+    expect((mse as unknown as Facts).recoveryFacts).toMatchObject({ evictions: 1, evictionsAhead: 1 });
+    expect(onError).not.toHaveBeenCalled();
+    mse.destroy();
+  });
+
+  it("ne relit pas plus de trois fois par minute un système qui retire à mesure", async () => {
+    FakeBuffer.managed = true;
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(2000);
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    const internals = mse as unknown as { fillTask: Promise<void> | null };
+    await until(() => internals.fillTask === null && video.buffered.length > 0 && video.buffered.end(0) >= 30, "le premier remplissage est fini");
+    traceReset();
+    for (let i = 0; i < 5; i++) {
+      const end = video.buffered.end(0);
+      FakeSource.instances[0].buffers[0].systemEvicts(end - 5, end);
+      await until(() => internals.fillTask === null, "la relecture finie");
+      await flush();
+    }
+    expect(traceText().match(/relecture de ce que le navigateur a retiré/g)?.length ?? 0).toBeLessThanOrEqual(3);
+    expect(traceText()).toContain("retraits répétés");
+    mse.destroy();
+  });
+
+  it("ne s'abonne à rien sur une MediaSource ordinaire", async () => {
+    const video = fakeVideo();
+    const mse = await MseSource.attach(video, fakeRemuxer(50), PLAN, { onError: vi.fn() });
+    await until(() => video.buffered.length > 0, "du média");
+    FakeSource.instances[0].buffers[0].systemEvicts(0, 4);
+    await flush();
+    expect((mse as unknown as Facts).recoveryFacts.evictions).toBe(0);
+    mse.destroy();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Une zone illisible dans le fichier (DECISIONS.md §93) : ni fin de flux, ni reprise, un seul relais.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Un remultiplexeur qui donne `good` segments de 2 s, puis lève la zone illisible que le lecteur
+ * de fichier strict lève — à chaque appel, comme le ferait le même endroit relu. Après un saut,
+ * repart de la cible : la zone reste à son instant, seuls les segments d'avant elle sortent.
+ */
+function zoneRemuxer(good: number, zone: { byte: number; seconds: number; safe: number; resumeAfter: number | null }) {
+  let produced = 0;
+  let from = 0;
+  const seeks: number[] = [];
+  let calls = 0;
+  const remuxer = {
+    seeks,
+    get calls() {
+      return calls;
+    },
+    seekable: true,
+    plan: () => PLAN,
+    keyframeAtOrBefore: (s: number) => Math.floor(s / 2) * 2,
+    keyframeAfter: (s: number) => Math.floor(s / 2) * 2 + 2,
+    resumeAfterByte: () => zone.resumeAfter,
+    diagnostics: () => ({ presentationDelaySeconds: 0, clampedSamples: 0 }),
+    seekTo: (s: number) => {
+      seeks.push(s);
+      from = s;
+      produced = 0;
+    },
+    prepareSeek: () => {},
+    nextSegment: async (): Promise<RemuxSegment | null> => {
+      calls += 1;
+      const end = from + (produced + 1) * 2;
+      // Au-delà de la zone (un saut par-dessus) : du film ordinaire.
+      if (from < zone.seconds && (produced >= good || end > zone.seconds)) throw new UnreadableZone(zone.byte, zone.seconds, zone.safe);
+      produced += 1;
+      return { video: [new Uint8Array([30 + produced])], audio: new Uint8Array([40 + produced]), subtitles: [], endSeconds: end };
+    },
+  };
+  return remuxer as unknown as Remuxer & { seeks: number[]; calls: number };
+}
+
+describe("MseSource — zone illisible (§93)", () => {
+  const ZONE = { byte: 169510505, seconds: 12.4, safe: 11, resumeAfter: 20 };
+
+  it("garde ce qui est là, ne déclare pas la fin, ne relit pas, et prévient l'hôte une fois", async () => {
+    const video = fakeVideo();
+    const onError = vi.fn();
+    const onUnreadableZone = vi.fn();
+    const remuxer = zoneRemuxer(5, ZONE);
+    await MseSource.attach(video, remuxer, PLAN, { onError, onUnreadableZone });
+    await until(() => onUnreadableZone.mock.calls.length > 0, "zone annoncée");
+    const callsAtZone = remuxer.calls;
+    await new Promise((r) => setTimeout(r, 400));
+
+    expect(onUnreadableZone).toHaveBeenCalledTimes(1);
+    const event = onUnreadableZone.mock.calls[0][0];
+    expect(event.kind).toBe("held");
+    expect(event.zone.message).toBe("zone illisible dans le fichier vers 12,4 s (octet 169510505)");
+    // La fin de ce qui est sûr (11 s, moins la marge) — avant la fin du tampon (10 s, moins la marge).
+    expect(event.zone.switchAt).toBeCloseTo(9.5, 5);
+    expect(event.zone.resumeAfter).toBe(20);
+    // Rien d'autre n'est demandé au remultiplexeur : relire relirait les mêmes zéros.
+    expect(remuxer.calls).toBe(callsAtZone);
+    expect(remuxer.seeks).toEqual([]);
+    expect(onError).not.toHaveBeenCalled();
+    expect(FakeSource.instances[0].endedTimes).toBe(0);
+    expect(traceText()).not.toContain("fin du fichier");
+    expect(traceText()).toContain("zone illisible dans le fichier vers 12,4 s");
+  });
+
+  it("passe la main une seule fois quand la tête arrive au relais — sans reprise ni reconstruction", async () => {
+    const video = fakeVideo();
+    const onError = vi.fn();
+    const onUnreadableZone = vi.fn();
+    const remuxer = zoneRemuxer(5, ZONE);
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError, onUnreadableZone });
+    await until(() => onUnreadableZone.mock.calls.length > 0, "zone annoncée");
+    (video as unknown as { currentTime: number }).currentTime = 9.6;
+    await until(() => onError.mock.calls.length > 0, "relais");
+    // Le chien de garde continue de tourner : il ne doit ni reprendre ni relayer une seconde fois.
+    await new Promise((r) => setTimeout(r, 800));
+    expect(onError).toHaveBeenCalledTimes(1);
+    const [message, kind, facts] = onError.mock.calls[0];
+    expect(message).toBe("zone illisible dans le fichier vers 12,4 s (octet 169510505)");
+    expect(kind).toBe("playback");
+    expect(facts).toMatchObject({ unreadableZone: true, zoneByte: 169510505, zoneSeconds: 12.4, resumeAt: 9.5, resumeAfter: 20 });
+    expect(remuxer.seeks).toEqual([]);
+    // Ni « perdue » (l'hôte reconstruirait au même endroit), ni fin de flux.
+    expect(mse.lost).toBe(false);
+    expect(FakeSource.instances[0].endedTimes).toBe(0);
+  });
+
+  it("un saut dans la zone passe la main tout de suite, là où il visait, sans lire", async () => {
+    const video = fakeVideo();
+    const onError = vi.fn();
+    const remuxer = zoneRemuxer(5, ZONE);
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError, onUnreadableZone: () => {} });
+    await until(() => traceText().includes("zone illisible dans le fichier"), "zone atteinte");
+    await mse.seek(14);
+    await until(() => onError.mock.calls.length > 0, "relais");
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError.mock.calls[0][2]).toMatchObject({ unreadableZone: true, resumeAt: 14 });
+    expect(remuxer.seeks).toEqual([]);
+  });
+
+  it("un saut au-delà de la zone la quitte : l'hôte est prévenu, la lecture native continue", async () => {
+    const video = fakeVideo();
+    const onError = vi.fn();
+    const onUnreadableZone = vi.fn();
+    const remuxer = zoneRemuxer(5, ZONE);
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError, onUnreadableZone });
+    await until(() => onUnreadableZone.mock.calls.length > 0, "zone annoncée");
+    await mse.seek(30);
+    await until(() => remuxer.seeks.length > 0, "saut servi");
+    await until(() => remuxer.calls > 8, "lecture reprise après la zone");
+    expect(onUnreadableZone.mock.calls[1][0]).toMatchObject({ kind: "left", target: 30 });
+    expect(remuxer.seeks[0]).toBeCloseTo(30, 5);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("un saut en arrière la quitte, et la lecture la retrouve en y revenant", async () => {
+    const video = fakeVideo();
+    const onUnreadableZone = vi.fn();
+    const onError = vi.fn();
+    const remuxer = zoneRemuxer(5, ZONE);
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError, onUnreadableZone });
+    await until(() => onUnreadableZone.mock.calls.length > 0, "zone annoncée");
+    (video as unknown as { currentTime: number }).currentTime = 6;
+    await mse.seek(2);
+    await until(() => onUnreadableZone.mock.calls.length >= 3, "zone retrouvée");
+    expect(onUnreadableZone.mock.calls.map((c) => c[0].kind)).toEqual(["held", "left", "held"]);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("une ouverture qui tombe dans la zone passe la main sur-le-champ, à sa position", async () => {
+    const video = fakeVideo();
+    const onError = vi.fn();
+    await MseSource.attach(video, zoneRemuxer(0, { ...ZONE, seconds: 0.5, safe: 0 }), PLAN, { onError, onUnreadableZone: () => {} });
+    await until(() => onError.mock.calls.length > 0, "relais");
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError.mock.calls[0][2]).toMatchObject({ unreadableZone: true, resumeAt: 0 });
+    expect(FakeSource.instances[0].endedTimes).toBe(0);
+  });
+});
+
+/**
+ * Une coupure en pleine lecture, bornée par le temps (DECISIONS.md §97, LECTEUR-4). Avant : l'échelle
+ * des envois refusés (`appendFailures` / `recover`) vidait les tampons pour relire sur le même réseau
+ * absent, et l'écran « connexion perdue » ne venait qu'après quatre à sept minutes d'image figée.
+ * Le silence du réseau est celui de la source (`networkSilentMs`, testé avec un `fetch` factice dans
+ * webcodecs-byteSource.test.ts) ; ici, le remultiplexeur le rend d'après ce que le test décide.
+ */
+describe("une coupure en pleine lecture, bornée (§97)", () => {
+  const networkError = () => Object.assign(new Error("Plage inaccessible : Load failed"), { network: true });
+  afterEach(() => vi.useRealTimers());
+
+  /**
+   * Un film qui a joué, la tête au bout du média, et un réseau dans l'état `mode` : `reject` (chaque
+   * lecture échoue — hors ligne après sa minute de patience, ou un refus immédiat), `hang` (la lecture
+   * pend — requête sans réponse, `onLine` vrai), `ok`.
+   */
+  async function playingThenCut() {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const video = fakeVideo();
+    const onError = vi.fn();
+    let mode: "ok" | "reject" | "hang" = "ok";
+    let silentSince: number | null = null;
+    let index = 0;
+    const seeks: number[] = [];
+    const hung: (() => void)[] = [];
+    const remuxer = Object.assign(fakeRemuxer(5000), {
+      seeks,
+      seekTo: (at: number) => {
+        seeks.push(at);
+        index = Math.floor(at / 2);
+      },
+      diagnostics: () => ({ presentationDelaySeconds: 0.2, clampedSamples: 0, segmentStartSeconds: index * 2 }),
+      networkSilentMs: () => (silentSince === null ? 0 : Date.now() - silentSince),
+      nextSegment: async () => {
+        if (mode === "reject") throw networkError();
+        if (mode === "hang") {
+          await new Promise<void>((resolve) => hung.push(resolve));
+          if ((mode as string) !== "ok") throw networkError(); // relu après l'attente : `restore` a pu le changer
+        }
+        index += 1;
+        silentSince = null;
+        return { video: [new Uint8Array([index])], audio: new Uint8Array([index]), subtitles: [], endSeconds: index * 2 };
+      },
+    });
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError });
+    await vi.waitFor(() => expect(video.buffered.length > 0 && video.buffered.end(0) > 10).toBe(true));
+    video.dispatchEvent(new Event("playing"));
+    const buffers = FakeSource.instances[0].buffers;
+    const removedBefore = buffers.map((b) => b.removed.length);
+    const cut = (to: "reject" | "hang") => {
+      mode = to;
+      silentSince = Date.now();
+      // La tête arrive au bout du média : à court, rien sous elle — l'image figée d'une vraie coupure.
+      (video as unknown as { currentTime: number }).currentTime = video.buffered.end(0);
+      void (mse as unknown as { fill: () => Promise<void> }).fill();
+    };
+    const restore = () => {
+      mode = "ok";
+      hung.splice(0).forEach((f) => f());
+    };
+    const fullClears = () => buffers.flatMap((b, i) => b.removed.slice(removedBefore[i])).filter(([from]) => from === 0).length;
+    return { mse, video, onError, seeks, cut, restore, fullClears, buffers };
+  }
+
+  it("refus à chaque lecture : ni reprise ni vidage, des essais sans compter, puis la main à l'hôte à 48 s de silence", async () => {
+    const { mse, onError, cut, fullClears } = await playingThenCut();
+    cut("reject");
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(onError).not.toHaveBeenCalled();
+    expect(fullClears()).toBe(0);
+    expect(traceText()).toMatch(/coupure réseau .*essai n°6/);
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError.mock.calls[0][1]).toBe("network");
+    expect(onError.mock.calls[0][0]).toMatch(/aucun octet reçu depuis 4[89] s/);
+    // Rien ne part plus d'ici : l'hôte a la main.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(fullClears()).toBe(0);
+    mse.destroy();
+  });
+
+  it("requête pendante, `onLine` vrai : la borne vient du silence, pas d'une erreur — la lecture pend encore", async () => {
+    const { mse, onError, cut, restore, buffers } = await playingThenCut();
+    cut("hang");
+    await vi.advanceTimersByTimeAsync(47_000);
+    expect(onError).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError.mock.calls[0][1]).toBe("network");
+    // La requête finit par répondre après coup : rien n'est envoyé sur un pipeline rendu à l'hôte.
+    const appended = buffers.map((b) => b.appended.length);
+    restore();
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(buffers.map((b) => b.appended.length)).toEqual(appended);
+    mse.destroy();
+  });
+
+  it("le réseau revient avant l'échéance, la lecture encore en attente : elle reprend où elle était, sans reconstruction ni vidage", async () => {
+    // Le cas de la passe de nuit (hors ligne, la lecture attend `online`) : reprise en 0,4 s, gardée.
+    const { mse, video, onError, cut, restore, fullClears } = await playingThenCut();
+    const end = video.buffered.end(0);
+    cut("hang");
+    await vi.advanceTimersByTimeAsync(20_000);
+    restore();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(video.buffered.end(0)).toBeGreaterThan(end + 1);
+    expect(onError).not.toHaveBeenCalled();
+    expect(fullClears()).toBe(0);
+    // Et la borne ne vient plus : le silence est fini. (L'horloge de ce modèle n'avance pas : seule
+    // l'erreur réseau compte ici, le chien de garde de l'horloge figée a ses propres tests.)
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(onError.mock.calls.filter(([, kind]) => kind === "network")).toEqual([]);
+    mse.destroy();
+  });
+
+  it("le réseau revient avant l'échéance après des lectures en échec : le nouvel essai reprend, sans passer la main à l'hôte", async () => {
+    // La tête posée au bout du média : le groupe relu commence sous elle, et c'est la reprise
+    // habituelle (`trimBeforeNextAppend`) qui sert — un saut, pas une reconstruction.
+    const { mse, video, onError, cut, restore } = await playingThenCut();
+    const end = video.buffered.end(0);
+    cut("reject");
+    await vi.advanceTimersByTimeAsync(20_000);
+    restore();
+    await vi.advanceTimersByTimeAsync(9000);
+    expect(video.buffered.end(0)).toBeGreaterThan(end - 1);
+    expect(onError).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(onError.mock.calls.filter(([, kind]) => kind === "network")).toEqual([]);
+    mse.destroy();
+  });
+
+  it("le réseau revient pendant l'attente d'un essai : `online` le relance tout de suite", async () => {
+    const { mse, video, cut, restore } = await playingThenCut();
+    const end = video.buffered.end(0);
+    cut("reject");
+    // Assez d'essais pour que le suivant soit à 8 s.
+    await vi.advanceTimersByTimeAsync(16_000);
+    restore();
+    window.dispatchEvent(new Event("online"));
+    await vi.advanceTimersByTimeAsync(300);
+    expect(video.buffered.end(0)).toBeGreaterThan(end + 1);
+    mse.destroy();
+  });
+
+  it("en pause, ou avec de l'avance, la borne attend : seule une tête à court la déclenche", async () => {
+    const { mse, video, onError, cut } = await playingThenCut();
+    cut("reject");
+    (video as unknown as { paused: boolean }).paused = true;
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(onError).not.toHaveBeenCalled();
+    (video as unknown as { paused: boolean }).paused = false;
+    await vi.advanceTimersByTimeAsync(500);
+    expect(onError).toHaveBeenCalledTimes(1);
+    mse.destroy();
+  });
+
+  it("avant la première image de ce pipeline, l'ouverture garde son chemin d'avant", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const video = fakeVideo();
+    const onError = vi.fn();
+    const remuxer = Object.assign(fakeRemuxer(500), {
+      networkSilentMs: () => 120_000,
+      nextSegment: async () => {
+        throw networkError();
+      },
+    });
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError });
+    await vi.advanceTimersByTimeAsync(5000);
+    // L'échelle d'avant : des reprises, puis l'erreur réseau — jamais la borne de 48 s.
+    expect(remuxer.seeks.length).toBeGreaterThan(0);
+    expect(traceText()).not.toMatch(/aucun octet reçu/);
+    mse.destroy();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Audit du lecteur, 22/10/2026 : la relecture d'une éviction et le retrait sur refus de quota.
+// ---------------------------------------------------------------------------------------------
+
+describe("le débit mesuré après une relecture d'éviction", () => {
+  const setTime = (video: HTMLVideoElement, t: number) => ((video as unknown as { currentTime: number }).currentTime = t);
+
+  // Le premier segment relu repart de l'image clé d'avant le trou : ses octets couvrent tout le
+  // segment, mais sa durée était comptée depuis le trou (`readUpTo`). Trou à 25,7 s dans un segment
+  // de 24 à 26 s : 2 s d'octets sur 0,5 s, un débit ×4 qui, dans la fenêtre de `ByteRate`, divisait
+  // le budget WebKit de moitié pendant une douzaine de segments.
+  it("ne compte pas le segment relu, qui repart d'avant le trou", async () => {
+    FakeBuffer.managed = true;
+    const video = fakeVideo();
+    let index = 0;
+    const seeks: number[] = [];
+    // 1 000 octets par seconde d'image, 100 de son : deux secondes par segment.
+    const remuxer = Object.assign(fakeRemuxer(500), {
+      seeks,
+      seekTo: (at: number) => {
+        seeks.push(at);
+        index = Math.floor(at / 2);
+      },
+      diagnostics: () => ({ presentationDelaySeconds: 0.2, clampedSamples: 0, segmentStartSeconds: Math.max(0, index - 1) * 2 }),
+      nextSegment: async () => {
+        index += 1;
+        return { video: [new Uint8Array(2000)], audio: new Uint8Array(200), subtitles: [], endSeconds: index * 2 };
+      },
+    });
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    const internals = mse as unknown as {
+      fillTask: Promise<void> | null;
+      videoRate: { record(bytes: number, seconds: number): void };
+      audioRate: { record(bytes: number, seconds: number): void };
+    };
+    await until(() => internals.fillTask === null && video.buffered.length > 0 && video.buffered.end(0) >= 30, "le premier remplissage est fini");
+    setTime(video, 2);
+    const videoRecords = vi.spyOn(internals.videoRate, "record");
+    const audioRecords = vi.spyOn(internals.audioRate, "record");
+
+    FakeSource.instances[0].buffers[0].systemEvicts(25.7, 40);
+    await until(() => seeks.length > 0, "le lecteur de fichier renvoyé au trou");
+    await until(() => internals.fillTask === null && videoRecords.mock.calls.length >= 2, "la relecture envoyée et mesurée");
+
+    // Chaque segment mesuré l'est à son vrai débit ; le segment relu n'en fait pas partie.
+    for (const [bytes, seconds] of videoRecords.mock.calls) expect(bytes / seconds).toBeCloseTo(1000, 5);
+    for (const [bytes, seconds] of audioRecords.mock.calls) expect(bytes / seconds).toBeCloseTo(100, 5);
+    mse.destroy();
+  });
+});
+
+describe("le retrait sur refus de quota (`evict`) suit la règle de `trimBehind`", () => {
+  const setTime = (video: HTMLVideoElement, t: number) => ((video as unknown as { currentTime: number }).currentTime = t);
+
+  async function filled(keyframeAtOrBefore: (s: number) => number) {
+    const video = fakeVideo();
+    const remuxer = Object.assign(fakeRemuxer(20), { keyframeAtOrBefore });
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    const internals = mse as unknown as { fillTask: Promise<void> | null; evict(): void };
+    await until(() => internals.fillTask === null && video.buffered.length > 0, "le remplissage fini");
+    const [videoBuffer, audioBuffer] = FakeSource.instances[0].buffers;
+    videoBuffer.setBuffered(0, 80);
+    audioBuffer.setBuffered(0, 80);
+    setTime(video, 60);
+    return { mse, internals, videoBuffer, audioBuffer, before: [videoBuffer.removed.length, audioBuffer.removed.length] };
+  }
+
+  // Aucune image clé connue sous la tête (`behindLimit` → 0) : l'image n'a rien à céder sans perdre
+  // celle qu'on voit, mais le son, dont chaque trame est une image clé, a tout ce qui précède
+  // `wanted`. Une seule borne pour les deux tampons, et un `until <= 0` sur celle de l'image, ne
+  // retiraient rien du tout.
+  it("retire le son derrière la tête même quand l'image n'a rien à céder", async () => {
+    const { mse, internals, videoBuffer, audioBuffer, before } = await filled(() => null as unknown as number);
+    internals.evict();
+    await flush();
+    expect(videoBuffer.removed.slice(before[0])).toEqual([]);
+    // 60 s − 30 s gardées derrière.
+    expect(audioBuffer.removed.slice(before[1])).toEqual([[0, 30]]);
+    mse.destroy();
+  });
+
+  // Un long groupe ouvert à 20 s : l'image s'arrête avant son image clé, le son va jusqu'à `wanted`.
+  // Borné comme l'image, il gardait dix secondes de plus derrière la tête, sous un plafond plein.
+  it("retire le son jusqu'à la limite exacte, l'image jusqu'à l'image clé de la tête", async () => {
+    const { mse, internals, videoBuffer, audioBuffer, before } = await filled((s) => (s >= 20 && s < 100 ? 20 : Math.floor(s / 2) * 2));
+    internals.evict();
+    await flush();
+    const [[videoFrom, videoUntil]] = videoBuffer.removed.slice(before[0]);
+    expect(videoFrom).toBe(0);
+    expect(videoUntil).toBeCloseTo(20 + 0.2 - 0.05, 5);
+    expect(audioBuffer.removed.slice(before[1])).toEqual([[0, 30]]);
+    mse.destroy();
+  });
+
+  // Sans index, rien ne change : on retire quand même jusqu'à `wanted`, faute de mieux.
+  it("sans index, retire les deux tampons jusqu'à la limite", async () => {
+    const { mse, internals, videoBuffer, audioBuffer, before } = await filled(() => 0);
+    Object.assign((mse as unknown as { remuxer: { seekable: boolean } }).remuxer, { seekable: false });
+    internals.evict();
+    await flush();
+    expect(videoBuffer.removed.slice(before[0])).toEqual([[0, 30]]);
+    expect(audioBuffer.removed.slice(before[1])).toEqual([[0, 30]]);
+    mse.destroy();
+  });
+});

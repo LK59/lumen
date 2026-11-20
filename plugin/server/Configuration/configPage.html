@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Lumen</title>
+</head>
+<body>
+    <div id="LumenConfigPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button,emby-checkbox">
+        <div data-role="content">
+            <div class="content-primary">
+                <form id="LumenConfigForm">
+                    <div class="sectionTitleContainer flex align-items-center">
+                        <h2 class="sectionTitle">Lumen</h2>
+                    </div>
+                    <p>
+                        With Lumen, the web client plays files as they are: the browser remuxes them and decodes the
+                        audio itself, and the server only sends bytes. A file Lumen cannot play is played as before,
+                        by the regular player.
+                    </p>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label class="emby-checkbox-label">
+                            <input id="LumenEnabled" type="checkbox" is="emby-checkbox" />
+                            <span>Enable the plugin</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription">
+                            When disabled, the web client page is served without the Lumen script: nothing is played
+                            by Lumen and nothing is logged. Takes effect the next time the page is loaded.
+                        </div>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label class="emby-checkbox-label">
+                            <input id="LumenPlayback" type="checkbox" is="emby-checkbox" />
+                            <span>Play with Lumen</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription">
+                            When unchecked, the script stays in the page but lets the regular player do the playing.
+                            This is the switch to flip for a comparison: playbacks are then logged "without Lumen",
+                            measured the same way.
+                        </div>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label class="emby-checkbox-label">
+                            <input id="LumenAllUsers" type="checkbox" is="emby-checkbox" />
+                            <span>For all users</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription">
+                            When unchecked, Lumen only plays for the users selected below.
+                        </div>
+                    </div>
+                    <div id="LumenUsers" class="checkboxList paperList" style="padding: 0.5em 1em; margin-bottom: 1.5em;"></div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label class="emby-checkbox-label">
+                            <input id="LumenJournal" type="checkbox" is="emby-checkbox" />
+                            <span>Log playbacks</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription">
+                            Every playback in the web client is recorded on the server: user, title, player, and what
+                            the viewer waited for (first frame, seeks, stalls). The log stays on this server and is
+                            shown below.
+                        </div>
+                    </div>
+                    <div>
+                        <button is="emby-button" type="submit" class="raised button-submit block emby-button">
+                            <span>Save</span>
+                        </button>
+                    </div>
+                </form>
+
+                <div class="sectionTitleContainer flex align-items-center" style="margin-top: 2.5em;">
+                    <h2 class="sectionTitle">Playback log</h2>
+                    <button is="emby-button" type="button" id="LumenJournalRefresh" class="raised emby-button" style="margin-left: 1em;"><span>Refresh</span></button>
+                    <button is="emby-button" type="button" id="LumenJournalClear" class="raised emby-button" style="margin-left: 0.5em;"><span>Clear</span></button>
+                </div>
+                <p class="fieldDescription">
+                    Times run from the playback request to the first frame shown. Medians only compare like with
+                    like: the same file played with and without Lumen. "ffmpeg" is the CPU time the server spent
+                    transcoding, remuxing and extracting subtitles for that file during the playback (Linux only).
+                </p>
+                <div id="LumenJournalSummary" style="overflow-x: auto; margin-bottom: 1.5em;"></div>
+                <div id="LumenJournalRows" style="overflow-x: auto;"></div>
+            </div>
+        </div>
+        <script type="text/javascript">
+            (function () {
+                // L'identifiant du plugin : celui de Plugin.cs.
+                var pluginId = '6f1b0a3e-52c8-4d0e-9a7b-1c7e5d9a4b20';
+                var page = document.querySelector('#LumenConfigPage');
+                var $ = function (selector) { return page.querySelector(selector); };
+                var compact = function (id) { return String(id).replace(/-/g, '').toLowerCase(); };
+
+                function showUsers() {
+                    $('#LumenUsers').style.display = $('#LumenAllUsers').checked ? 'none' : '';
+                }
+
+                // --- le journal ---------------------------------------------------------------------
+
+                function median(values) {
+                    var sorted = values.filter(function (v) { return typeof v === 'number'; }).sort(function (a, b) { return a - b; });
+                    if (!sorted.length) return null;
+                    var middle = Math.floor(sorted.length / 2);
+                    return sorted.length % 2 ? sorted[middle] : Math.round((sorted[middle - 1] + sorted[middle]) / 2);
+                }
+
+                function ms(value) {
+                    return value === null || value === undefined ? '-' : value >= 10000 ? (value / 1000).toFixed(0) + ' s' : value >= 1000 ? (value / 1000).toFixed(1) + ' s' : value + ' ms';
+                }
+
+                // Un tableau construit nœud par nœud : un titre ou un nom de compte n'est jamais lu comme du HTML.
+                function table(headers, rows) {
+                    var element = document.createElement('table');
+                    element.style.cssText = 'border-collapse: collapse; width: 100%; font-size: 0.92em;';
+                    var cell = function (tag, text, row) {
+                        var node = document.createElement(tag);
+                        node.textContent = text;
+                        node.style.cssText = 'text-align: left; padding: 0.35em 0.8em 0.35em 0; border-bottom: 1px solid rgba(128,128,128,0.25); white-space: nowrap;';
+                        row.appendChild(node);
+                    };
+                    var head = document.createElement('tr');
+                    headers.forEach(function (header) { cell('th', header, head); });
+                    element.appendChild(head);
+                    rows.forEach(function (values) {
+                        var row = document.createElement('tr');
+                        values.forEach(function (value) { cell('td', value, row); });
+                        element.appendChild(row);
+                    });
+                    return element;
+                }
+
+                // What the engine did with the audio. It says so in French, in a few fixed phrases; anything
+                // else is shown as the engine wrote it rather than guessed at.
+                function audio(text) {
+                    if (text === 'copié tel quel') return 'copied as is';
+                    var encoded = /^décodé puis ré-encodé en (.+)$/.exec(text);
+                    return encoded ? 'decoded, re-encoded to ' + encoded[1] : text;
+                }
+
+                function who(entry) {
+                    if (entry.player === 'lumen') return 'Lumen' + (entry.audio ? ', audio ' + audio(entry.audio) : '');
+                    return 'jellyfin-web, ' + (entry.playMethod || '?') + (entry.transcodeReasons ? ' (' + entry.transcodeReasons + ')' : '');
+                }
+
+                function summarise(lines) {
+                    var groups = { lumen: [], jellyfin: [] };
+                    var byItem = {};
+                    lines.forEach(function (line) {
+                        var entry = line.entry || {};
+                        if (!groups[entry.player]) return;
+                        entry.cpu = line.ffmpegCpuSeconds;
+                        groups[entry.player].push(entry);
+                        (byItem[entry.itemId] = byItem[entry.itemId] || { lumen: [], jellyfin: [] })[entry.player].push(entry);
+                    });
+                    var row = function (label, entries) {
+                        var seeks = [].concat.apply([], entries.map(function (e) { return e.seeksMs || []; }));
+                        var hours = entries.reduce(function (sum, e) { return sum + (e.watchedSeconds || 0); }, 0) / 3600;
+                        var waits = entries.reduce(function (sum, e) { return sum + (e.waits || 0); }, 0);
+                        return [label, String(entries.length), ms(median(entries.map(function (e) { return e.firstFrameMs; }))), ms(median(seeks)) + ' (' + seeks.length + ')',
+                            hours > 0.05 ? (waits / hours).toFixed(1) + ' / h' : '-', hours.toFixed(1) + ' h',
+                            (function (cpu) { return cpu === null ? '-' : cpu + ' s'; })(median(entries.map(function (e) { return typeof e.cpu === 'number' ? Math.round(e.cpu) : null; })))];
+                    };
+                    // Les mêmes fichiers des deux côtés : sinon on comparerait des films faciles à des films difficiles.
+                    var both = Object.keys(byItem).filter(function (id) { return byItem[id].lumen.length && byItem[id].jellyfin.length; });
+                    var pick = function (player) { return [].concat.apply([], both.map(function (id) { return byItem[id][player]; })); };
+                    var rows = [row('Lumen, all playbacks', groups.lumen), row('jellyfin-web, all playbacks', groups.jellyfin)];
+                    if (both.length) {
+                        var withLumen = pick('lumen');
+                        var without = pick('jellyfin');
+                        rows.push(row('Lumen, ' + both.length + ' file(s) played both ways', withLumen));
+                        rows.push(row('jellyfin-web, the same files', without));
+                        // The headline: how many times faster, on the files both players have played.
+                        var times = function (slow, fast) {
+                            if (typeof slow !== 'number' || typeof fast !== 'number' || fast <= 0) return '-';
+                            var ratio = slow / fast;
+                            return ratio >= 1.05 ? ratio.toFixed(1) + 'x faster' : ratio <= 0.95 ? (1 / ratio).toFixed(1) + 'x slower' : 'same';
+                        };
+                        var all = function (entries, key) { return [].concat.apply([], entries.map(function (e) { return e[key] || []; })); };
+                        var first = function (entries) { return median(entries.map(function (e) { return e.firstFrameMs; })); };
+                        var cpu = function (entries) { return entries.reduce(function (sum, e) { return sum + (typeof e.cpu === 'number' ? e.cpu : 0); }, 0); };
+                        rows.push(['With Lumen, on those files', '', times(first(without), first(withLumen)), times(median(all(without, 'seeksMs')), median(all(withLumen, 'seeksMs'))), '', '',
+                            cpu(without) > 0 ? Math.round(100 - 100 * (cpu(withLumen) / withLumen.length) / (cpu(without) / without.length)) + ' % less' : '-']);
+                    }
+                    return table(['', 'Playbacks', 'First frame (median)', 'Seek (median, count)', 'Stalls', 'Played', 'ffmpeg per playback (median)'], rows);
+                }
+
+                function loadJournal() {
+                    return ApiClient.ajax({ type: 'GET', url: ApiClient.getUrl('Lumen/Journal'), dataType: 'json' }).then(function (lines) {
+                        var summary = $('#LumenJournalSummary');
+                        var rows = $('#LumenJournalRows');
+                        summary.textContent = '';
+                        rows.textContent = '';
+                        if (!lines.length) {
+                            rows.textContent = 'No playback logged yet.';
+                            return;
+                        }
+                        summary.appendChild(summarise(lines));
+                        rows.appendChild(table(['Date', 'User', 'Title', 'Player', 'First frame', 'Seeks', 'Stream changes', 'Stalls', 'Played', 'ffmpeg', 'Why Lumen declined'], lines.map(function (line) {
+                            var entry = line.entry || {};
+                            var seeks = entry.seeksMs || [];
+                            var changes = entry.streamChangesMs || [];
+                            return [new Date(line.at).toLocaleString(), line.user || '', entry.title || '', who(entry), ms(entry.firstFrameMs),
+                                seeks.length ? ms(median(seeks)) + ' × ' + seeks.length : '-',
+                                changes.length ? ms(median(changes)) + ' × ' + changes.length : '-',
+                                entry.waits ? entry.waits + ' (' + ms(entry.waitsMs) + ')' : '-',
+                                Math.round((entry.watchedSeconds || 0) / 60) + ' min',
+                                typeof line.ffmpegCpuSeconds === 'number' ? line.ffmpegCpuSeconds.toFixed(0) + ' s' : '-', entry.refusal || ''];
+                        })));
+                    });
+                }
+
+                // --- les réglages -------------------------------------------------------------------
+
+                page.addEventListener('pageshow', function () {
+                    Dashboard.showLoadingMsg();
+                    Promise.all([ApiClient.getPluginConfiguration(pluginId), ApiClient.getUsers()]).then(function (results) {
+                        var config = results[0];
+                        var chosen = (config.UserIds || []).map(compact);
+                        $('#LumenEnabled').checked = config.Enabled !== false;
+                        $('#LumenPlayback').checked = config.Playback !== false;
+                        $('#LumenAllUsers').checked = config.AllUsers !== false;
+                        $('#LumenJournal').checked = config.Journal === true;
+                        var list = $('#LumenUsers');
+                        list.textContent = '';
+                        results[1].forEach(function (user) {
+                            var label = document.createElement('label');
+                            var input = document.createElement('input');
+                            input.type = 'checkbox';
+                            input.setAttribute('is', 'emby-checkbox');
+                            input.dataset.userId = user.Id;
+                            input.checked = chosen.indexOf(compact(user.Id)) !== -1;
+                            var name = document.createElement('span');
+                            name.textContent = user.Name;
+                            label.appendChild(input);
+                            label.appendChild(name);
+                            list.appendChild(label);
+                        });
+                        showUsers();
+                        return loadJournal();
+                    }).then(Dashboard.hideLoadingMsg, Dashboard.hideLoadingMsg);
+                });
+
+                $('#LumenAllUsers').addEventListener('change', showUsers);
+                $('#LumenJournalRefresh').addEventListener('click', loadJournal);
+                $('#LumenJournalClear').addEventListener('click', function () {
+                    ApiClient.ajax({ type: 'DELETE', url: ApiClient.getUrl('Lumen/Journal') }).then(loadJournal);
+                });
+
+                $('#LumenConfigForm').addEventListener('submit', function (event) {
+                    event.preventDefault();
+                    Dashboard.showLoadingMsg();
+                    ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+                        config.Enabled = $('#LumenEnabled').checked;
+                        config.Playback = $('#LumenPlayback').checked;
+                        config.AllUsers = $('#LumenAllUsers').checked;
+                        config.Journal = $('#LumenJournal').checked;
+                        config.UserIds = Array.prototype.filter.call(page.querySelectorAll('#LumenUsers input'), function (input) {
+                            return input.checked;
+                        }).map(function (input) { return input.dataset.userId; });
+                        ApiClient.updatePluginConfiguration(pluginId, config).then(Dashboard.processPluginConfigurationUpdateResult);
+                    });
+                    return false;
+                });
+            })();
+        </script>
+    </div>
+</body>
+</html>

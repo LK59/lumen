@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <!-- La version de Jellyfin que ce plugin vise : celle de ses paquets, et de `targetAbi` dans le manifeste. -->
+    <JellyfinVersion>12.4.0</JellyfinVersion>
+  </PropertyGroup>
+</Project>

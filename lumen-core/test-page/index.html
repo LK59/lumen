@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lumen — page de test</title>
+<style>
+  :root { color-scheme: dark; font: 14px/1.4 system-ui, sans-serif; }
+  body { margin: 0; padding: 16px; background: #111; color: #ddd; max-width: 1100px; }
+  form, .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
+  input[type=text] { flex: 1 1 320px; }
+  input, select, button { font: inherit; padding: 4px 8px; }
+  .stage { position: relative; background: #000; aspect-ratio: 16 / 9; }
+  video { width: 100%; height: 100%; display: block; }
+  #cue { position: absolute; left: 0; right: 0; bottom: 6%; text-align: center; font-size: 22px; text-shadow: 0 0 4px #000, 0 0 4px #000; white-space: pre-line; pointer-events: none; }
+  #bar { flex: 1 1 300px; }
+  pre { background: #1b1b1b; padding: 8px; overflow: auto; max-height: 320px; font-size: 12px; }
+  #refusal { color: #f88; }
+</style>
+</head>
+<body>
+<!--
+  La page de test de lumen-core : un fichier lu depuis une simple adresse qui honore `Range`.
+
+  Elle fait ce qu'un hôte doit faire, et rien de plus : régler l'hôte (jeton), sonder l'adresse, démarrer
+  sur un élément <video>, appeler play() après la retenue d'ouverture, relayer les sauts, reconstruire
+  quand un changement de piste le demande, afficher la réplique en cours. Les mesures qu'elle relève
+  (première image, coût d'un saut) sont lues par les bancs dans `window.lumenTest`.
+
+  Paramètres d'adresse : ?url=…&token=…&t=<secondes>&auto=1 (ouvrir sans clic), et ce qu'un hôte tient
+  de son serveur avant d'ouvrir : &size=<octets> (épargne le HEAD) et &range=<plage dynamique, ex. DOVI>.
+-->
+<form id="open">
+  <input type="text" id="url" placeholder="Adresse du fichier (ex. /media/film.mkv)" required>
+  <input type="text" id="token" placeholder="Jeton (facultatif)" style="flex: 0 1 180px">
+  <input type="number" id="start" value="0" min="0" step="1" title="Départ (s)" style="width: 80px">
+  <button>Ouvrir</button>
+</form>
+<div class="stage"><video id="video" playsinline></video><div id="cue"></div></div>
+<div class="row">
+  <button id="toggle" disabled>Lecture</button>
+  <input type="range" id="bar" min="0" max="0" step="0.1" value="0" disabled>
+  <span id="clock">0:00 / 0:00</span>
+  <label>Son <select id="audio" disabled></select></label>
+  <label>Sous-titres <select id="subs" disabled></select></label>
+</div>
+<div id="refusal"></div>
+<pre id="facts"></pre>
+<pre id="trace"></pre>
+
+<script type="module">
+import { configureHost, probePlaybackPath, traceText } from "./dist/lumen-core.js";
+
+const $ = (id) => document.getElementById(id);
+const video = $("video");
+const params = new URLSearchParams(location.search);
+
+/** Ce que les bancs lisent. `events` : chaque mesure, dans l'ordre, avec son instant. */
+const state = (window.lumenTest = { phase: "idle", refusal: null, error: null, firstFrameMs: null, seeks: [], audioChanges: [], events: [], playback: null, traceText });
+const note = (name, fields = {}) => state.events.push({ at: Math.round(performance.now()), name, ...fields });
+
+let playback = null;
+let opening = 0;
+
+const clock = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+
+/** La prochaine image réellement présentée — pas `playing`, qui précède parfois l'image. */
+function nextFrame() {
+  return new Promise((resolve) => {
+    if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(() => resolve());
+    else video.addEventListener("timeupdate", () => resolve(), { once: true });
+  });
+}
+
+function fillMenu(select, tracks, current, none) {
+  select.replaceChildren();
+  if (none) select.append(new Option(none, ""));
+  for (const track of tracks) select.append(new Option([track.name, track.language, track.codecId, track.channels ? `${track.channels} c.` : null].filter(Boolean).join(" · ") || `piste ${track.number}`, String(track.number)));
+  select.value = current === null || current === undefined ? "" : String(current);
+  select.disabled = tracks.length === 0;
+}
+
+async function open({ startSeconds, audioTrackNumber = null, startPaused = false }) {
+  const mine = ++opening;
+  playback?.destroy();
+  playback = state.playback = null;
+  state.phase = "opening";
+  state.refusal = state.error = null;
+  $("refusal").textContent = "";
+  const token = $("token").value.trim();
+  // Le jeton, à la façon de Jellyfin : jamais dans l'adresse, toujours dans l'en-tête.
+  configureHost({ requestHeaders: token ? () => ({ Authorization: `MediaBrowser Token="${token}"` }) : null });
+  const startedAt = performance.now();
+  try {
+    const probe = await probePlaybackPath({
+      streamUrl: new URL($("url").value.trim(), location.href).href,
+      startSeconds,
+      audioTrackNumber,
+      startPaused,
+      knownSize: Number(params.get("size")) || null,
+      videoRangeType: params.get("range"),
+      onError: (message, kind) => {
+        state.error = { message, kind };
+        state.phase = "error";
+        note("error", { message, kind });
+        $("refusal").textContent = `Erreur (${kind ?? "lecture"}) : ${message}`;
+      },
+      onWarning: (warning) => note("warning", { warning }),
+      onStall: (facts) => note("stall", facts),
+    });
+    if (mine !== opening) return probe.discard();
+    const started = await probe.start(video);
+    if (mine !== opening) return started.destroy();
+    playback = state.playback = started;
+    fillMenu($("audio"), playback.audioTracks, playback.currentAudioTrack, null);
+    fillMenu($("subs"), playback.subtitleTracks, playback.currentSubtitleTrack, "aucun");
+    $("toggle").disabled = $("bar").disabled = false;
+    if (!startPaused) {
+      // La retenue d'ouverture : un départ de zéro part avec sa première image, pas avant.
+      await (playback.openingHold() ?? Promise.resolve());
+      if (mine !== opening) return;
+      const frame = nextFrame();
+      await video.play().catch((error) => note("play refusé", { message: String(error) }));
+      await frame;
+      if (mine !== opening) return;
+    }
+    const ms = Math.round(performance.now() - startedAt);
+    if (state.firstFrameMs === null) state.firstFrameMs = ms;
+    state.phase = "playing";
+    note("première image", { ms, startSeconds, audioTrackNumber });
+    return ms;
+  } catch (error) {
+    if (mine !== opening) return;
+    // Un refus nommé : ce chemin ne porte pas ce fichier, et dit pourquoi. À un hôte de passer la main.
+    state.refusal = error instanceof Error ? error.message : String(error);
+    state.phase = "refused";
+    note("refus", { message: state.refusal });
+    $("refusal").textContent = `Refus : ${state.refusal}`;
+  }
+}
+
+async function seek(seconds) {
+  if (!playback) return;
+  const startedAt = performance.now();
+  const path = playback.seekPathFor(seconds);
+  await playback.seek(seconds);
+  // Le saut est servi quand une image d'après lui est à l'écran.
+  if (!video.paused) await nextFrame();
+  const ms = Math.round(performance.now() - startedAt);
+  state.seeks.push({ to: seconds, ms, path });
+  note("saut", { to: seconds, ms, path });
+  return ms;
+}
+state.seek = seek;
+
+$("open").addEventListener("submit", (event) => {
+  event.preventDefault();
+  state.firstFrameMs = null;
+  void open({ startSeconds: Number($("start").value) || 0 });
+});
+$("toggle").addEventListener("click", () => (video.paused ? void video.play() : video.pause()));
+$("bar").addEventListener("change", () => void seek(Number($("bar").value)));
+$("audio").addEventListener("change", async () => {
+  if (!playback) return;
+  const wanted = Number($("audio").value);
+  const startedAt = performance.now();
+  const answer = playback.requestAudioTrack(wanted);
+  if (answer === "refused") {
+    $("audio").value = String(playback.currentAudioTrack);
+    return note("piste son refusée", { wanted });
+  }
+  // « rebuild » : aucun changement de piste dans un tampon vivant n'a tenu — on rouvre sur la piste voulue.
+  if (answer === "rebuild") await open({ startSeconds: playback.position, audioTrackNumber: wanted, startPaused: video.paused });
+  const ms = Math.round(performance.now() - startedAt);
+  state.audioChanges.push({ to: wanted, ms, answer });
+  note("piste son", { to: wanted, ms, answer });
+});
+$("subs").addEventListener("change", () => playback?.selectSubtitleTrack($("subs").value === "" ? null : Number($("subs").value)));
+
+video.addEventListener("play", () => ($("toggle").textContent = "Pause"));
+video.addEventListener("pause", () => ($("toggle").textContent = "Lecture"));
+setInterval(() => {
+  if (playback) {
+    const duration = Number.isFinite(video.duration) ? video.duration : 0;
+    $("bar").max = String(duration);
+    if (document.activeElement !== $("bar")) $("bar").value = String(playback.position);
+    $("clock").textContent = `${clock(playback.position)} / ${clock(duration)}`;
+    $("cue").textContent = playback.subtitleAt(video.currentTime) ?? "";
+    $("facts").textContent = JSON.stringify({ phase: state.phase, premiereImageMs: state.firstFrameMs, sauts: state.seeks, pistesSon: state.audioChanges, ...playback.diagnostics }, null, 1);
+  }
+  $("trace").textContent = traceText();
+}, 250);
+
+$("url").value = params.get("url") ?? "";
+$("token").value = params.get("token") ?? "";
+$("start").value = params.get("t") ?? "0";
+if (params.get("auto") === "1" && $("url").value) void open({ startSeconds: Number($("start").value) || 0 });
+</script>
+</body>
+</html>

@@ -1,0 +1,1376 @@
+import { noteFetchRetrying, noteFetchSettled } from "../support/networkTrouble";
+import { hostSaysSessionEnded, linkShaper, withHostHeaders } from "../host";
+import { trace } from "./trace";
+import { diagInterval, diagNow, diagRequest, diagRequestFailed } from "./playbackDiagnosis";
+import { meterOpeningRequest } from "../support/slowLink";
+// Random access over a media file, for the native player's remuxer.
+//
+// The demuxer needs to jump around a file that can be 40 GB: read the header, jump to the end
+// for the index, then stream clusters from wherever the user seeks. HTTP range requests give
+// exactly that, and the existing Jellyfin stream proxy already forwards Range headers for the
+// static (non-transcoded) endpoint — so the original file is reachable with no new route and no
+// ffmpeg anywhere in the path.
+//
+// Everything above this interface is testable without a network: the demuxer only ever sees
+// `size` and `read()`, so its tests feed it a Uint8Array.
+
+export interface ByteSource {
+  /** Total length of the file in bytes. */
+  readonly size: number;
+  /**
+   * Reads exactly [offset, offset+length), clamped at EOF. `who` : qui lit (« lecteur » par défaut, « son » pour
+   * le décodeur d'une piste ré-encodée — voir `readingAs`), compté par `HttpByteSource` depuis le dernier saut.
+   */
+  read(offset: number, length: number, who?: string): Promise<Uint8Array>;
+  /**
+   * Starts fetching around an offset nothing has asked for yet.
+   *
+   * Optional: a source already holding the whole file has nothing to warm. For one reading over
+   * the network it is the difference between a seek that begins with a single request on an idle
+   * link and one that begins with the link full.
+   */
+  warm?(offset: number): void;
+  /**
+   * Une plage à garder en mémoire de préférence — celle autour de la tête de lecture. Optionnel,
+   * et une préférence, pas une réservation : rien n'est téléchargé pour elle.
+   */
+  keep?(from: number, to: number): void;
+  /**
+   * Abandonne les lectures réseau en cours loin de `keepOffset` — la position où l'on saute.
+   * Celui qui les attendait reçoit `ReadAbandoned`. Optionnel : une source en mémoire n'a rien en
+   * vol.
+   */
+  abandon?(keepOffset: number): void;
+  /** Le saut a sa première image : la lecture en avance reprend en entier. Optionnel. */
+  seekSettled?(): void;
+  /**
+   * Suspend (`true`) ou rend (`false`) la lecture en avance, le temps de lire l'en-tête d'une
+   * ouverture en reprise — voir `HttpByteSource.holdReadahead`. Optionnel.
+   */
+  holdReadahead?(held: boolean): void;
+  /** Prévenir si le serveur annonce une autre taille — voir `HttpByteSource.whenSizeCorrected`. Optionnel. */
+  whenSizeCorrected?(fn: () => void): void;
+  /** Le réseau depuis le dernier saut (`abandon`) — voir `NetworkWindow`. Optionnel. */
+  networkSinceSeek?(): NetworkWindow | null;
+  /**
+   * Depuis combien de millisecondes le réseau ne livre plus rien alors qu'on lui demande quelque
+   * chose — voir `HttpByteSource.networkSilentMs`. Zéro quand rien n'est demandé. Optionnel : une
+   * source en mémoire n'attend jamais le réseau.
+   */
+  networkSilentMs?(): number;
+  /**
+   * Les morceaux entiers en mémoire, et la date du fichier selon le serveur — ce que l'arrêt d'une
+   * lecture garde sur l'appareil (`keepOnStop`). Optionnel : une source en mémoire n'a rien à garder.
+   */
+  held?(): HeldBytes | null;
+  /** Releases any pending work. Safe to call twice. */
+  close(): void;
+}
+
+/** Voir `ByteSource.held`. */
+export interface HeldBytes {
+  size: number;
+  lastModified: string | null;
+  chunks: Map<number, Uint8Array>;
+}
+
+/**
+ * A window of another source, already in memory, addressed by the SAME absolute offsets.
+ *
+ * Parsing a container element field by field means one read per field — 129 000 of them for a
+ * film with 15 000 cue points, measured. Each is cheap on its own but they are all awaited. When
+ * an element is known to be small enough to hold whole (Tracks, Cues), reading it once and
+ * parsing out of the buffer turns those thousands of reads into one, with no change to the
+ * parsing code: it keeps handing out the same absolute offsets.
+ */
+export class SlicedSource implements ByteSource {
+  constructor(private readonly bytes: Uint8Array, private readonly base: number, readonly size: number) {}
+
+  static async of(source: ByteSource, start: number, end: number): Promise<SlicedSource> {
+    const bytes = await source.read(start, end - start);
+    return new SlicedSource(bytes, start, source.size);
+  }
+
+  async read(offset: number, length: number): Promise<Uint8Array> {
+    const from = offset - this.base;
+    const start = Math.max(0, Math.min(from, this.bytes.length));
+    const to = Math.max(start, Math.min(from + length, this.bytes.length));
+    return this.bytes.subarray(start, to);
+  }
+
+  close(): void {}
+}
+
+export class MemoryByteSource implements ByteSource {
+  constructor(private readonly bytes: Uint8Array) {}
+  get size() {
+    return this.bytes.length;
+  }
+  async read(offset: number, length: number): Promise<Uint8Array> {
+    const start = Math.max(0, Math.min(offset, this.bytes.length));
+    const end = Math.max(start, Math.min(offset + length, this.bytes.length));
+    return this.bytes.subarray(start, end);
+  }
+  close(): void {}
+}
+
+// Reads are coalesced into fixed-size chunks and cached: a demuxer asks for a 4-byte element
+// header, then a 3-byte size, then a payload — issuing an HTTP request per call would be
+// thousands of round-trips. One chunk fetch answers hundreds of those.
+export const CHUNK_SIZE = 1 << 20; // 1 MiB
+
+/**
+ * How many chunks to keep. Enough to cover a seek's working set, and a ceiling on the memory a
+ * long film can quietly accumulate.
+ */
+const MAX_CACHED_CHUNKS = 64; // ~64 MiB
+
+/**
+ * **La zone autour de la tête de lecture, gardée — ajoutée le 21/09/2026.**
+ *
+ * Le cache évinçait le plus ancien morceau d'abord. Or le lecteur lit en avance, jusqu'à trente
+ * secondes : les 48 Mo gardés étaient surtout l'*avenir* du film, et l'endroit qu'on regarde avait
+ * été chassé depuis longtemps. Changer de piste audio, c'est justement relire cet endroit — le son
+ * y est entrelacé avec l'image —, donc tout retélécharger : 9 s mesurées sur iPhone ce jour-là, sur
+ * une connexion lente. Le lecteur désigne maintenant la zone à garder (`keep`), et l'éviction passe
+ * par-dessus ; le cache a grandi de seize mégaoctets pour que cette zone ne mange pas l'avance.
+ *
+ * Bornée : jamais plus de `MAX_KEPT_CHUNKS`, quoi que demande l'appelant — un fichier dont les
+ * images clés sont à vingt-cinq secondes d'intervalle ne doit pas figer tout le cache.
+ */
+const MAX_KEPT_CHUNKS = 24;
+
+/**
+ * How far ahead to fetch, in chunks.
+ *
+ * One was not a pipeline, it was a relay: chunk N being consumed while N+1 was in flight, and
+ * every megabyte after that paying a fresh round trip before its first byte arrived. Reading one
+ * keyframe group means five or six of these, and on the phone that came to 2.6 seconds against
+ * 40 ms of actual muxing — the wait was almost entirely the shape of the fetching.
+ *
+ * Six is chosen against what the reader is for: the fill loop wants thirty seconds of media, which
+ * on this library is twenty megabytes, so six ahead is never speculative in the sense of being
+ * thrown away. It is only ever bytes that were going to be asked for a moment later.
+ */
+const PREFETCH_CHUNKS = 6;
+
+/**
+ * Et juste après un saut, tant que sa première image n'est pas là : deux seulement.
+ *
+ * Banc du 22/09/2026, serveur lointain à 75 Mb/s : 11 à 21 Mo transférés avant la première image
+ * d'un saut qui n'en demandait que 4 à 6. Les six morceaux lus en avance partageaient le lien avec
+ * celui que le lecteur attendait, qui n'en recevait qu'une part sur sept. Deux suffisent à garder
+ * le lien plein (un aller-retour de 60 ms à 75 Mb/s, c'est un demi-mégaoctet en vol) ; l'avance
+ * entière reprend dès que le saut a son image (`seekSettled`).
+ */
+const SEEK_PREFETCH_CHUNKS = 2;
+
+/**
+ * Juste après un saut, une requête qui n'a reçu aucun octet en ce temps est redemandée.
+ *
+ * Banc iPhone du 22/09/2026, 5G en itinérance : un saut sans un octet en quinze secondes, douze
+ * requêtes encore en suspens au saut suivant. L'échéance ordinaire (`REQUEST_TIMEOUT_MS`, 25 s) est
+ * faite pour reconnaître une connexion morte ; une requête restée muette pendant qu'un spectateur
+ * attend son saut se redemande bien avant. Première tentative seulement, et seulement pendant
+ * qu'un saut attend sa première image : sur un lien vraiment lent, redemander en boucle ne ferait
+ * que recommencer.
+ */
+const SEEK_FIRST_BYTE_MS = 5000;
+
+/**
+ * Au retour au premier plan, la même échéance du premier octet, pendant ce temps.
+ *
+ * 13/10/2026, iPhone d'Augustine : pause, écran verrouillé deux minutes, retour — la lecture repart
+ * sur ses 21 s d'avance, mais aucun octet n'arrive pendant ~13 s (la connexion d'avant le
+ * verrouillage est souvent morte, et une requête posée dessus attend l'échéance ordinaire de 25 s) :
+ * l'avance s'épuise, 5 s de blocage. Une requête muette 5 s est redemandée — sur une connexion
+ * neuve si l'ancienne est morte —, pendant que la lecture continue sur son avance : rien à
+ * l'écran. Une fois par morceau, comme après un saut : sur un lien vraiment lent, redemander en
+ * boucle ne ferait que recommencer. Les requêtes déjà en vol au retour y passent aussi.
+ */
+const WAKE_FIRST_BYTE_WINDOW_MS = 15_000;
+
+/** Au-delà, l'avance entière reprend d'elle-même : un saut qui n'aboutit pas ne la bride pas. */
+const SEEK_FOCUS_MS = 8000;
+
+/**
+ * How a chunk that fails to arrive is retried.
+ *
+ * A range request is not a stream: nothing resumes it, and one refused fetch used to travel all
+ * the way up as a read failure — through the fill loop, through the recovery, and out the other
+ * side as the player giving up. A phone changing from Wi-Fi to mobile drops every connection it
+ * has, which is a perfectly ordinary thing to do while watching a film and no reason at all to
+ * abandon hardware decoding for the rest of it.
+ */
+const FETCH_ATTEMPTS = 4;
+const FETCH_BACKOFF_MS = [200, 600, 1500];
+
+/**
+ * Le temps qu'une plage a pour arriver — et ce qui manquait à tout le reste pour fonctionner.
+ *
+ * Les quatre tentatives ci-dessus, l'attente du retour du réseau, l'écran « Connexion perdue »
+ * avec son bouton, la reprise automatique à la position exacte : tout cela existait déjà et rien
+ * ne s'armait dans un cas précis, qui est justement le plus courant sur un téléphone. Une bascule
+ * Wi-Fi → 5G ne *refuse* pas les connexions en cours, elle les laisse **pendre** : la socket ne
+ * répond plus et ne se ferme pas. Sans échéance, ce `fetch` ne se résout jamais — pas d'erreur,
+ * donc pas de nouvelle tentative, donc pas d'écran, donc une image figée pour toujours.
+ *
+ * Vingt-cinq secondes pour un mégaoctet, soit quarante-deux kilo-octets par seconde. C'est le
+ * point qui rend ce garde-fou incapable de nuire : un flux remultiplexé demande plusieurs
+ * centaines de kilo-octets par seconde pour tenir, donc en dessous de ce seuil la lecture est de
+ * toute façon perdue. Une connexion lente mais réelle ne peut pas être coupée par cette échéance ;
+ * seule une connexion morte l'atteint.
+ */
+const REQUEST_TIMEOUT_MS = 25_000;
+
+/**
+ * L'échéance, ajoutée à l'annulation du lecteur — quand le navigateur sait les combiner.
+ *
+ * `AbortSignal.any` date de Safari 17.4 et de Chrome 116. Là où il manque, on rend le signal du
+ * lecteur seul : on perd l'échéance, pas la lecture. Dégradé, jamais cassé — c'est la règle de ce
+ * dossier pour tout ce qui dépend d'une capacité du navigateur.
+ */
+function readSignal(playerSignal: AbortSignal): AbortSignal {
+  const any = (AbortSignal as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+  if (typeof any !== "function" || typeof AbortSignal.timeout !== "function") return playerSignal;
+  return any([playerSignal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]);
+}
+
+/** How long a read waits for the network to come back before admitting it is not going to. */
+const OFFLINE_PATIENCE_MS = 60_000;
+
+/**
+ * A read that failed for want of a network, told apart from one that failed for want of sense.
+ *
+ * The difference decides what happens next, and getting it wrong is worse than either: handing
+ * the file to the stable player because the Wi-Fi dropped abandons hardware decoding for a
+ * reason that has nothing to do with it — and hands the file to a player that needs the very
+ * same network to do anything at all.
+ */
+export class NetworkUnavailable extends Error {
+  readonly network = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "NetworkUnavailable";
+  }
+}
+
+/**
+ * Ce que le réseau a fait depuis le dernier saut : de quoi dire, d'un saut lent, si c'était le
+ * trajet, le relais ou Jellyfin (22/09/2026 : sauts de dix secondes depuis un serveur lointain
+ * pour quelques mégaoctets, alors que le serveur servait la même plage en vingt millisecondes).
+ */
+export interface NetworkWindow {
+  /** Requêtes terminées depuis le saut. */
+  requests: number;
+  bytes: number;
+  /** Du saut à la fin de la dernière requête terminée. */
+  elapsedMs: number;
+  /**
+   * Ce que chaque lecteur du fichier a demandé depuis le saut (18/11/2026) : `{ lecteur: { reads, bytes }, son: … }`.
+   * L'enquête sur les sauts lents trouvait sur *Drive* 4K 12 à 24 Mo reçus pour 1 à 4 Mo utiles, et soupçonnait le
+   * décodeur du son ré-encodé (mediabunny), qui lit le fichier de son côté — ceci le dit.
+   */
+  demand?: Record<string, { reads: number; bytes: number }>;
+  /** Délai jusqu'aux en-têtes (premier octet), le plus court et le plus long. */
+  firstByteMinMs: number;
+  firstByteMaxMs: number;
+  /** La plus longue requête, de l'envoi au dernier octet. */
+  slowestMs: number;
+  /** Le temps passé côté serveur, d'après `Server-Timing` (`app`) — le plus long vu. */
+  serverMaxMs: number | null;
+  /**
+   * Le protocole de chaque requête — `h2`, `h3`, `http/1.1` —, compté. Vide quand le navigateur
+   * ne le dit pas.
+   *
+   * Un saut lent depuis un serveur lointain se lit autrement selon la réponse : en HTTP/1.1, six
+   * connexions au plus par origine, et chaque morceau lu en avance fait la queue derrière les
+   * autres ; en HTTP/2, une seule connexion dont les pertes retiennent toutes les requêtes à la
+   * fois ; en HTTP/3, ni l'un ni l'autre. Sans ce champ, la trace ne permettait pas de trancher.
+   */
+  protocols: Record<string, number>;
+}
+
+/** La même fenêtre, en une ligne de trace. */
+export function describeNetwork(w: NetworkWindow): string {
+  const mbps = w.elapsedMs > 0 ? (w.bytes * 8) / (w.elapsedMs / 1000) / 1e6 : 0;
+  return (
+    `${(w.bytes / 1048576).toFixed(1)} Mo en ${w.elapsedMs} ms (${mbps.toFixed(0)} Mb/s), ${w.requests} requête(s), ` +
+    `premier octet ${w.firstByteMinMs}–${w.firstByteMaxMs} ms, la plus lente ${w.slowestMs} ms` +
+    (w.serverMaxMs !== null ? `, serveur ≤ ${w.serverMaxMs} ms` : "") +
+    describeProtocols(w.protocols) +
+    describeDemand(w.demand)
+  );
+}
+
+/** `{ lecteur: {reads: 12, bytes: 2.2e6}, son: … }` → `, demandé : lecteur 2.1 Mo ×12, son 18.4 Mo ×40`. */
+function describeDemand(demand: NetworkWindow["demand"]): string {
+  const seen = Object.entries(demand ?? {}).filter(([, d]) => d.reads > 0);
+  if (seen.length === 0) return "";
+  return `, demandé : ${seen.map(([who, d]) => `${who} ${(d.bytes / 1048576).toFixed(1)} Mo ×${d.reads}`).join(", ")}`;
+}
+
+/**
+ * La même source, lue sous un autre nom (`ByteSource.read`, `who`) — le décodeur d'une piste ré-encodée la reçoit
+ * ainsi, pour que la fenêtre d'un saut dise ce qu'il a demandé à côté du lecteur (18/11/2026). Tout le reste passe tel
+ * quel.
+ */
+export function readingAs(source: ByteSource, who: string): ByteSource {
+  return new Proxy(source, {
+    get(target, property) {
+      if (property === "read") return (offset: number, length: number) => target.read(offset, length, who);
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+/** `{ h2: 5 }` → `, protocole h2` ; `{ h2: 5, "http/1.1": 1 }` → `, protocoles h2 ×5, http/1.1 ×1`. */
+function describeProtocols(protocols: Record<string, number> | undefined): string {
+  const seen = Object.entries(protocols ?? {}).sort((a, b) => b[1] - a[1]);
+  if (seen.length === 0) return "";
+  if (seen.length === 1) return `, protocole ${seen[0][0]}`;
+  return `, protocoles ${seen.map(([name, count]) => `${name} ×${count}`).join(", ")}`;
+}
+
+/**
+ * Le protocole de la dernière requête terminée vers `url`, d'après le Resource Timing du
+ * navigateur — ou `null` s'il ne le dit pas.
+ *
+ * Toutes les plages d'un film ont la même adresse : la dernière entrée de ce nom est donc la
+ * requête qu'on vient de finir, ou sa voisine immédiate si le navigateur ne l'a pas encore
+ * enregistrée — sur une même origine, le protocole ne change pas d'une requête à l'autre. Le
+ * tampon du navigateur s'arrête à quelques centaines d'entrées : passé ce nombre, c'est celui des
+ * premières requêtes qu'on lit, ce qui reste la bonne réponse pour la même raison.
+ *
+ * Ne lève jamais : c'est une mesure, sur le chemin de lecture.
+ */
+export function protocolOf(url: string): string | null {
+  try {
+    if (typeof performance === "undefined" || typeof performance.getEntriesByName !== "function") return null;
+    // Les entrées sont nommées par l'adresse absolue ; le lecteur demande une adresse relative.
+    const name = typeof location !== "undefined" && location?.href ? new URL(url, location.href).href : url;
+    const entries = performance.getEntriesByName(name, "resource");
+    const last = entries[entries.length - 1] as PerformanceResourceTiming | undefined;
+    const protocol = last?.nextHopProtocol;
+    return typeof protocol === "string" && protocol !== "" ? protocol : null;
+  } catch {
+    return null;
+  }
+}
+
+/** `app;dur=12, jf;dur=8` → 12. */
+export function serverTimingApp(header: string | null): number | null {
+  const match = header ? /(?:^|,)\s*app;dur=([\d.]+)/.exec(header) : null;
+  return match ? Math.round(Number(match[1])) : null;
+}
+
+/**
+ * Une lecture abandonnée parce que le lecteur est allé ailleurs — ni une panne, ni le réseau.
+ *
+ * Tout ce qui attendait cette lecture doit s'effacer sans rien réparer : ni nouvelle tentative, ni
+ * reprise, ni reconstruction de l'encodeur. Le saut qui l'a causée repositionne tout derrière.
+ */
+/** La session de connexion a expiré : rien à redemander, voir la lecture des plages. */
+export class SessionEnded extends Error {
+  constructor() {
+    super("Session expirée");
+    this.name = "SessionEnded";
+  }
+}
+
+export class ReadAbandoned extends Error {
+  readonly abandoned = true;
+  constructor() {
+    super("lecture abandonnée pour un saut");
+    this.name = "ReadAbandoned";
+  }
+}
+
+export function isReadAbandoned(error: unknown): boolean {
+  return error instanceof Error && "abandoned" in error && error.abandoned === true;
+}
+
+/** Whether a failure was the network's rather than the media's. */
+export function isNetworkFailure(error: unknown): boolean {
+  return error instanceof Error && "network" in error && error.network === true;
+}
+
+/**
+ * Waits for the browser to say it is connected again, up to a point.
+ *
+ * Retrying while the machine knows it has no network is a way of spending attempts on nothing.
+ * Waiting for the event costs neither requests nor battery, and a viewer walking between two
+ * networks is back within a second or two.
+ */
+/**
+ * Rend vrai quand la patience s'est épuisée sans retour du réseau : l'appareil se dit toujours hors
+ * ligne. L'appelant renonce alors — une seule minute d'attente par morceau, pas une par tentative.
+ */
+async function waitForNetwork(signal?: AbortSignal): Promise<boolean> {
+  if (typeof navigator === "undefined" || navigator.onLine !== false) return false;
+  if (signal?.aborted) return false;
+  trace("réseau : hors ligne, la lecture attend le retour");
+  let gaveUp = false;
+  await new Promise<void>((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      window.removeEventListener("online", done);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      gaveUp = navigator.onLine === false;
+      done();
+    }, OFFLINE_PATIENCE_MS);
+    window.addEventListener("online", done, { once: true });
+    // A player closed while waiting is a player nobody is waiting for. Without this the minute
+    // ran out on its own, holding a timer and a listener for a film already gone from the screen.
+    signal?.addEventListener("abort", done, { once: true });
+  });
+  trace(gaveUp ? `réseau : toujours hors ligne après ${OFFLINE_PATIENCE_MS / 1000} s` : "réseau : de retour");
+  return gaveUp;
+}
+
+/**
+ * Le délai avant une nouvelle tentative — que l'interrupteur du morceau écourte.
+ *
+ * Chasse aux défauts du 22/09/2026 : l'attente ignorait l'abandon. Un morceau coupé par un saut
+ * pendant son délai (jusqu'à 1,5 s) restait une promesse vivante tout ce temps, et le saut, qui
+ * attendait la lecture en cours, attendait avec lui la fin d'un délai qui ne servait plus à rien.
+ * Rend la main aussitôt ; c'est l'appelant qui regarde le signal et lève `ReadAbandoned`.
+ */
+function backoff(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
+
+/** Ce qui répond à une source fermée : aucune requête ne part plus pour elle. */
+function closedSource(): Error {
+  return new Error("source fermée");
+}
+
+/**
+ * Ce qu'une source fermée laisse à la suivante, pour le même fichier.
+ *
+ * Un changement de piste d'un format à un autre reconstruit le lecteur (voir `perTrack` dans
+ * remuxer.ts), et la reconstruction rouvrait tout à zéro : une requête HEAD pour une taille déjà
+ * connue — une seconde entière, relevée sur iPhone le 21/09/2026 —, puis tous les octets autour de
+ * la tête retéléchargés alors que la source d'avant venait de les avoir. Un fichier ne change pas
+ * sous un film qu'on regarde ; sa taille et ses morceaux passent donc de l'une à l'autre.
+ *
+ * Une seule entrée, et pour quelques secondes : c'est le relais d'une reconstruction — qui rouvre
+ * quelques dizaines de millisecondes après avoir fermé —, pas un cache de plus. Court exprès : un
+ * fichier que Radarr remplacerait entre deux lectures ne doit pas hériter de la taille de l'ancien,
+ * et passé ce délai les quarante-huit mégaoctets sont rendus.
+ */
+const HANDOVER_MS = 5_000;
+type Kept = { first: number; last: number } | null;
+type Handover = { size: number; chunks: Map<number, Uint8Array>; kept: Kept; reserve: Map<number, Uint8Array> };
+let handover: (Handover & { url: string; timer: ReturnType<typeof setTimeout> }) | null = null;
+
+function takeHandover(url: string): Handover | null {
+  if (!handover || handover.url !== url) return null;
+  const taken = handover;
+  clearTimeout(taken.timer);
+  handover = null;
+  return { size: taken.size, chunks: taken.chunks, kept: taken.kept, reserve: taken.reserve };
+}
+
+/**
+ * Des morceaux de ce fichier attendent-ils la prochaine source ? Regardé sans les prendre : qui ne
+ * fait que préparer un fichier (`sheetHeaderWarmup`) s'abstient plutôt que de vider le relais que la
+ * vraie réouverture, juste après un film, aurait trouvé.
+ */
+export function holdsHandover(url: string): boolean {
+  return handover !== null && handover.url === url;
+}
+
+/**
+ * La réserve d'avance (`MemoryReserve`) passe aussi : une reconstruction — changement de piste, reprise
+ * après une erreur — la retrouve au lieu de retélécharger jusqu'à 150 Mo (chasse aux défauts du 28/09).
+ * La réserve de la nouvelle source rend d'elle-même ce qui ne sert plus à sa position.
+ */
+function leaveHandover(url: string, size: number, chunks: Map<number, Uint8Array>, kept: Kept, reserve: Map<number, Uint8Array>): void {
+  if (handover) clearTimeout(handover.timer);
+  if (chunks.size === 0 && reserve.size === 0) {
+    handover = null;
+    return;
+  }
+  const timer = setTimeout(() => {
+    if (handover?.chunks === chunks) handover = null;
+  }, HANDOVER_MS);
+  handover = { url, size, chunks, kept, reserve, timer };
+}
+
+/** Pour les tests : l'état d'une page neuve. */
+export function forgetHandover(): void {
+  if (handover) clearTimeout(handover.timer);
+  handover = null;
+}
+
+/**
+ * Des morceaux de ce fichier déjà sur l'appareil — voir `src/lib/resumeCache/`.
+ *
+ * Ouvrir un film est borné par les octets, pas par le calcul (`cout.spec.ts`) : l'en-tête, l'index
+ * et le premier groupe d'images à la position de reprise. Gardés sur l'appareil pour les titres de
+ * « Reprendre » et « À suivre », ils sont servis d'ici avant le réseau ; le reste du fichier vient
+ * du réseau comme toujours.
+ *
+ * Un morceau n'est servi que s'il appartient **à ce fichier-là** : l'identité est vérifiée avant
+ * l'ouverture (taille et version annoncées par Jellyfin), puis à la première réponse du réseau
+ * (taille du `Content-Range`, `Last-Modified`). Au moindre écart, la couche se tait (`has` rend
+ * faux) et se jette elle-même : dans le doute, le réseau.
+ */
+export interface DiskChunks {
+  has(index: number): boolean;
+  /** Le morceau, ou null s'il n'a pas pu être relu — le réseau prend alors le relais. */
+  read(index: number): Promise<Uint8Array | null>;
+  /** Ce que le serveur annonce à la première réponse : un écart retire la couche pour de bon. */
+  verify(total: number, lastModified: string | null): void;
+}
+
+/** D'où sont venus les octets d'une ouverture — pour la ligne `start` du journal. */
+export interface OpeningBytes {
+  device: number;
+  network: number;
+}
+
+/** La dernière source ouverte pour chaque adresse, pour `openingBytes`. Quelques-unes au plus. */
+const lastOpened = new Map<string, HttpByteSource>();
+
+/**
+ * Les octets lus jusqu'ici par la dernière source ouverte sur cette adresse : combien de
+ * l'appareil, combien du réseau. Null si aucune n'est connue.
+ */
+export function openingBytes(url: string): OpeningBytes | null {
+  const source = lastOpened.get(url);
+  return source ? { device: source.deviceBytes, network: source.networkBytes } : null;
+}
+
+export class HttpByteSource implements ByteSource {
+  /** Octets servis depuis l'appareil, et depuis le réseau — voir `openingBytes`. */
+  deviceBytes = 0;
+  networkBytes = 0;
+  /** Le `Last-Modified` de la première réponse qui en portait un : la date du fichier chez Jellyfin. */
+  lastModified: string | null = null;
+  /** Les morceaux gardés sur l'appareil pour ce fichier, s'il y en a — voir `DiskChunks`. */
+  private disk: DiskChunks | null = null;
+  /**
+   * La taille du fichier — corrigée une fois, si le serveur en annonce une autre que celle avec
+   * laquelle la source a été ouverte. Voir `checkTotal`.
+   */
+  get size(): number {
+    return this.total;
+  }
+  private total: number;
+  /** Voir `whenSizeCorrected`. */
+  private sizeCorrected = false;
+  private onSizeCorrected: (() => void) | null = null;
+
+  /**
+   * `fn` est appelée une fois si `checkTotal` corrige la taille : le fichier n'est plus celui qu'on
+   * croyait, et ce qui a été gardé ailleurs sous son adresse (l'en-tête lu) doit être oublié.
+   * Tout de suite si c'est déjà fait : les deux premières plages partent dès l'ouverture
+   * (`warmed`), et leur réponse peut précéder celui qui s'y abonne.
+   */
+  whenSizeCorrected(fn: () => void): void {
+    if (this.sizeCorrected) fn();
+    else this.onSizeCorrected = fn;
+  }
+  /** Le total annoncé par une réponse a été lu et comparé : voir `checkTotal`. */
+  private totalChecked = false;
+  private readonly url: string;
+  private chunks = new Map<number, Uint8Array>();
+  /** Les morceaux à garder de préférence, bornes comprises — voir `keep`. */
+  private kept: Kept = null;
+  private readonly inflight = new Map<number, Promise<Uint8Array>>();
+  /** L'interrupteur de chaque morceau en vol — pour n'abandonner que ceux qui ne servent plus. */
+  private readonly inflightControllers = new Map<number, AbortController>();
+  private readonly controller = new AbortController();
+  /** Voir `NetworkWindow` : remis à zéro à chaque `abandon`, c'est-à-dire à chaque saut. */
+  /** Jusqu'à quand la lecture en avance est bridée — voir `SEEK_PREFETCH_CHUNKS`. */
+  private focusUntil = 0;
+  /** Le dernier morceau qu'une lecture a demandé : d'où l'avance repart quand le saut aboutit. */
+  private lastDemanded = -1;
+  /** Jusqu'à quand un retour au premier plan surveille le premier octet — `WAKE_FIRST_BYTE_WINDOW_MS`. */
+  private wakeUntil = 0;
+  /** Les tentatives en vol sans en-têtes encore : un retour au premier plan leur pose l'échéance. */
+  private readonly silentAttempts = new Set<() => void>();
+  private readonly onVisibility = () => {
+    if (document.visibilityState !== "visible") return;
+    this.wakeUntil = performance.now() + WAKE_FIRST_BYTE_WINDOW_MS;
+    for (const arm of this.silentAttempts) arm();
+    // Ce qui s'est tu en arrière-plan ne se compte pas : le système a pu mettre le réseau en veille.
+    this.silenceFloor = Date.now();
+  };
+  /**
+   * Le silence du réseau, pour la borne d'une coupure en pleine lecture (DECISIONS.md §97).
+   *
+   * `demand` : les morceaux en cours de demande, tentatives, attentes entre elles et attente du
+   * retour du réseau comprises (`fetchWithRetries`). `silentFrom` : le début de la demande restée
+   * sans octet — posé quand une demande commence, effacé par un morceau arrivé ou par une demande
+   * qui finit sans échec réseau, **gardé** par une demande qui échoue, si bien qu'un serveur qui
+   * refuse aussitôt (essais de 2 s séparés de quelques secondes) reste un silence qui dure.
+   * `silenceFloor` : un retour au premier plan ou `online` — le silence repart de là. En `Date.now()` :
+   * des durées de quelques dizaines de secondes, et l'horloge que les minuteurs simulés savent avancer.
+   */
+  private demand = 0;
+  private silentFrom: number | null = null;
+  private silenceFloor = 0;
+  private readonly onOnline = () => {
+    this.silenceFloor = Date.now();
+  };
+  private window: {
+    since: number;
+    requests: number;
+    bytes: number;
+    lastEnd: number;
+    fbMin: number;
+    fbMax: number;
+    slowest: number;
+    server: number | null;
+    protocols: Record<string, number>;
+    demand: Record<string, { reads: number; bytes: number }>;
+  } | null = null;
+
+  private constructor(url: string, size: number) {
+    this.url = url;
+    this.total = size;
+    lastOpened.delete(url);
+    lastOpened.set(url, this);
+    while (lastOpened.size > 4) lastOpened.delete(lastOpened.keys().next().value!);
+    if (typeof document !== "undefined") document.addEventListener("visibilitychange", this.onVisibility);
+    if (typeof window !== "undefined" && typeof window.addEventListener === "function") window.addEventListener("online", this.onOnline);
+  }
+
+  // The length has to come from the server before anything else can be parsed. HEAD is tried
+  // first because it costs nothing; some proxies answer it without Content-Length, in which case
+  // a one-byte ranged GET gets the total out of Content-Range instead.
+  //
+  // Sauf quand l'appelant la connaît déjà (`knownSize`). La description du fichier, que l'hôte a
+  // demandée avant d'ouvrir quoi que ce soit, la porte — Jellyfin la tient de son analyse du
+  // fichier. Le HEAD coûtait alors un aller-retour entier pour une réponse déjà en main, avant
+  // que les deux premières plages puissent même partir : relevé le 22/09/2026 depuis un serveur
+  // lointain, ~60 ms d'aller-retour, soit autant de moins à chaque ouverture. Une taille fausse
+  // n'est pas crue sur parole : la première réponse la corrige — voir `checkTotal`.
+  static async open(url: string, knownSize?: number | null, disk?: DiskChunks | null): Promise<HttpByteSource> {
+    // Le même fichier que la source qu'on vient de fermer : sa taille et ses morceaux sont déjà
+    // là, sans aller-retour — voir `handover`.
+    const inherited = takeHandover(url);
+    if (inherited) {
+      const source = new HttpByteSource(url, inherited.size);
+      source.disk = disk ?? null;
+      source.chunks = inherited.chunks;
+      source.reserve = inherited.reserve;
+      // La zone autour de la tête aussi : c'est elle que la reconstruction relit d'abord, et ses
+      // premiers téléchargements l'auraient chassée avant que le lecteur ne la redésigne.
+      source.kept = inherited.kept;
+      trace(
+        `flux repris de la lecture précédente — ${inherited.chunks.size} Mo déjà là` +
+          (inherited.reserve.size > 0 ? `, ${inherited.reserve.size} en réserve` : "")
+      );
+      return source;
+    }
+    if (typeof knownSize === "number" && Number.isFinite(knownSize) && knownSize > 0) {
+      // Rien n'est attendu ici : les deux plages partent tout de suite. Un réseau absent se dit
+      // donc à la première lecture plutôt qu'à l'ouverture, avec la même erreur nommée
+      // (`NetworkUnavailable`, après `waitForNetwork` et les nouvelles tentatives).
+      trace(`taille connue d'avance (${Math.floor(knownSize)} octets) — pas de HEAD`);
+      return HttpByteSource.warmed(url, Math.floor(knownSize), disk ?? null);
+    }
+    // Named for what it is. A file that cannot be opened because there is no network is not a
+    // file this player cannot play, and handing it to a player needing the same network is the
+    // one answer that helps nobody.
+    const head = await fetch(url, withHostHeaders({ method: "HEAD" })).catch((cause: unknown) => {
+      throw new NetworkUnavailable(cause instanceof Error ? cause.message : "réseau indisponible");
+    });
+    const headLength = Number(head.headers.get("Content-Length"));
+    if (head.ok && Number.isFinite(headLength) && headLength > 0) {
+      return HttpByteSource.warmed(url, headLength);
+    }
+
+    const probe = await fetch(url, withHostHeaders({ headers: { Range: "bytes=0-0" } })).catch((cause: unknown) => {
+      throw new NetworkUnavailable(cause instanceof Error ? cause.message : "réseau indisponible");
+    });
+    const contentRange = probe.headers.get("Content-Range");
+    const total = contentRange ? Number(contentRange.split("/")[1]) : NaN;
+    if (!Number.isFinite(total) || total <= 0) {
+      throw new Error("Le serveur ne fournit pas la taille du fichier (Content-Range absent).");
+    }
+    return HttpByteSource.warmed(url, total);
+  }
+
+  /**
+   * Starts the two fetches every Matroska file begins with, before anyone asks for them.
+   *
+   * Reading the header means the front of the file; reading the index means wherever the Cues
+   * were written, which for a file made for streaming is the very end. Those two were fetched one
+   * after the other, each paying its own round trip, and together they were most of the second
+   * that passed between opening a file and knowing what was in it. Asked for together they cost
+   * one round trip instead of two.
+   *
+   * Neither is awaited: a file whose Cues are at the front simply leaves the tail chunk unused,
+   * which costs a megabyte and no time at all.
+   */
+  private static warmed(url: string, size: number, disk: DiskChunks | null = null): HttpByteSource {
+    const source = new HttpByteSource(url, size);
+    // Posée avant les deux premières plages : l'en-tête et l'index, s'ils sont sur l'appareil, en
+    // viennent — c'est tout l'intérêt.
+    source.disk = disk;
+    const last = Math.floor((size - 1) / CHUNK_SIZE);
+    for (const index of last > 0 ? [0, last] : [0]) {
+      void source.fetchChunk(index).catch(() => {
+        // Speculative. The real read will ask again and report properly if it fails.
+      });
+    }
+    return source;
+  }
+
+  /**
+   * One range, fetched until it arrives or until there is reason to believe it never will.
+   *
+   * A server that answers 200 to a Range header is not having a bad moment — it does not honour
+   * ranges at all, and asking again would only download a forty-gigabyte film four times.
+   */
+  private async fetchWithRetries(start: number, end: number, own: AbortSignal): Promise<Uint8Array> {
+    // Ce morceau réessaie-t-il ? Dit à l'hôte (`networkTrouble`, §78) et retiré quoi qu'il arrive.
+    let retrying = false;
+    // Une demande au réseau de plus — voir `networkSilentMs`.
+    this.demand += 1;
+    this.silentFrom ??= Date.now();
+    let networkFailed = false;
+    try {
+      return await this.fetchAttempts(start, end, own, () => {
+        if (!retrying) {
+          retrying = true;
+          noteFetchRetrying();
+        }
+      });
+    } catch (error) {
+      networkFailed = isNetworkFailure(error);
+      throw error;
+    } finally {
+      this.demand -= 1;
+      if (this.demand === 0 && !networkFailed) this.silentFrom = null;
+      if (retrying) noteFetchSettled();
+    }
+  }
+
+  /**
+   * Depuis combien de temps le réseau ne livre plus un octet alors qu'on lui demande quelque chose
+   * (DECISIONS.md §97). Zéro quand rien n'est demandé, sauf après une demande qui a échoué : un film
+   * en pause, un tampon plein, une lecture servie par l'appareil ne sont pas un silence. Un morceau arrivé (1 Mio, bien au-delà des
+   * 256 Kio qui suffisent à dire un lien lent, §77) le remet à zéro ; un lien lent mais vivant en livre
+   * un bien avant la borne — sous ~40 Ko/s, l'échéance de 25 s des requêtes l'aurait de toute façon
+   * coupé. Mesure seulement : rien ici ne change une requête.
+   */
+  networkSilentMs(): number {
+    if (this.silentFrom === null) return 0;
+    return Math.max(0, Date.now() - Math.max(this.silentFrom, this.silenceFloor));
+  }
+
+  private async fetchAttempts(start: number, end: number, own: AbortSignal, noteRetrying: () => void): Promise<Uint8Array> {
+    let last: unknown;
+    // L'échéance du premier octet, une fois par morceau (saut ou retour au premier plan).
+    let deadlineUsed = false;
+    for (let attempt = 0; attempt < FETCH_ATTEMPTS; attempt++) {
+      if (attempt > 0) {
+        /**
+         * Une minute hors ligne, et c'est assez (13/10/2026) : la patience était attendue à chaque
+         * nouvelle tentative — trois minutes d'image figée pour un appareil vraiment hors ligne avant
+         * l'écran « connexion perdue », le seul qui propose de reprendre (et qui reprend de lui-même
+         * au retour du réseau). Les tentatives restantes ne feraient qu'échouer à leur tour.
+         */
+        if (await waitForNetwork(own)) {
+          if (this.controller.signal.aborted) throw last ?? new Error("lecture annulée");
+          if (own.aborted) throw new ReadAbandoned();
+          break;
+        }
+        await backoff(FETCH_BACKOFF_MS[attempt - 1] ?? 1500, own);
+        if (this.controller.signal.aborted) throw last ?? new Error("lecture annulée");
+        if (own.aborted) throw new ReadAbandoned();
+      }
+      // Cette tentative-ci peut être coupée seule, sans abandonner le morceau : c'est ce que fait
+      // l'échéance du premier octet après un saut (`SEEK_FIRST_BYTE_MS`).
+      const attemptControl = new AbortController();
+      const forward = () => attemptControl.abort();
+      own.addEventListener("abort", forward, { once: true });
+      let muted = false;
+      let firstByteTimer: ReturnType<typeof setTimeout> | null = null;
+      let deadlineWhy = "après un saut";
+      const armDeadline = (why: string) => {
+        if (firstByteTimer !== null || deadlineUsed) return;
+        deadlineUsed = true;
+        deadlineWhy = why;
+        firstByteTimer = setTimeout(() => {
+          muted = true;
+          attemptControl.abort();
+        }, SEEK_FIRST_BYTE_MS);
+      };
+      if (attempt === 0 && performance.now() < this.focusUntil) armDeadline("après un saut");
+      else if (performance.now() < this.wakeUntil) armDeadline("au retour au premier plan");
+      // Encore muette quand la page revient au premier plan : l'échéance part de ce retour.
+      const armOnWake = () => armDeadline("au retour au premier plan");
+      this.silentAttempts.add(armOnWake);
+      // Suivie si une ouverture du lecteur natif est en cours — voir `meterOpeningRequest`.
+      const metered = meterOpeningRequest();
+      try {
+        // Le lien bridé que l'hôte peut fournir (`LinkShaper`, host.ts) — absent partout ailleurs que
+        // sur un banc : sans lui, aucune de ces deux branches n'est prise.
+        const shaper = linkShaper();
+        if (shaper) shaper.gate();
+        const sentAt = performance.now();
+        const res = await fetch(this.url, withHostHeaders({
+          headers: { Range: `bytes=${start}-${end}` },
+          // Le signal du lecteur *et* une échéance — voir `readSignal`. L'abandon sur échéance
+          // laisse `this.controller.signal.aborted` à faux, si bien que la boucle ci-dessous le
+          // traite comme n'importe quel échec réseau : une nouvelle tentative, puis l'écran.
+          // Le signal de ce morceau, que la fermeture de la source coupe aussi — voir `abandon`.
+          signal: readSignal(attemptControl.signal),
+        }));
+        // Des en-têtes : la requête parle, elle n'est plus muette.
+        if (firstByteTimer !== null) clearTimeout(firstByteTimer);
+        this.silentAttempts.delete(armOnWake);
+        // 206 is the expected answer; a 200 means the server ignored the Range and sent the whole
+        // file, which for a 40 GB movie must not be treated as a successful chunk read.
+        if (res.status === 200) {
+          throw new Error("Le serveur n'honore pas les requêtes de plage (statut 200).");
+        }
+        /**
+         * La session de connexion a expiré pendant le film : ni le réseau, ni le serveur de médias.
+         *
+         * Traité comme une coupure, ce 401 donnait « connexion perdue » et des reconstructions
+         * sans fin, jamais le chemin de la reconnexion (relevé le 23/09/2026). Seul l'hôte sait
+         * dire que c'est la session — voir `sessionEnded` (host.ts) : à lui de renvoyer à la
+         * connexion, et ne plus rien redemander.
+         */
+        if (hostSaysSessionEnded(res)) throw new SessionEnded();
+        // 416 : la plage commence après la fin du fichier — une taille d'avance périmée (fichier
+        // remplacé plus petit sous la même adresse), dont le dernier morceau tombe au-delà de la vraie
+        // fin. Le redemander n'y changera rien : il était pris pour une panne réseau, redemandé quatre
+        // fois en 2,3 s sous « Connexion perdue ou instable… » (chasse du 18/11/2026).
+        if (res.status === 416) throw new Error("La plage demandée est hors du fichier (statut 416).");
+        if (res.status !== 206) throw new Error(`Le serveur a refusé la plage demandée (statut ${res.status}).`);
+        this.checkTotal(res);
+        const headersAt = performance.now();
+        metered?.headers();
+        // Le corps se lit d'un bloc, comme toujours : pendant une ouverture, le morceau est compté
+        // une fois arrivé (« connexion trop lente », DECISIONS.md §77). Une lecture au fil de l'eau
+        // (`readCounted`) mesurait aussi le morceau en cours, mais changeait la réception des octets
+        // de toutes les ouvertures, Safari compris, pour la précision d'un verdict que les morceaux
+        // finis donnent déjà — gardée prête, non branchée (12/10/2026).
+        const bytes = new Uint8Array(await res.arrayBuffer());
+        if (shaper) await shaper.transfer(bytes.byteLength, headersAt, attemptControl.signal);
+        /**
+         * Un corps plus court que la plage que la réponse annonce : une réponse coupée qui s'est
+         * terminée « proprement » (13/10/2026). Rendu tel quel, le cache le refusait (mauvaise
+         * longueur) mais la lecture qui l'attendait recevait moins d'octets que demandé — ce que le
+         * démultiplexeur prend pour la fin du fichier. Redemandé, comme un échec réseau. Comparé au
+         * `Content-Range` de *cette* réponse, pas à la taille d'ouverture : un morceau de fin coupé
+         * par une taille corrigée (`checkTotal`) est légitimement plus court que demandé.
+         */
+        const announced = /bytes (\d+)-(\d+)\//.exec(res.headers?.get?.("Content-Range") ?? "");
+        if (announced && bytes.byteLength !== Number(announced[2]) - Number(announced[1]) + 1) {
+          throw new Error(`plage tronquée (${bytes.byteLength} octets sur ${Number(announced[2]) - Number(announced[1]) + 1})`);
+        }
+        metered?.received(bytes.byteLength);
+        this.networkBytes += bytes.byteLength;
+        // Le réseau livre : le silence est fini — et repart d'ici pour les autres morceaux en vol.
+        this.silentFrom = this.demand > 1 ? Date.now() : null;
+        const endAt = performance.now();
+        this.note(sentAt, headersAt, endAt, bytes.byteLength, res);
+        // Toutes les requêtes, pas seulement celles d'un saut : le débit en pleine lecture — voir
+        // playbackDiagnosis.ts.
+        diagRequest(sentAt, headersAt, endAt, bytes.byteLength, serverTimingApp(res.headers?.get?.("Server-Timing") ?? null));
+        return bytes;
+      } catch (error) {
+        // Cancelled by the player itself, and a server that ignores ranges: neither improves by
+        // being asked again.
+        if (this.controller.signal.aborted) throw error;
+        // Abandonné pour un saut : ce n'est pas un échec, et le redemander irait contre le saut.
+        if (own.aborted) throw new ReadAbandoned();
+        if (error instanceof Error && (error.message.includes("statut 200") || error.message.includes("statut 416"))) throw error;
+        if (error instanceof SessionEnded) throw error;
+        last = error;
+        diagRequestFailed();
+        // Une autre tentative suit : « Connexion perdue ou instable… » (§78), jusqu'à ce que ce morceau
+        // arrive, soit abandonné, ou laisse la place à l'écran « connexion perdue ». Pas pour la plage
+        // qu'un saut a relancée faute de premier octet (`muted`) : c'est la relance ordinaire d'un saut,
+        // pas une tentative en échec — la dire « instable » mentait après chaque saut un peu lent.
+        if (attempt < FETCH_ATTEMPTS - 1 && !muted) noteRetrying();
+        if (muted) trace(`réseau : aucun octet en ${SEEK_FIRST_BYTE_MS / 1000} s ${deadlineWhy}, plage ${start}-${end} redemandée`);
+        else if (attempt === 0) trace(`réseau : plage ${start}-${end} refusée, nouvelle tentative`);
+      } finally {
+        metered?.end();
+        if (firstByteTimer !== null) clearTimeout(firstByteTimer);
+        this.silentAttempts.delete(armOnWake);
+        own.removeEventListener("abort", forward);
+      }
+    }
+    throw new NetworkUnavailable(
+      last instanceof Error ? `Plage inaccessible : ${last.message}` : "Plage inaccessible."
+    );
+  }
+
+  private async fetchChunk(index: number): Promise<Uint8Array> {
+    // Fermée : rien ne part plus. Une lecture ou une avance arrivée après `close` (une boucle de
+    // remplissage qui finit son tour, un `warm` tardif) lançait une requête que plus personne
+    // n'écoutait — et qui, abandonnée d'avance, n'aboutissait qu'au bout de ses tentatives.
+    if (this.controller.signal.aborted) throw closedSource();
+    const cached = this.chunks.get(index);
+    if (cached) return cached;
+    // Téléchargé d'avance par la réserve mémoire (`MemoryReserve`) : il rejoint le cache, lu.
+    const reserved = this.reserve.get(index);
+    if (reserved) {
+      this.reserve.delete(index);
+      this.chunks.set(index, reserved);
+      this.evict();
+      this.reserveBytes += reserved.byteLength;
+      return reserved;
+    }
+    const pending = this.inflight.get(index);
+    if (pending) return pending;
+
+    const start = index * CHUNK_SIZE;
+    const end = Math.min(start + CHUNK_SIZE, this.size) - 1;
+    const own = new AbortController();
+    this.inflightControllers.set(index, own);
+    const promise = this.fromDiskOrNetwork(index, start, end, own.signal)
+      .then((bytes) => {
+        // Demandé avant que `checkTotal` ne corrige la taille, un morceau de fin peut avoir été
+        // coupé au mauvais endroit : servi à la lecture qui l'attendait, mais pas gardé.
+        if (bytes.byteLength === this.expectedLength(index)) {
+          this.chunks.set(index, bytes);
+          this.evict();
+        }
+        return bytes;
+      })
+      .finally(() => {
+        // Seulement si l'entrée est encore la sienne : un morceau abandonné puis redemandé a déjà
+        // une promesse neuve à cette place, et l'effacer en lancerait une troisième au prochain
+        // appel — ou ferait croire à la lecture en avance que rien n'est en route.
+        if (this.inflight.get(index) === promise) this.inflight.delete(index);
+        if (this.inflightControllers.get(index) === own) this.inflightControllers.delete(index);
+      });
+
+    this.inflight.set(index, promise);
+    return promise;
+  }
+
+  /**
+   * L'appareil d'abord, s'il a ce morceau de ce fichier ; le réseau sinon — et aussi quand la
+   * relecture sur l'appareil échoue ou rend une longueur inattendue. Ne lève jamais à cause de
+   * l'appareil.
+   */
+  private async fromDiskOrNetwork(index: number, start: number, end: number, own: AbortSignal): Promise<Uint8Array> {
+    const disk = this.disk;
+    if (disk?.has(index)) {
+      try {
+        const bytes = await disk.read(index);
+        // Relu une seconde fois après l'attente : une réponse du réseau arrivée entre-temps a pu
+        // dire que ce n'est plus le même fichier.
+        if (bytes && bytes.byteLength === this.expectedLength(index) && disk.has(index)) {
+          this.deviceBytes += bytes.byteLength;
+          return bytes;
+        }
+      } catch {
+        /* l'appareil n'est qu'une avance : le réseau répond */
+      }
+      // Fermée, ou ce morceau abandonné pour un saut, pendant l'attente de l'appareil : plus personne
+      // ne l'attend. Le réseau partait quand même — un signal déjà coupé ne déclenche plus son
+      // écouteur `abort`, la requête n'était jamais annulée (chasse du 18/11/2026).
+      if (own.aborted || this.controller.signal.aborted) throw new ReadAbandoned();
+    }
+    return this.fetchWithRetries(start, end, own);
+  }
+
+  /**
+   * Starts fetching the chunk after the one just used, without waiting for it.
+   *
+   * Playback reads strictly forward, and a 1 MiB chunk is well under a second of 4K video — so
+   * without this, every chunk boundary is a full network round trip the decoder sits through.
+   * That stall is what turns a decoder that can keep up into one that visibly cannot.
+   */
+  /** Voir `withoutReadahead`. */
+  private readahead = true;
+
+  /**
+   * Plus de lecture en avance : chaque octet lu est un octet demandé, rien de plus (28/09/2026). Pour
+   * les sources qui préparent un titre au repos (`recordTitle`, l'épisode suivant) — la lecture en
+   * avance y téléchargeait six mégaoctets après chaque lecture, que personne ne gardait. Jamais pour
+   * le lecteur, dont c'est l'avance.
+   */
+  withoutReadahead(): this {
+    this.readahead = false;
+    return this;
+  }
+
+  /**
+   * La lecture en avance suspendue le temps de lire l'en-tête d'une ouverture en reprise
+   * (29/09/2026). Lire le morceau 0 lançait les morceaux 1 à 6 — le début du film, six mégaoctets
+   * qu'une reprise à vingt minutes ne lit jamais, demandés avant que quiconque sache où elle
+   * tomberait. Même un titre dont l'appareil tenait l'en-tête, l'index et la zone de reprise
+   * allait chercher ces six-là sur le réseau, et rien d'autre. Rendue dès l'en-tête lu : la
+   * lecture suivante, à la position de reprise, relance l'avance là où elle sert. Jamais pour une
+   * ouverture au début, dont ces morceaux sont les premières images.
+   */
+  private readaheadHeld = false;
+
+  holdReadahead(held: boolean): void {
+    this.readaheadHeld = held;
+  }
+
+  private prefetchAfter(index: number): void {
+    if (this.controller.signal.aborted || !this.readahead || this.readaheadHeld) return;
+    const depth = performance.now() < this.focusUntil ? SEEK_PREFETCH_CHUNKS : PREFETCH_CHUNKS;
+    for (let ahead = 1; ahead <= depth; ahead++) {
+      const next = index + ahead;
+      if (next * CHUNK_SIZE >= this.size) return;
+      // Un morceau que la réserve d'avance a déjà en route n'est pas demandé une seconde fois : elle
+      // le livre dans quelques instants, et la lecture en avance n'est jamais pressée.
+      if (this.chunks.has(next) || this.inflight.has(next) || this.reserve.has(next) || this.reserveInflight.has(next)) continue;
+      void this.fetchChunk(next).catch(() => {
+        // A failed read-ahead is not an error: the real read will try again and report properly.
+      });
+    }
+  }
+
+  /**
+   * Fetches around an offset before anything reads there.
+   *
+   * A seek knows which cluster it is going to land in the moment the index is consulted, and
+   * that is several milliseconds before the parser asks for its first byte. Until now those
+   * milliseconds were spent idle and the one after them was spent waiting on a single request:
+   * the read-ahead only started once that first chunk had already arrived, so the beginning of
+   * every seek was one round trip during which the link carried one megabyte and nothing else —
+   * on a file needing four before it can show a picture.
+   *
+   * Cheap to be wrong about: these are chunks the reader was about to ask for anyway, and a
+   * fetch already in flight or already cached is left alone.
+   */
+  warm(offset: number): void {
+    if (this.controller.signal.aborted) return;
+    const first = Math.floor(Math.max(0, Math.min(offset, this.size - 1)) / CHUNK_SIZE);
+    if (!this.chunks.has(first) && !this.inflight.has(first)) {
+      void this.fetchChunk(first).catch(() => {
+        // Speculative: the real read asks again and reports properly if it fails.
+      });
+    }
+    this.prefetchAfter(first);
+  }
+
+  /**
+   * La lecture, et ce qu'elle a fait attendre : une lecture servie par le cache revient dans la
+   * milliseconde, une qui attend le réseau ou le disque est notée — c'est le remultiplexeur à sec
+   * (voir playbackDiagnosis.ts).
+   */
+  async read(offset: number, length: number, who = "lecteur"): Promise<Uint8Array> {
+    const from = diagNow();
+    // Qui demande quoi depuis le saut (`NetworkWindow.demand`) — une mesure, jamais une erreur.
+    const window = this.window;
+    if (window) {
+      const d = (window.demand[who] ??= { reads: 0, bytes: 0 });
+      d.reads += 1;
+      d.bytes += Math.max(0, length);
+    }
+    // Une lecture dont un morceau n'est pas en mémoire attend : la réserve d'avance (`MemoryReserve`)
+    // se retient tant qu'il y en a une — le lien est d'abord au lecteur.
+    const start = Math.max(0, Math.min(offset, this.size));
+    const end = Math.max(start, Math.min(offset + length, this.size));
+    let waiting = false;
+    for (let index = Math.floor(start / CHUNK_SIZE); end > start && index <= Math.floor((end - 1) / CHUNK_SIZE); index++) {
+      if (!this.chunks.has(index) && !this.reserve.has(index)) {
+        waiting = true;
+        break;
+      }
+    }
+    if (waiting) this.waitingReads += 1;
+    try {
+      return await this.readBytes(offset, length);
+    } finally {
+      if (waiting) this.waitingReads -= 1;
+      if (diagNow() - from >= 2) diagInterval("read", from);
+    }
+  }
+
+  /** Les lectures en cours qui attendent un morceau absent de la mémoire — voir `read`. */
+  private waitingReads = 0;
+
+  /**
+   * La réserve d'avance en mémoire (`MemoryReserve`, 28/09/2026) : des morceaux téléchargés au-delà de
+   * la lecture en avance, gardés à part du cache pour que ses évictions ne les chassent pas avant
+   * qu'ils servent. Un morceau lu la quitte pour le cache (`fetchChunk`) ; la réserve retire elle-même
+   * ce que la tête a dépassé. Rien sur l'appareil : la mémoire seulement, rendue à la fermeture.
+   */
+  private reserve = new Map<number, Uint8Array>();
+  /** Octets que le lecteur a lus depuis la réserve mémoire. */
+  reserveBytes = 0;
+
+  /** Un morceau pour la réserve — refusé s'il est déjà là, ou s'il n'a pas sa longueur. */
+  offerReserve(index: number, bytes: Uint8Array): boolean {
+    if (this.controller.signal.aborted || this.chunks.has(index) || bytes.byteLength !== this.expectedLength(index)) return false;
+    this.reserve.set(index, bytes);
+    return true;
+  }
+  dropReserve(index: number): void {
+    this.reserve.delete(index);
+  }
+  clearReserve(): void {
+    this.reserve.clear();
+  }
+  get reserveIndices(): number[] {
+    return [...this.reserve.keys()];
+  }
+  /** Les morceaux que la réserve a en route — tenus par elle, lus par `prefetchAfter`. */
+  readonly reserveInflight = new Set<number>();
+  /** Le lecteur a-t-il ce morceau en route ? La réserve ne le demande pas une seconde fois. */
+  isFetching(index: number): boolean {
+    return this.inflight.has(index);
+  }
+  /** Le morceau est-il en mémoire, dans le cache ou dans la réserve ? */
+  hasInMemory(index: number): boolean {
+    return this.chunks.has(index) || this.reserve.has(index);
+  }
+
+  /**
+   * Ce que la réserve d'avance (`MemoryReserve`, 28/09/2026) lit de la source, sans rien y changer : où
+   * en est le lecteur, s'il attend. Rien ici ne lance de requête.
+   */
+  get streamUrl(): string {
+    return this.url;
+  }
+  get readsWaiting(): number {
+    return this.waitingReads;
+  }
+  /** Le dernier morceau qu'une lecture a demandé — la lecture en avance court jusqu'à `PREFETCH_CHUNKS` au-delà. */
+  get demandedChunk(): number {
+    return this.lastDemanded;
+  }
+  /** Un saut attend sa première image : la lecture en avance est bridée, le lien est au saut. */
+  get seekFocused(): boolean {
+    return performance.now() < this.focusUntil;
+  }
+  private async readBytes(offset: number, length: number): Promise<Uint8Array> {
+    if (this.controller.signal.aborted) throw closedSource();
+    const start = Math.max(0, Math.min(offset, this.size));
+    const end = Math.max(start, Math.min(offset + length, this.size));
+    if (end === start) return new Uint8Array(0);
+
+    const firstChunk = Math.floor(start / CHUNK_SIZE);
+    const lastChunk = Math.floor((end - 1) / CHUNK_SIZE);
+
+    this.lastDemanded = lastChunk;
+    // Fast path: the whole read sits inside one chunk, so it's a view, not a copy.
+    if (firstChunk === lastChunk) {
+      const chunk = await this.fetchChunk(firstChunk);
+      this.prefetchAfter(firstChunk);
+      const from = start - firstChunk * CHUNK_SIZE;
+      return chunk.subarray(from, from + (end - start));
+    }
+
+    // Asked for together, not one after the other. Awaiting each in turn made a read spanning
+    // four chunks four round trips deep, which is exactly the shape this cache exists to avoid.
+    const pending: Promise<Uint8Array>[] = [];
+    for (let index = firstChunk; index <= lastChunk; index++) pending.push(this.fetchChunk(index));
+    const fetched = await Promise.all(pending);
+
+    const out = new Uint8Array(end - start);
+    let written = 0;
+    for (let index = firstChunk; index <= lastChunk; index++) {
+      const chunk = fetched[index - firstChunk];
+      const chunkStart = index * CHUNK_SIZE;
+      const from = Math.max(0, start - chunkStart);
+      const to = Math.min(chunk.length, end - chunkStart);
+      if (to > from) {
+        out.set(chunk.subarray(from, to), written);
+        written += to - from;
+      }
+    }
+    this.prefetchAfter(lastChunk);
+    return written === out.length ? out : out.subarray(0, written);
+  }
+
+  /**
+   * Un saut vient d'être demandé vers `keepOffset` : tout ce qui est en vol ailleurs est coupé.
+   *
+   * 22/09/2026, serveur lointain : un saut attendait la fin de la lecture en cours — jusqu'à deux
+   * secondes — avant de repositionner le lecteur, et pendant ce temps les six morceaux lus en
+   * avance de l'ancienne position occupaient le lien que la nouvelle attendait. On garde ce qui
+   * sert le saut lui-même : le morceau où il tombe et l'avance qui le suit.
+   */
+  abandon(keepOffset: number): void {
+    this.focusUntil = performance.now() + SEEK_FOCUS_MS;
+    this.window = { since: performance.now(), requests: 0, bytes: 0, lastEnd: 0, fbMin: Infinity, fbMax: 0, slowest: 0, server: null, protocols: {}, demand: {} };
+    const first = Math.floor(Math.max(0, Math.min(keepOffset, this.size - 1)) / CHUNK_SIZE);
+    let dropped = 0;
+    for (const [index, own] of this.inflightControllers) {
+      if (index >= first && index <= first + PREFETCH_CHUNKS) continue;
+      own.abort();
+      this.inflightControllers.delete(index);
+      // Sa promesse aussi. Laissée dans `inflight`, elle était rendue par `fetchChunk` à toute
+      // lecture de ce morceau jusqu'à ce qu'elle s'éteigne — et avec elle `ReadAbandoned`, pour
+      // un morceau que le lecteur voulait bel et bien (22/09/2026 : boucle de remplissage arrêtée
+      // sans un mot, image en double, plus de son jusqu'au saut suivant). La lecture en avance,
+      // elle, le sautait en le croyant en route.
+      this.inflight.delete(index);
+      dropped += 1;
+    }
+    if (dropped > 0) trace(`réseau : ${dropped} lecture(s) de l'ancienne position abandonnée(s)`);
+  }
+
+  /** La longueur qu'a le morceau `index` dans un fichier de la taille actuelle. */
+  private expectedLength(index: number): number {
+    return Math.max(0, Math.min(CHUNK_SIZE, this.total - index * CHUNK_SIZE));
+  }
+
+  /**
+   * La taille annoncée par la première réponse qui en porte une, comparée à celle de l'ouverture.
+   *
+   * Une taille connue d'avance vient de la description du fichier, que le lecteur garde en
+   * mémoire toute la session : un fichier remplacé entre-temps par son gestionnaire en aurait une
+   * autre. Le `Content-Range` d'une plage est la vérité du moment — il arrive avec les premiers
+   * octets, avant que le démultiplexeur ait lu quoi que ce soit, et c'est lui qu'on garde. Les
+   * morceaux déjà reçus que la nouvelle taille rend faux (un morceau de fin coupé trop tôt) sont
+   * oubliés. Tracé, parce qu'un écart dit que la description était périmée. Ne lève jamais.
+   */
+  private checkTotal(res: Response): void {
+    if (this.totalChecked) return;
+    try {
+      const header = res.headers?.get?.("Content-Range");
+      const total = header ? Number(header.split("/")[1]) : NaN;
+      if (!Number.isFinite(total) || total <= 0) return;
+      this.totalChecked = true;
+      this.lastModified = res.headers?.get?.("Last-Modified") ?? null;
+      // La première parole du serveur sur ce fichier : les morceaux gardés sur l'appareil ne
+      // valent que s'ils sont du même.
+      try {
+        this.disk?.verify(total, this.lastModified);
+      } catch {
+        /* une vérification n'est pas une lecture */
+      }
+      if (total === this.total) return;
+      trace(`réseau : le serveur annonce ${total} octets, la source était ouverte sur ${this.total} — taille corrigée`);
+      this.total = total;
+      for (const [index, bytes] of this.chunks) {
+        if (bytes.byteLength !== this.expectedLength(index)) this.chunks.delete(index);
+      }
+      this.sizeCorrected = true;
+      this.onSizeCorrected?.();
+    } catch {
+      /* une vérification n'est pas une lecture */
+    }
+  }
+
+  /** Une requête terminée, comptée dans la fenêtre du saut en cours. Ne lève jamais. */
+  private note(sentAt: number, headersAt: number, endAt: number, bytes: number, res: Response): void {
+    const w = this.window;
+    if (!w) return;
+    try {
+      const serverTiming = res.headers?.get?.("Server-Timing") ?? null;
+      w.requests += 1;
+      w.bytes += bytes;
+      w.lastEnd = Math.max(w.lastEnd, endAt);
+      w.fbMin = Math.min(w.fbMin, headersAt - sentAt);
+      w.fbMax = Math.max(w.fbMax, headersAt - sentAt);
+      w.slowest = Math.max(w.slowest, endAt - sentAt);
+      const server = serverTimingApp(serverTiming);
+      if (server !== null) w.server = Math.max(w.server ?? 0, server);
+      const protocol = protocolOf(this.url);
+      if (protocol !== null) w.protocols[protocol] = (w.protocols[protocol] ?? 0) + 1;
+    } catch {
+      /* une mesure n'est pas une lecture */
+    }
+  }
+
+  seekSettled(): void {
+    if (this.focusUntil === 0) return;
+    this.focusUntil = 0;
+    if (this.lastDemanded >= 0) this.prefetchAfter(this.lastDemanded);
+  }
+
+  networkSinceSeek(): NetworkWindow | null {
+    const w = this.window;
+    if (!w || w.requests === 0) return null;
+    return {
+      requests: w.requests,
+      bytes: w.bytes,
+      elapsedMs: Math.round(w.lastEnd - w.since),
+      firstByteMinMs: Math.round(w.fbMin),
+      firstByteMaxMs: Math.round(w.fbMax),
+      slowestMs: Math.round(w.slowest),
+      serverMaxMs: w.server,
+      protocols: { ...w.protocols },
+      demand: Object.fromEntries(Object.entries(w.demand).map(([who, d]) => [who, { ...d }])),
+    };
+  }
+
+  held(): HeldBytes | null {
+    // Une copie de la carte, pas des octets : la source peut continuer, ou être fermée, sans rien changer à ce qui est rendu.
+    return { size: this.size, lastModified: this.lastModified, chunks: new Map(this.chunks) };
+  }
+
+  keep(from: number, to: number): void {
+    if (!(to > from)) {
+      this.kept = null;
+      return;
+    }
+    const first = Math.max(0, Math.floor(from / CHUNK_SIZE));
+    const last = Math.min(Math.floor((to - 1) / CHUNK_SIZE), first + MAX_KEPT_CHUNKS - 1);
+    this.kept = { first, last };
+  }
+
+  /**
+   * Le plus ancien d'abord — un démultiplexeur lit presque toujours en avant, donc le plus ancien
+   * est d'ordinaire le moins utile —, sauf la zone gardée. Si tout ce qui reste est gardé, le plus
+   * ancien part quand même : la borne de mémoire passe avant la préférence.
+   */
+  private evict(): void {
+    while (this.chunks.size > MAX_CACHED_CHUNKS) {
+      let victim: number | undefined;
+      for (const index of this.chunks.keys()) {
+        if (!this.kept || index < this.kept.first || index > this.kept.last) {
+          victim = index;
+          break;
+        }
+      }
+      victim ??= this.chunks.keys().next().value;
+      if (victim === undefined) break;
+      this.chunks.delete(victim);
+    }
+  }
+
+  /**
+   * @param leaveForNext laisser ses morceaux au relais (voir `handover`). Faux pour une source qui
+   *   ne sert qu'à préparer un autre fichier — l'épisode suivant — et qui, sinon, prendrait la place
+   *   unique du relais au film en cours.
+   */
+  close(leaveForNext = true): void {
+    // Une seule fois. Une seconde fermeture (un nettoyage tardif) laissait au relais une carte
+    // vide — ce qui l'efface —, et effaçait donc celui qu'une *autre* source, rouverte sur ce même
+    // fichier puis refermée entre-temps, venait d'y laisser.
+    if (this.controller.signal.aborted) return;
+    this.controller.abort();
+    if (typeof document !== "undefined") document.removeEventListener("visibilitychange", this.onVisibility);
+    if (typeof window !== "undefined" && typeof window.removeEventListener === "function") window.removeEventListener("online", this.onOnline);
+    this.silentAttempts.clear();
+    // Chaque morceau a son propre interrupteur : la fermeture les coupe tous.
+    for (const own of this.inflightControllers.values()) own.abort();
+    this.inflightControllers.clear();
+    // Les morceaux arrivés entiers restent valables pour ce fichier : laissés à la source qui le
+    // rouvrira, s'il y en a une bientôt. Les requêtes en cours, elles, meurent avec celle-ci.
+    if (leaveForNext) leaveHandover(this.url, this.size, this.chunks, this.kept, this.reserve);
+    this.chunks = new Map();
+    this.reserve = new Map();
+    this.reserveInflight.clear();
+    this.inflight.clear();
+  }
+}

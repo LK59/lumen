@@ -1,0 +1,626 @@
+// Everything about the element's own clock.
+//
+// Pausing, resuming, landing on media after a seek, and starting a film the element gave up on.
+// None of it is about buffers or bytes: it is about what the viewer sees
+// and hears at the moment they press something, and almost all of it exists because a device
+// disagreed with the specification about what should happen next.
+//
+// It lives apart from the source because it is a different subject with a different kind of
+// evidence behind it — every rule here was measured on a device, and the comments say which.
+
+import { trace } from "./trace";
+import { rangeAround } from "./timeRanges";
+import { LANDING_REACH_SECONDS, landingFor } from "./seekLifecycle";
+
+/**
+ * What the guard needs from the source it belongs to.
+ *
+ * Deliberately small, and all of it read-only except the two verbs: this half decides *when* the
+ * playhead should move, and the source remains the only thing that moves media.
+ */
+export interface GuardHost {
+  readonly destroyed: boolean;
+  /** How far the player's clock runs ahead of the file's. */
+  readonly delaySeconds: number;
+  /** What the element can actually play: the intersection of its buffers. */
+  readonly playable: TimeRanges;
+  seek(seconds: number, because: string): Promise<void>;
+  /** Tells the source a position was moved to deliberately, so it does not read it as a jump. */
+  noteSeekTarget(seconds: number): void;
+}
+
+/**
+ * How long after pressing play the position from the pause is still defended.
+ *
+ * The jump does not necessarily happen the instant playback resumes: the element can start, find
+ * nothing where it was, and move on a moment later. Long enough to cover that, short enough that
+ * it can never be mistaken for fighting a viewer who has moved on.
+ */
+const RESUME_GUARD_MS = 1500;
+
+/**
+ * How long the clock is watched after a pause has been flushed, in case the flush did not take.
+ *
+ * The flush itself is immediate; this only covers a platform that queues more sound after being
+ * told to discard what it had. A clock advancing while nothing is playing is exactly that.
+ */
+const PAUSE_SETTLE_MS = 1000;
+
+/**
+ * How far ahead of the pause a resume may land before it counts as a discontinuity.
+ *
+ * Measured on the device: the picture freezes where the button was pressed, but the sound the
+ * hardware already held plays on for about half a second, and the clock reports that at the
+ * moment of resuming — half a second ahead. Nothing was skipped; it was heard while the picture
+ * stood still. Pulling it back replays it and shows the wrong frame for a moment, which is the
+ * flicker this once caused. Only a gap far larger than the drain is a real discontinuity: media
+ * the system reclaimed while nothing was playing, which runs to seconds.
+ */
+const RESUME_TOLERANCE_SECONDS = 1.5;
+
+/**
+ * How far the clock may creep while paused before it is worth putting back.
+ *
+ * Below this the correction costs more than the drift: re-stating the position is a seek, and a
+ * seek at a pause is heard.
+ */
+const PAUSE_DRIFT_SECONDS = 0.25;
+
+/** Including the one made at the pause itself. Past this, the element is left alone. */
+const MAX_PAUSE_ASSERTIONS = 3;
+
+/** How many times a start the element abandoned is attempted again before leaving it be. */
+const MAX_START_RETRIES = 2;
+
+/**
+ * How far the playhead may have moved and still count as never having started.
+ *
+ * Wider than the presentation delay, which the opening steps over, and far narrower than any
+ * amount of film somebody could have watched before pressing pause.
+ */
+const STILL_AT_THE_START = 1;
+
+/** How long after opening a film this may still insist on starting it. */
+const START_WINDOW_MS = 15000;
+
+export class PlaybackGuard {
+  constructor(
+    private readonly video: HTMLVideoElement,
+    private readonly host: GuardHost,
+    private readonly onStarting: ((startedAt: number | null) => void) | undefined
+  ) {}
+
+  /** Whether a set of ranges covers a point. */
+  private covers(ranges: TimeRanges, seconds: number): boolean {
+    return rangeAround(ranges, seconds, 0) >= 0;
+  }
+
+  /** Where a seek was served, until the playhead is actually standing on media. */
+  private seekLanding: number | null = null;
+  /** Set when the element abandoned a start rather than the viewer pausing one. */
+  private startAborted = false;
+  private startRetries = 0;
+  /** Where the film was opened, so a playhead still standing there has plainly never started. */
+  private openedFrom: number | null = null;
+  private openedAt = 0;
+
+  /** Where the picture froze when the viewer pressed pause. Resume lands exactly there. */
+  private pauseAnchor: number | null = null;
+
+  private resumeDeadline = 0;
+
+  private resumeStartedAt = 0;
+
+  private pauseStartedAt = 0;
+
+  /**
+   * Where the clock was when play was asked for, while it has not moved since.
+   *
+   * Kept apart from the pause trace on purpose: that trace only exists once something has been
+   * paused, and the very first play — the automatic one, before anyone has touched anything —
+   * would otherwise raise this and have nothing able to lower it again.
+   */
+  private startingFrom: number | null = null;
+
+  private frameCallback: number | null = null;
+
+  private pauseSettleTimer: ReturnType<typeof setInterval> | null = null;
+
+  /**
+   * The last pause and resume, in positions.
+   *
+   * Written down because the remaining flicker cannot be reasoned about any further from here:
+   * nothing in this file moves the playhead when the buffer covers it, and the device says it
+   * does. Four numbers settle what a description cannot — where it stopped, where it came back,
+   * and where it was one tick later.
+   */
+  private resumeTrace: {
+    paused: number;
+    settled: number;
+    asserted: number;
+    play: number;
+    tick: number | null;
+    /** Milliseconds between pressing play and the clock actually moving. */
+    latencyMs: number | null;
+    /**
+     * How long the pause lasted, which is the question that discriminates.
+     *
+     * If emptying the queue is what costs, then time spent paused is time the platform has
+     * already had to recover, and a long pause should start faster than a short one. If the cost
+     * is charged at the press regardless, it does not depend on this at all.
+     */
+    pausedForMs: number | null;
+  } | null = null;
+
+  /** Re-states the position, which runs the seek algorithm and so discards any queued sound. */
+  private assertPausePosition(): void {
+    const anchor = this.pauseAnchor;
+    if (this.host.destroyed || anchor === null || !this.video.paused) return;
+    this.host.noteSeekTarget(anchor);
+    this.video.currentTime = anchor;
+    if (this.resumeTrace) this.resumeTrace.asserted += 1;
+  }
+
+  /**
+   * The wait shown to the viewer, armed and cleared in one place.
+   *
+   * Six call sites used to set this directly, and a spinner that stayed up said nothing about
+   * which of them had armed it or which had failed to come. Named here, and written to the
+   * record, so the next report answers that instead of posing it.
+   */
+  private setStarting(startedAt: number | null, because: string): void {
+    // A clear is never skipped, however sure this is that the wait is already down: being sure
+    // and being wrong is the whole shape of the fault. Only a repeated *arming* is dropped, so
+    // the record does not fill with the same line.
+    if (startedAt !== null && this.startingWait !== null) return;
+    this.startingWait = startedAt;
+    trace(startedAt === null ? `attente levée (${because})` : `attente affichée (${because})`);
+    this.onStarting?.(startedAt);
+  }
+
+  private startingWait: number | null = null;
+
+  /**
+   * Puts playback back where it was stopped, if resuming has moved it on.
+   *
+   * Two things move it. The element's clock follows the sound, and the sound already handed to
+   * the hardware plays out past the button press. And the system may reclaim buffered media while
+   * nothing is playing — it is allowed to, and on a phone it does — so the element can come back
+   * to find nothing where it was and carry on from the nearest media it still holds. Both look
+   * identical from here: the film quietly continued while it was stopped.
+   */
+  private holdPausePosition(): boolean {
+    const anchor = this.pauseAnchor;
+    if (anchor === null || this.host.destroyed) return false;
+    if (Date.now() > this.resumeDeadline) {
+      this.pauseAnchor = null;
+      return false;
+    }
+
+    // Measured against where playing could legitimately have got to, never against the anchor
+    // itself. Playback passes the anchor within a tenth of a second of resuming, and reading that
+    // as a jump is a yank backwards — and, when the media there has been reclaimed, a full
+    // re-read for nothing. Only a playhead further along than time can account for has jumped.
+    const rate = this.video.playbackRate || 1;
+    const reachable = anchor + ((Date.now() - this.resumeStartedAt) / 1000) * rate;
+    if (this.video.currentTime <= reachable + RESUME_TOLERANCE_SECONDS) return false;
+
+    this.pauseAnchor = null;
+    if (this.covers(this.host.playable, anchor)) {
+      this.host.noteSeekTarget(anchor);
+      this.video.currentTime = anchor;
+      return true;
+    }
+    // The media that was there is gone. Fetching it again is the whole point — this is the case
+    // the guard exists for, and the one where giving up leaves the jump in place.
+    void this.host.seek(anchor, "reprise après une pause");
+    return true;
+  }
+
+  /**
+   * Playback has genuinely begun.
+   *
+   * Waiting instead for the clock to be seen moving means waiting for the next timeupdate, which
+   * a browser emits about four times a second — long enough for the picture to be running again
+   * before anyone here notices, and for a spinner to appear over media that is already playing
+   * and then vanish. This event is the moment itself.
+   */
+  /**
+   * Waits for a picture to actually be presented, and only then stops saying it is starting.
+   *
+   * The three candidate signals are not interchangeable. The playing event fires as soon as play
+   * is called, before the pipeline has begun — clearing on it means never showing anything at
+   * all. timeupdate arrives about four times a second, so the picture can be running again a
+   * fifth of a second before anyone here notices, which is long enough to show a spinner over
+   * media that is already moving and then take it away. This one is the frame itself.
+   */
+  private watchForFirstFrame(from: number): void {
+    const request = this.video.requestVideoFrameCallback?.bind(this.video);
+    if (!request) return; // fallback: the clock check below, a beat late but correct
+
+    const step = (_now: number, metadata: VideoFrameCallbackMetadata) => {
+      this.frameCallback = null;
+      if (this.host.destroyed || this.startingFrom === null) return;
+      if (metadata.mediaTime > from + 0.01) {
+        this.startingFrom = null;
+        this.firstPictureOwed = false;
+        this.setStarting(null, "première image affichée");
+        return;
+      }
+      this.frameCallback = request(step);
+    };
+    this.frameCallback = request(step);
+  }
+
+  private stopWatchingForFirstFrame(): void {
+    if (this.frameCallback === null) return;
+    this.video.cancelVideoFrameCallback?.(this.frameCallback);
+    this.frameCallback = null;
+  }
+
+  /**
+   * Moves the playhead onto the media, when it has landed just short of it.
+   *
+   * A seek starts reading at the indexed cluster at or before the requested time, but everything
+   * this path produces is shifted later by the presentation delay. Land on an index point exactly
+   * and the media therefore begins a fifth of a second *after* the playhead — a gap the element
+   * will sit in front of indefinitely, waiting for data that is never coming. The step is far too
+   * small to see, and it is the difference between a seek that works and one that hangs.
+   */
+  nudgeIntoBuffer(): void {
+    const ranges = this.host.playable;
+    // A seek just served is the one time this may move a stopped picture: the viewer asked to be
+    // somewhere, and landing them on nothing is worse than landing them a little further on.
+    //
+    // "Just served" has to mean exactly that. A flag set at the seek and cleared only on arrival
+    // stayed up for the rest of the session whenever playback found its own media, and then a
+    // pause half an hour later was free to step fifteen seconds — which is what it did. So the
+    // window is the playhead still standing precisely where the seek put it: the moment it moves
+    // at all, it is on media and the landing is over.
+    const landing = this.seekLanding !== null && Math.abs(this.video.currentTime - this.seekLanding) < 0.05;
+    // Otherwise never while paused. The frame on screen is already drawn and needs nothing;
+    // moving the playhead under a viewer who has stopped is a picture that jumps on its own, and
+    // then resumes somewhere other than where they left it.
+    if (ranges.length === 0 || this.host.destroyed || (this.video.paused && !landing)) return;
+
+    const now = this.video.currentTime;
+
+    // Two tolerances, because two different things are being closed.
+    //
+    // In the ordinary case, only a gap the size of the presentation delay: anything larger is a
+    // real hole in the stream, and stepping over it silently would hide a genuine fault.
+    //
+    // Right after a seek it is far wider, and that is the whole point. An index is not exact:
+    // asking this file for 1568 s produced media that begins at 1570.6, and no amount of waiting
+    // or seeking again will ever make it cover 1568 — the recovery asked three times, each time
+    // was served, and each time the playhead stayed on nothing until the reader gave up and
+    // declared the browser to be keeping nothing. A media element seeking into a gap lands on
+    // the nearest media it has; so does this.
+    const tolerance = landing ? LANDING_REACH_SECONDS : this.host.delaySeconds + 0.15;
+    // Le même atterrissage qu'à l'ouverture — voir `landingFor`, qui dit aussi pourquoi un pas dans
+    // le média plutôt que son premier instant.
+    const target = landingFor(ranges, now, tolerance);
+    if (target === null) return;
+    if (target === now) {
+      this.seekLanding = null; // arrived
+      return;
+    }
+    if (landing) trace(`atterrissage : la tête passe de ${now.toFixed(1)} s au média, posée à ${target.toFixed(2)} s`);
+    this.seekLanding = null;
+    this.host.noteSeekTarget(target);
+    // A move made on purpose, and the resume guard must not mistake it for one. Left standing,
+    // the anchor makes the next event read this step forward as a jump and pull it back — a
+    // frame from further on, briefly, then the right one. Settling the position here is what the
+    // anchor was for, so it has done its job.
+    this.pauseAnchor = null;
+    this.headPlaced(target);
+    this.video.currentTime = target;
+  }
+
+  /**
+   * La source vient de poser la tête ailleurs pendant qu'un démarrage est attendu : l'atterrissage
+   * de l'ouverture (0 → 0,27 s sur un fichier à images B), la poussée d'une horloge figée.
+   *
+   * Ce pas-là n'est pas de la lecture, et il passait pour elle : `clockTicked` comme la première
+   * image lisaient « la tête a dépassé le départ » et levaient l'attente sur une image figée. Sur
+   * iPhone, un tiers des ouvertures depuis le début restaient ainsi arrêtées 1,5 s sans rien dire,
+   * puis repartaient après la poussée — le « second petit chargement » vu sur *Her*
+   * (10/10/2026 ; trace de *Forrest Gump* du 06/10 : atterrissage à 0,27 s, « attente levée », puis
+   * « horloge figée à 0,27 s » 1,5 s plus tard). Le départ se compte donc depuis là où la tête a été
+   * posée.
+   */
+  headPlaced(at: number): void {
+    if (this.startingFrom === null) return;
+    this.startingFrom = at;
+    this.stopWatchingForFirstFrame();
+    this.watchForFirstFrame(at);
+  }
+
+  /**
+   * Vrai depuis l'ouverture jusqu'à la première image qui avance vraiment — voir
+   * `FROZEN_OPENING_MS` dans la source, qui pousse plus tôt une ouverture figée.
+   */
+  get awaitingFirstPicture(): boolean {
+    // Et près de là où elle s'est ouverte : un saut demandé avant toute image n'est plus
+    // l'ouverture, il a son propre délai, mesuré sur ce qu'il a à décoder.
+    return this.firstPictureOwed && this.openedFrom !== null && Math.abs(this.video.currentTime - this.openedFrom) < 1;
+  }
+
+  private firstPictureOwed = false;
+
+  readonly clockTicked = () => {
+    // The first tick after resuming is where a jump would show, so it is recorded before
+    // anything here has a chance to act on it.
+    // Independent of the pause trace, so the first automatic play is answered too.
+    if (this.startingFrom !== null && this.video.currentTime > this.startingFrom + 0.01) {
+      this.startingFrom = null;
+      this.firstPictureOwed = false;
+      this.stopWatchingForFirstFrame();
+      this.setStarting(null, "l'horloge a avancé");
+    }
+
+    const trace = this.resumeTrace;
+    if (trace && !Number.isNaN(trace.play)) {
+      if (trace.tick === null) trace.tick = this.video.currentTime;
+      // Not the first event after play, but the first one where the clock has actually moved:
+      // that is when sound and picture are genuinely running again, and it is what a viewer
+      // feels as the button being slow.
+      if (trace.latencyMs === null && this.video.currentTime > trace.play + 0.01) {
+        trace.latencyMs = Date.now() - this.resumeStartedAt;
+        trace.pausedForMs = this.resumeStartedAt - this.pauseStartedAt;
+      }
+    }
+    // Playback advancing is also the first moment a jump on resume becomes visible.
+    if (this.pauseAnchor !== null) this.holdPausePosition();
+  };
+
+  /**
+   * Remembers exactly where the picture stopped.
+   *
+   * The element's clock does not necessarily stop where the button was pressed: the audio the
+   * system has already handed to the hardware plays out over the next fraction of a second, and
+   * the clock follows the sound. Resuming then starts from wherever it drifted to, which reads
+   * as the film having quietly continued while paused and jumping to catch up.
+   */
+  readonly paused = () => {
+    if (this.host.destroyed) return;
+    // A pause that arrives before the first frame of a playback that was asked for is not the
+    // viewer pausing — it is the element giving up on a start it could not make.
+    const abortedStart = this.startingFrom !== null;
+    if (abortedStart) this.startAborted = true;
+    this.startingFrom = null;
+    this.stopWatchingForFirstFrame();
+    this.setStarting(null, "mise en pause");
+    /**
+     * Et une pause pareille ne laisse pas d'ancre.
+     *
+     * L'ancre existe pour remettre la lecture là où le *son* s'est arrêté : l'horloge de
+     * l'élément dépasse le bouton, et le système peut reprendre le média pendant l'arrêt. Elle
+     * suppose donc qu'il y a eu lecture. Un démarrage auquel l'élément renonce n'en est pas une,
+     * et la position où il renonce est celle où il se trouvait : zéro.
+     *
+     * Cette ancre-là servait ensuite de vérité. Rapporté sur appareil, en forçant le cas : lancer
+     * une reprise, fermer pendant le chargement, relancer. La seconde lecture posait sa tête à
+     * 1049 s, puis la reprise après pause y voyait un saut de dix-sept minutes à annuler et
+     * ramenait le film au début. Une lecture qui n'a jamais commencé ne doit rien décider.
+     */
+    /**
+     * Ni une pause qui arrive en plein saut.
+     *
+     * Mettre en pause puis sauter dans la même tâche (le raccourci clavier sur un film arrêté, la
+     * barre relâchée pendant la pause) livre l'événement `pause` *avant* `seeking`. La tête est
+     * déjà sur la cible ; l'ancrer là et la « réaffirmer » marquait la cible comme un pas de ce
+     * lecteur, et le saut du spectateur, pris pour ce pas-là, n'allait jamais chercher son média :
+     * image figée sur un endroit non chargé (relevé le 23/09/2026). Le saut décide de la position ;
+     * la file de son déjà envoyée, il la vide lui-même.
+     */
+    const seeking = this.video.seeking;
+    this.pauseAnchor = abortedStart || seeking ? null : this.video.currentTime;
+    this.resumeTrace = {
+      paused: this.video.currentTime,
+      settled: this.video.currentTime,
+      asserted: 0,
+      play: NaN,
+      tick: null,
+      latencyMs: null,
+      pausedForMs: null,
+    };
+    this.pauseStartedAt = Date.now();
+
+    // Emptied at once, not a second later.
+    //
+    // The half second that turns up at the instant of resuming is the sound iOS still holds
+    // queued: it plays on past the frozen picture, and the clock — which follows the sound —
+    // reports it all in one go when playback restarts. Asking the element to be where it already
+    // is runs the seek algorithm, and that discards what is queued. Doing it immediately means
+    // there is never anything queued to drain, so a resume a fraction of a second later is as
+    // exact as one a minute later. Waiting first, as this did, left the fast pause-and-play
+    // untouched — the very case where the wait is most obvious.
+    this.assertPausePosition();
+
+    // Then watched, in case the flush did not take on the first attempt: the clock advancing
+    // while nothing is playing is the queue draining anyway, and it is re-stated each time.
+    if (this.pauseSettleTimer) clearInterval(this.pauseSettleTimer);
+    const deadline = Date.now() + PAUSE_SETTLE_MS;
+    this.pauseSettleTimer = setInterval(() => {
+      const stop = this.host.destroyed || this.pauseAnchor === null || !this.video.paused || Date.now() > deadline;
+      if (stop) {
+        if (this.pauseSettleTimer) clearInterval(this.pauseSettleTimer);
+        this.pauseSettleTimer = null;
+        return;
+      }
+      const settled = this.pauseAnchor;
+      // Each assertion runs the seek algorithm, and on iOS that re-renders the sound around the
+      // position — audible, as a tenth of a second replayed. Once was the fix; every eighty
+      // milliseconds for as long as the clock keeps creeping is a stuck record. So: only a drift
+      // large enough to be worth correcting, and only a couple of times before this leaves the
+      // element alone with whatever it has settled on.
+      if (settled !== null && this.video.currentTime > settled + PAUSE_DRIFT_SECONDS) {
+        this.pauseAnchor = this.video.currentTime;
+        if (this.resumeTrace) this.resumeTrace.settled = this.video.currentTime;
+        this.assertPausePosition();
+        if ((this.resumeTrace?.asserted ?? 0) >= MAX_PAUSE_ASSERTIONS) {
+          clearInterval(this.pauseSettleTimer!);
+          this.pauseSettleTimer = null;
+        }
+      }
+    }, 120);
+
+  };
+
+  readonly playing = () => {
+    if (this.host.destroyed) return;
+    // Held for a moment rather than settled on the spot: the element fires this as soon as play
+    // is called, which is before it has actually resumed and therefore before it can have
+    // jumped. Checked again as playback gets going, until the window closes.
+    this.resumeStartedAt = Date.now();
+    if (this.resumeTrace) this.resumeTrace.play = this.video.currentTime;
+    this.startingFrom = this.video.currentTime;
+    this.setStarting(this.resumeStartedAt, "lecture demandée");
+    this.watchForFirstFrame(this.startingFrom);
+    this.resumeDeadline = this.resumeStartedAt + RESUME_GUARD_MS;
+    const moved = this.holdPausePosition();
+
+    // Nothing moves the playhead while paused, so any settling owed is settled here — before the
+    // watchdog's own delay, which would otherwise be a visible wait at the moment of pressing
+    // play. Skipped when the position was just put back, which has already settled it.
+    if (!moved) this.nudgeIntoBuffer();
+  };
+
+  /** A seek has been served: the landing licence lasts only while the playhead has not moved. */
+  seekServed(playerSeconds: number): void {
+    this.seekLanding = playerSeconds;
+  }
+
+  /**
+   * The film has just been opened at this position.
+   *
+   * Treated as a landing, because that is what it is: a request to be somewhere, about to be
+   * answered with media that begins a fraction of a second later. Without the licence the
+   * opening deadlocks — the element is paused because there is nothing under the playhead, and
+   * the playhead is not moved onto the media because the element is paused.
+   */
+  opened(
+    playerSeconds: number,
+    /**
+     * Faux pour une ouverture qui doit rester à l'arrêt — un changement de piste pendant une
+     * pause, qui reconstruit le lecteur. Rien n'est alors dû, et `mediaArrived` ne relance rien.
+     */
+    startOwed = true
+  ): void {
+    this.seekLanding = playerSeconds;
+    // A start is owed from here. Not conditional on having seen the element refuse one: when the
+    // refusal is immediate — the promise rejected before the element ever announced it was
+    // playing — there is no `play` event and therefore no `pause` event either, and waiting for
+    // that pair to arrive is waiting for something that already did not happen. Measured: the
+    // first fix caught the episodes where the element announced the start and gave up, and left
+    // the ones where it never announced anything sitting at 0:00.
+    this.startAborted = startOwed;
+    this.startRetries = 0;
+    this.firstPictureOwed = startOwed;
+    this.openedFrom = playerSeconds;
+    this.openedAt = Date.now();
+    /**
+     * Et toute pause d'avant l'ouverture cesse de compter.
+     *
+     * L'ancre de pause sert à remettre la lecture là où le son s'est arrêté, parce que l'horloge
+     * de l'élément le dépasse et que le système peut reprendre le média pendant l'arrêt. Elle
+     * suppose donc une lecture en cours. Une pause enregistrée *avant* que la tête ait atterri
+     * n'en est pas une : c'est l'élément qui renonce à un démarrage qu'il ne pouvait pas faire,
+     * à la position où il se trouvait — zéro.
+     *
+     * Rapporté sur appareil : « Reprendre », fermer pendant le chargement, « Reprendre » à
+     * nouveau. La seconde lecture posait bien sa tête à 648 s, puis la reprise après pause la
+     * ramenait à l'ancre de la première, c'est-à-dire au début. Ouvrir quelque part est une
+     * décision plus récente que cette pause-là, et elle tranche.
+     */
+    this.forgetPause();
+  }
+
+  /**
+   * The first media has arrived. Starts the film if it was asked for and never began.
+   *
+   * Measured on an iPhone, opening an episode from the beginning: the media of a file with
+   * B-frames starts 210 ms in, `play()` was called before any of it existed, and the element
+   * aborted the attempt and went back to paused with the playhead short of everything. The film
+   * then sat at 0:00 with thirty seconds buffered, and only a seek or a press of play — both of
+   * which the viewer had to think of — got it going.
+   *
+   * Only for a start the *element* abandoned: a viewer who pressed pause while it was loading
+   * has asked for exactly this, and starting the film under them would be the player arguing.
+   */
+  mediaArrived(): void {
+    if (this.host.destroyed || !this.startAborted) return;
+    // Already going: nothing is owed, and nothing more will be.
+    if (!this.video.paused) {
+      this.startAborted = false;
+      return;
+    }
+    // The film played and was then stopped — by the viewer, since it got as far as moving. Only
+    // a start that never produced a second of playback is one this may still make.
+    if (this.openedFrom === null || Math.abs(this.video.currentTime - this.openedFrom) > STILL_AT_THE_START) {
+      this.startAborted = false;
+      return;
+    }
+    // And only for as long as opening is still what is happening. A viewer who opens a film and
+    // stops it before it starts has asked for something this cannot tell apart from a start that
+    // failed — so the window in which it may insist is kept to the length of an opening.
+    if (Date.now() - this.openedAt > START_WINDOW_MS) {
+      this.startAborted = false;
+      return;
+    }
+    if (this.startRetries >= MAX_START_RETRIES) return;
+    this.startRetries += 1;
+    this.startAborted = false;
+
+    // Onto the media first: playing from a position that has nothing under it is what failed the
+    // first time. The licence is re-granted here rather than relied on — the failed start ran a
+    // nudge of its own, and a nudge that reaches its media spends the licence on the way.
+    this.seekLanding = this.video.currentTime;
+    this.nudgeIntoBuffer();
+    trace(`démarrage repris (${this.startRetries}) — tête à ${this.video.currentTime.toFixed(2)} s`);
+    void this.video.play().catch(() => {
+      // Nothing more to do: the controls are showing a play button, which is now the only thing
+      // that can carry the permission this needs.
+    });
+  }
+
+  /** A deliberate move elsewhere settles the question of where playback belongs. */
+  forgetPause(): void {
+    this.pauseAnchor = null;
+  }
+
+  /**
+   * Whatever the guard was waiting for died with the source.
+   *
+   * Cleared unconditionally, before anything else can fail on the way out: a wait nobody will
+   * answer is a spinner for ever.
+   */
+  destroy(): void {
+    this.startingFrom = null;
+    this.stopWatchingForFirstFrame();
+    this.startingWait = Date.now();
+    this.setStarting(null, "lecteur détruit");
+    if (this.pauseSettleTimer) clearInterval(this.pauseSettleTimer);
+    this.pauseSettleTimer = null;
+    this.pauseAnchor = null;
+  }
+
+  /** The last pause and resume, in positions, for the technical panel. */
+  get debug(): Record<string, string> {
+    const trace = this.resumeTrace;
+    if (!trace) return {};
+    return {
+      "Dernière pause": `arrêt ${trace.paused.toFixed(3)} → repos ${trace.settled.toFixed(3)}${
+        trace.asserted > 0 ? ` → recalé ×${trace.asserted}` : ""
+      }`,
+      "Dernière reprise": Number.isNaN(trace.play)
+        ? "—"
+        : `départ ${trace.play.toFixed(3)} → 1er tick ${trace.tick?.toFixed(3) ?? "—"}`,
+      "Délai du bouton lecture":
+        trace.latencyMs === null
+          ? "—"
+          : `${trace.latencyMs} ms · après ${((trace.pausedForMs ?? 0) / 1000).toFixed(1)} s de pause`,
+    };
+  }
+}

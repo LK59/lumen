@@ -1,0 +1,784 @@
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from "vitest";
+
+// Choosing what to re-encode to now asks the browser what it will accept back in a MediaSource,
+// so there has to be one to ask. This stands in for a player that takes anything.
+beforeEach(() => {
+  vi.stubGlobal("window", { ManagedMediaSource: { isTypeSupported: () => true } });
+});
+afterEach(() => vi.unstubAllGlobals());
+
+// The sound path for codecs that cannot ride in the container at all. What matters here is the
+// plumbing — what is asked of the browser, what is done with a refusal, and how frames are cut
+// into segments — since the encoding itself is the browser's and cannot be exercised in a test.
+
+const samples = vi.fn();
+const close = vi.fn();
+vi.mock("@lumen/engine/softwareAudio", () => ({
+  SoftwareAudioTrack: {
+    open: vi.fn(async () => ({
+      format: { sampleRate: 48000, numberOfChannels: 6 },
+      samples,
+      close,
+    })),
+  },
+}));
+
+/** Decoded blocks of 512 frames, as a DTS decoder hands them over. */
+// Des plans de silence partagés : vingt mille images à six plans neufs chacune, c'était ~240 Mo
+// alloués pour des zéros — une seconde de ramasse-miettes seul, plus de 5 s sous la charge de
+// plusieurs suites en parallèle (10/10/2026). Le transcodeur ne fait que les lire.
+const SILENT_PLANES = Array.from({ length: 6 }, () => new Float32Array(512));
+
+function decoded(count: number, fromSeconds = 0) {
+  return (async function* () {
+    for (let i = 0; i < count; i++) {
+      yield {
+        planes: SILENT_PLANES,
+        sampleRate: 48000,
+        timestampSeconds: fromSeconds + (i * 512) / 48000,
+      };
+    }
+  })();
+}
+
+class FakeAudioData {
+  constructor(readonly init: { numberOfFrames: number; sampleRate: number; timestamp: number }) {}
+  close() {}
+}
+
+/** Emits fixed 1024-frame chunks and buffers the remainder, as a real AAC encoder does. */
+function fakeEncoderClass(options: { describeAfter?: number; failWith?: string; refuseAbove?: number; failFlushWith?: string } = {}) {
+  return class {
+    static supportedCalls: unknown[] = [];
+    /** Every configuration handed to configure(), across every instance. */
+    static configured: { bitrate?: number }[] = [];
+    static instances = 0;
+    static resets = 0;
+    static async isConfigSupported(config: unknown) {
+      this.supportedCalls.push(config);
+      return { supported: true, config };
+    }
+    state = "unconfigured";
+    encodeQueueSize = 0;
+    private held = 0;
+    private heldFrom = 0;
+    private emitted = 0;
+    constructor(private readonly init: { output: (c: unknown, m?: unknown) => void; error: (e: unknown) => void }) {
+      (this.constructor as unknown as { instances: number }).instances++;
+      if (options.failWith) queueMicrotask(() => init.error({ message: options.failWith } as never));
+    }
+    configure(config: { bitrate?: number }) {
+      (this.constructor as unknown as { configured: unknown[] }).configured.push(config);
+      // An encoder that said yes to isConfigSupported and fails in use — the case the ladder is
+      // tried against for real.
+      if (options.refuseAbove !== undefined && (config.bitrate ?? 0) > options.refuseAbove) {
+        throw new Error(`bitrate ${config.bitrate} not supported`);
+      }
+      this.state = "configured";
+    }
+    encode(data: FakeAudioData) {
+      // Whole frames go out as they are completed, as a real encoder hands them back; only the
+      // remainder waits, and only a flush can make it come out early.
+      if (this.held === 0) this.heldFrom = data.init.timestamp;
+      this.held += data.init.numberOfFrames;
+      while (this.held >= 1024) {
+        this.emit({ timestamp: this.heldFrom, duration: Math.round((1024 / 48000) * 1e6) });
+        this.heldFrom += Math.round((1024 / 48000) * 1e6);
+        this.held -= 1024;
+      }
+    }
+    private emit(q: { timestamp: number; duration: number }) {
+      const describe = this.emitted >= (options.describeAfter ?? 0);
+      this.emitted += 1;
+      this.init.output(
+        { ...q, byteLength: 8, copyTo: (d: Uint8Array) => d.fill(7) },
+        describe ? { decoderConfig: { description: new Uint8Array([0x11, 0xb0]) } } : undefined
+      );
+    }
+    async flush() {
+      // Chrome Android, 08/11/2026 : l'erreur arrive par le rappel et par la promesse.
+      if (options.failFlushWith) {
+        this.init.error({ message: options.failFlushWith } as never);
+        throw new Error(options.failFlushWith);
+      }
+      // Padding out what did not fill a frame — the very thing this is no longer asked to do
+      // between segments.
+      if (this.held > 0) {
+        this.emit({ timestamp: this.heldFrom, duration: Math.round((1024 / 48000) * 1e6) });
+        this.held = 0;
+      }
+    }
+    reset() {
+      (this.constructor as unknown as { resets: number }).resets++;
+      this.held = 0;
+      this.state = "unconfigured";
+    }
+    close() {}
+  };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.stubGlobal("AudioData", FakeAudioData);
+});
+afterEach(() => vi.unstubAllGlobals());
+
+const track = { number: 2, codecId: "A_DTS", language: "fra", audio: { sampleRate: 48000, channels: 6 } };
+const source = { size: 1, read: async () => new Uint8Array(0), close: () => {} };
+
+async function load() {
+  return import("@lumen/engine/audioTranscode");
+}
+// Chargé une fois avant le premier test : importé à froid dedans, il passait les 5 s sous charge.
+beforeAll(async () => {
+  await load();
+});
+
+describe("transcodableAudio", () => {
+  it("names what there is a decoder for here, which is not the same as what needs one", async () => {
+    const { transcodableAudio } = await load();
+    // Being on this list does not mean a track will be re-encoded — only that it could be, if
+    // the browser turns out not to take it. Dolby is here because Chrome ships no decoder for it
+    // and would otherwise lose the hardware path over most of a library.
+    // FLAC since 21/09/2026: Safari refuses it in a MediaSource, where Chrome and Firefox take it.
+    // TrueHD and MLP since 21/09/2026: FFmpeg's decoder, compiled to WebAssembly.
+    for (const codecId of ["A_DTS", "A_DTS/EXPRESS", "A_DTS/LOSSLESS", "A_AC3", "A_EAC3", "A_FLAC", "A_TRUEHD", "A_MLP"]) {
+      expect(transcodableAudio({ codecId } as never)).toBe(true);
+    }
+    // Opus in mono and stereo, which Safari decodes and will not take in a MediaSource; not
+    // beyond, where the order Apple's decoder hands back has never been measured.
+    expect(transcodableAudio({ codecId: "A_OPUS", audio: { channels: 2, sampleRate: 48000 } } as never)).toBe(true);
+    expect(transcodableAudio({ codecId: "A_OPUS", audio: { channels: 3, sampleRate: 48000 } } as never)).toBe(false);
+    // AAC every browser takes, and RealAudio has no decoder here at all.
+    for (const codecId of ["A_AAC", "A_REAL/COOK", "A_MPEG/L2"]) {
+      expect(transcodableAudio({ codecId } as never)).toBe(false);
+    }
+  });
+});
+
+describe("canEncodeAac", () => {
+  it("asks a second time without a bitrate before believing a refusal", async () => {
+    const asked: { bitrate?: number }[] = [];
+    vi.stubGlobal("AudioEncoder", {
+      isConfigSupported: async (c: { bitrate?: number }) => {
+        asked.push(c);
+        return { supported: c.bitrate === undefined };
+      },
+    });
+    const { canEncodeAac } = await load();
+
+    // A desktop Chrome says no to an imposed bitrate and yes with nothing specified; reading the
+    // first answer as final sends a file down a slower path for no reason. The bitrate is asked
+    // for first all the same: an encoder left to choose reaches for HE-AAC, whose description
+    // does not match the profile written beside it.
+    expect(await canEncodeAac(48000, 6)).toBe(true);
+    // The ladder, best first, then nothing imposed: 96, 64 and 40 kbit/s per channel on a 5.1.
+    expect(asked.map((c) => c.bitrate)).toEqual([576_000, 384_000, 240_000, undefined]);
+  });
+
+  it("asks for enough bits per channel, and keeps the first rate the encoder accepts", async () => {
+    // Until 22/09/2026, a single 320 kbit/s whatever the layout: 40 per channel on a 7.1, a second
+    // lossy generation a good pair of headphones could tell from its source.
+    const asked: { bitrate?: number; numberOfChannels: number }[] = [];
+    vi.stubGlobal("AudioEncoder", {
+      isConfigSupported: async (c: { bitrate?: number; numberOfChannels: number }) => {
+        asked.push(c);
+        return { supported: (c.bitrate ?? 0) <= 512_000 };
+      },
+    });
+    const { canEncodeAac } = await load();
+    expect(await canEncodeAac(48000, 8)).toBe(true);
+    expect(asked.map((c) => c.bitrate)).toEqual([768_000, 512_000]);
+
+    // Stereo never drops below 128 kbit/s, and the ladder never asks the same rate twice.
+    const aac: { bitrate?: number; codec: string }[] = [];
+    vi.stubGlobal("AudioEncoder", {
+      isConfigSupported: async (c: { bitrate?: number; codec: string }) => (c.codec === "mp4a.40.2" && aac.push(c), { supported: false }),
+    });
+    expect(await canEncodeAac(48000, 1)).toBe(false);
+    expect(aac.map((c) => c.bitrate)).toEqual([128_000, undefined, undefined]);
+  });
+
+  it("is false where there is no encoder at all", async () => {
+    vi.stubGlobal("AudioEncoder", undefined);
+    const { canEncodeAac } = await load();
+    expect(await canEncodeAac(48000, 2)).toBe(false);
+  });
+});
+
+describe("chooseTranscodePlan chez Apple", () => {
+  it("ne demande jamais plus de six canaux à l'encodeur AAC d'Apple : un 7.1 y est replié en 5.1", async () => {
+    // L'AAC n'a pas de vrai 7.1 à enceintes arrière, et l'encodeur d'Apple ne dit pas où il range
+    // huit plans. Braveheart en VO 7.1 sur iPhone, 21/09/2026 : les voix plus fortes à droite.
+    vi.stubGlobal("navigator", {
+      userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Mobile/15E148 Safari/604.1",
+    });
+    // Comme WebKit : l'Opus au-delà de deux canaux est refusé.
+    vi.stubGlobal("AudioEncoder", {
+      isConfigSupported: async (c: { codec: string; numberOfChannels: number }) => ({ supported: c.codec !== "opus" || c.numberOfChannels <= 2 }),
+    });
+    const { chooseTranscodePlan } = await load();
+    expect(await chooseTranscodePlan(48000, 8)).toEqual({ codec: "mp4a.40.2", channels: 6 });
+    expect(await chooseTranscodePlan(48000, 6)).toEqual({ codec: "mp4a.40.2", channels: 6 });
+
+    // Chrome sur macOS passe par le même encodeur d'Apple, sans disposition non plus.
+    vi.stubGlobal("navigator", { userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36" });
+    expect(await chooseTranscodePlan(48000, 8)).toEqual({ codec: "mp4a.40.2", channels: 6 });
+
+    // Ailleurs, le 7.1 reste un 7.1 si l'encodeur le prend.
+    vi.stubGlobal("navigator", { userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36" });
+    expect(await chooseTranscodePlan(48000, 8)).toEqual({ codec: "mp4a.40.2", channels: 8 });
+  });
+});
+
+describe("AudioTranscoder", () => {
+  it("refuses plainly where the browser cannot encode", async () => {
+    vi.stubGlobal("AudioEncoder", undefined);
+    const { AudioTranscoder } = await load();
+    await expect(AudioTranscoder.open(source as never, track as never)).rejects.toThrow(/encoder/);
+  });
+
+  it("takes its track description from the encoder, since the file has none to give", async () => {
+    vi.stubGlobal("AudioEncoder", fakeEncoderClass());
+    samples.mockImplementation(() => decoded(8));
+    const { AudioTranscoder } = await load();
+
+    const transcoder = await AudioTranscoder.open(source as never, track as never);
+    // An MP4 needs a description that only exists once something has been encoded — so a little
+    // sound is pushed through at open, and this is what comes back.
+    expect(transcoder.sampleEntry.length).toBeGreaterThan(20);
+    expect(new TextDecoder().decode(transcoder.sampleEntry.subarray(4, 8))).toBe("mp4a");
+    expect(transcoder.codecString).toBe("mp4a.40.2");
+    expect(transcoder.channels).toBe(6);
+  });
+
+  it("keeps the exact configuration that described the track, bitrate included, across seeks", async () => {
+    // Until 22/09/2026 a seek reconfigured the encoder without a bitrate — and opening ends with
+    // one. The rate asked for served only the priming; the whole film ran at the browser's default,
+    // from an encoder configured unlike the one whose description the container carries.
+    const Encoder = fakeEncoderClass();
+    vi.stubGlobal("AudioEncoder", Encoder);
+    samples.mockImplementation(() => decoded(400));
+    const { AudioTranscoder } = await load();
+    const transcoder = await AudioTranscoder.open(source as never, track as never);
+    transcoder.seekTo(120);
+    transcoder.seekTo(3600);
+    expect(Encoder.configured.length).toBeGreaterThanOrEqual(3);
+    expect(new Set(Encoder.configured.map((c) => c.bitrate))).toEqual(new Set([576_000]));
+  });
+
+  it("starts a fresh encoder at every seek rather than resetting the one it has", async () => {
+    // 21/09/2026, iPhone: every fresh encoder primed; every "InternalAudioEncoderCocoa encoding
+    // failed" followed a reset() and a configure() — the note in remuxer.ts had said "always
+    // after a change of track, never at the start" for weeks. A fresh one is the path that held.
+    const Encoder = fakeEncoderClass();
+    vi.stubGlobal("AudioEncoder", Encoder);
+    samples.mockImplementation(() => decoded(400));
+    const { AudioTranscoder } = await load();
+    const transcoder = await AudioTranscoder.open(source as never, track as never);
+    const before = Encoder.instances;
+    transcoder.seekTo(120);
+    transcoder.seekTo(3600);
+    expect(Encoder.resets).toBe(0);
+    expect(Encoder.instances).toBe(before + 2);
+    expect((await transcoder.framesUpTo(3601)).length).toBeGreaterThan(0);
+  });
+
+  it("starts lower after an encoder failed in use at the rate it was given", async () => {
+    // The same evening: 768 kbit/s in 7.1 accepted, primed, then failing on the way — and every
+    // rebuild asked for 768 again until the film went to the server player.
+    const { AudioTranscoder, forgetBitrateCeilings } = await load();
+    forgetBitrateCeilings();
+    const Encoder = fakeEncoderClass();
+    vi.stubGlobal("AudioEncoder", Encoder);
+    samples.mockImplementation(() => decoded(400));
+    const first = await AudioTranscoder.open(source as never, track as never);
+    (first as unknown as { fail(message: string): void }).fail("InternalAudioEncoderCocoa encoding failed");
+    await expect(first.framesUpTo(1)).rejects.toThrow(/Cocoa/);
+
+    Encoder.configured.length = 0;
+    await AudioTranscoder.open(source as never, track as never);
+    expect(Encoder.configured[0].bitrate).toBe(384_000);
+    forgetBitrateCeilings();
+  });
+
+  it("never goes below the last rate of the ladder, however many failures", async () => {
+    // Without a rate, Safari answers with HE-AAC — another object type than the one already
+    // described to the buffer. Three failures used to empty the ladder and get exactly that.
+    const { AudioTranscoder, forgetBitrateCeilings } = await load();
+    forgetBitrateCeilings();
+    const Encoder = fakeEncoderClass();
+    vi.stubGlobal("AudioEncoder", Encoder);
+    samples.mockImplementation(() => decoded(400));
+    for (let i = 0; i < 4; i++) {
+      const t = await AudioTranscoder.open(source as never, track as never);
+      (t as unknown as { fail(message: string): void }).fail("InternalAudioEncoderCocoa encoding failed");
+    }
+    Encoder.configured.length = 0;
+    await AudioTranscoder.open(source as never, track as never);
+    expect(Encoder.configured[0].bitrate).toBe(240_000);
+    forgetBitrateCeilings();
+  });
+
+  it("does not listen to an encoder it has replaced", async () => {
+    // After a seek the old encoder is closed, but a frame or an error already queued on it can
+    // still arrive. A late frame was mixed with the new ones; a late error rebuilt a healthy
+    // encoder and lowered the rate for the whole page.
+    const { AudioTranscoder, forgetBitrateCeilings } = await load();
+    forgetBitrateCeilings();
+    const made: { init: { output: (c: unknown) => void; error: (e: unknown) => void } }[] = [];
+    const Base = fakeEncoderClass();
+    vi.stubGlobal(
+      "AudioEncoder",
+      class extends Base {
+        constructor(init: { output: (c: unknown) => void; error: (e: unknown) => void }) {
+          super(init as never);
+          made.push({ init });
+        }
+      }
+    );
+    samples.mockImplementation(() => decoded(400));
+    const transcoder = await AudioTranscoder.open(source as never, track as never);
+    const old = made[made.length - 1];
+    transcoder.seekTo(10);
+    old.init.error({ message: "InternalAudioEncoderCocoa encoding failed" });
+    old.init.output({ timestamp: 99_000_000, duration: 21_333, byteLength: 8, copyTo: (d: Uint8Array) => d.fill(1) });
+    const frames = await transcoder.framesUpTo(11);
+    expect(frames.length).toBeGreaterThan(0);
+    expect(frames.every((f) => f.timestampUs < 99_000_000)).toBe(true);
+    forgetBitrateCeilings();
+  });
+
+  it("goes down the ladder when a rate fails in use, and keeps the one that worked", async () => {
+    const Encoder = fakeEncoderClass({ refuseAbove: 400_000 });
+    vi.stubGlobal("AudioEncoder", Encoder);
+    samples.mockImplementation(() => decoded(400));
+    const { AudioTranscoder } = await load();
+    const transcoder = await AudioTranscoder.open(source as never, track as never);
+    expect(transcoder.sampleEntry.length).toBeGreaterThan(20);
+    // 576 refused at configure, 384 accepted — and every later configure is 384.
+    expect(Encoder.configured[0].bitrate).toBe(576_000);
+    expect(new Set(Encoder.configured.slice(1).map((c) => c.bitrate))).toEqual(new Set([384_000]));
+  });
+
+  it("an encoder that fails in use and closes itself goes down the ladder, not out on « closed codec »", async () => {
+    // Chasse du 18/11/2026 : WebCodecs ferme un encodeur tombé en erreur, et tout `encode` ensuite lève.
+    // L'erreur arrive pendant l'attente du décodeur ; l'`encode` suivant de l'amorçage levait, et la
+    // tentative entière échouait sous « closed codec » au lieu d'essayer le débit suivant.
+    const { AudioTranscoder, forgetBitrateCeilings } = await load();
+    forgetBitrateCeilings();
+    const Base = fakeEncoderClass();
+    let first = true;
+    const closedData: boolean[] = [];
+    class Closing extends Base {
+      private failing = first;
+      private dead = false;
+      constructor(init: { output: (c: unknown) => void; error: (e: unknown) => void }) {
+        super(init as never);
+        first = false;
+        const encode = this.encode.bind(this);
+        this.encode = (data: FakeAudioData) => {
+          if (this.dead) throw new Error("Cannot call 'encode' on a closed codec");
+          encode(data);
+          if (this.failing) {
+            this.dead = true;
+            queueMicrotask(() => init.error({ message: "InternalAudioEncoderCocoa encoding failed" } as never));
+          }
+        };
+      }
+    }
+    vi.stubGlobal("AudioEncoder", Closing);
+    vi.stubGlobal(
+      "AudioData",
+      class extends FakeAudioData {
+        private index = closedData.push(false) - 1;
+        close() {
+          closedData[this.index] = true;
+        }
+      }
+    );
+    samples.mockImplementation(() => decoded(400));
+    const transcoder = await AudioTranscoder.open(source as never, track as never);
+    expect(transcoder.sampleEntry.length).toBeGreaterThan(20);
+    // Le premier débit essayé, puis un plus bas.
+    expect(Base.configured.length).toBeGreaterThan(1);
+    expect(Base.configured.at(-1)!.bitrate).toBeLessThan(Base.configured[0].bitrate!);
+    // Et chaque AudioData construite a été fermée, même celle que l'encodeur fermé a refusée.
+    expect(closedData.every(Boolean)).toBe(true);
+    forgetBitrateCeilings();
+  });
+
+  it("says so rather than producing a track nothing describes", async () => {
+    // An encoder that never carries the description: silently muxing that would give the browser
+    // an audio track it cannot configure a decoder for.
+    vi.stubGlobal("AudioEncoder", fakeEncoderClass({ describeAfter: 999 }));
+    samples.mockImplementation(() => decoded(8));
+    const { AudioTranscoder } = await load();
+    await expect(AudioTranscoder.open(source as never, track as never)).rejects.toThrow(/décrit/);
+  });
+
+  it("hands back the frames below a boundary and keeps the rest for the next segment", async () => {
+    vi.stubGlobal("AudioEncoder", fakeEncoderClass());
+    samples.mockImplementation(() => decoded(400));
+    const { AudioTranscoder } = await load();
+    const transcoder = await AudioTranscoder.open(source as never, track as never);
+
+    const first = await transcoder.framesUpTo(1);
+    const second = await transcoder.framesUpTo(2);
+    expect(first.length).toBeGreaterThan(0);
+    expect(second.length).toBeGreaterThan(0);
+
+    // The two segments must tile: nothing repeated, nothing dropped between them.
+    expect(Math.max(...first.map((f) => f.timestampUs))).toBeLessThan(1_000_000);
+    expect(Math.min(...second.map((f) => f.timestampUs))).toBeGreaterThanOrEqual(1_000_000);
+    const times = [...first, ...second].map((f) => f.timestampUs);
+    expect(new Set(times).size).toBe(times.length);
+  });
+
+  it("ferme l'encodeur et le décodeur quand le décodeur lâche pendant l'amorçage", async () => {
+    // L'erreur de l'amorçage remontait telle quelle : l'encodeur de la tentative, que rien
+    // d'autre ne connaissait, restait ouvert — le navigateur n'en accorde qu'un nombre fixe —, et
+    // le décodeur (pour le TrueHD, un contexte WebAssembly) avec lui.
+    let made = 0;
+    let closed = 0;
+    const Base = fakeEncoderClass();
+    vi.stubGlobal(
+      "AudioEncoder",
+      class extends Base {
+        constructor(init: { output: (c: unknown) => void; error: (e: unknown) => void }) {
+          super(init as never);
+          made += 1;
+        }
+        close() {
+          closed += 1;
+        }
+      }
+    );
+    samples.mockImplementation(() => ({
+      next: async () => {
+        throw new Error("libFLAC : trame illisible");
+      },
+      return: async () => ({ done: true, value: undefined }),
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+    }));
+    const { AudioTranscoder } = await load();
+    await expect(AudioTranscoder.open(source as never, track as never)).rejects.toThrow(/libFLAC/);
+    expect(made).toBeGreaterThan(0);
+    expect(closed).toBe(made);
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("ferme aussi l'encodeur amorcé quand la suite de l'ouverture échoue", async () => {
+    // Un Opus dont l'en-tête est trop court pour être relu : l'encodeur a réussi, la description
+    // ne se lit pas, et l'exception partait avec l'encodeur encore ouvert.
+    let closed = 0;
+    const Base = fakeEncoderClass();
+    vi.stubGlobal(
+      "AudioEncoder",
+      class extends Base {
+        static async isConfigSupported(config: { codec: string }) {
+          return { supported: config.codec === "opus", config };
+        }
+        close() {
+          closed += 1;
+        }
+      }
+    );
+    samples.mockImplementation(() => decoded(8));
+    const { AudioTranscoder } = await load();
+    await expect(AudioTranscoder.open(source as never, track as never)).rejects.toThrow();
+    expect(closed).toBe(1);
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("se dit vidé une fois toute la piste rendue, et pas avant", async () => {
+    // Ce que le remultiplexeur interroge pour dire que le fichier est fini.
+    vi.stubGlobal("AudioEncoder", fakeEncoderClass());
+    samples.mockImplementation(() => decoded(40));
+    const { AudioTranscoder } = await load();
+    const transcoder = await AudioTranscoder.open(source as never, track as never);
+    expect(transcoder.drained).toBe(false);
+    await transcoder.framesUpTo(0.1);
+    expect(transcoder.drained).toBe(false);
+    expect((await transcoder.framesUpTo(Infinity)).length).toBeGreaterThan(0);
+    expect(transcoder.drained).toBe(true);
+  });
+
+  it("un vidage de fin refusé n'est pas une panne : ce qui est encodé est rendu, la piste se dit vidée", async () => {
+    // Anacondas, Chrome Android, 08/11/2026 : « Flushing error » à 29 s de la fin.
+    const Encoder = fakeEncoderClass({ failFlushWith: "Flushing error." });
+    vi.stubGlobal("AudioEncoder", Encoder);
+    samples.mockImplementation(() => decoded(41));
+    const { AudioTranscoder } = await load();
+    const transcoder = await AudioTranscoder.open(source as never, track as never);
+    const frames = await transcoder.framesUpTo(Infinity);
+    expect(frames.length).toBeGreaterThan(0);
+    expect(transcoder.drained).toBe(true);
+    // Redemandé (le remultiplexeur repasse) : pas de second vidage, pas d'erreur.
+    await expect(transcoder.framesUpTo(Infinity)).resolves.toEqual([]);
+  });
+
+  it("restarts decoding where a seek asks, not where it had got to", async () => {
+    vi.stubGlobal("AudioEncoder", fakeEncoderClass());
+    samples.mockImplementation((from: number) => decoded(200, from));
+    const { AudioTranscoder } = await load();
+    const transcoder = await AudioTranscoder.open(source as never, track as never);
+    await transcoder.framesUpTo(1);
+
+    transcoder.seekTo(900);
+    const frames = await transcoder.framesUpTo(901);
+    expect(frames.length).toBeGreaterThan(0);
+    expect(Math.min(...frames.map((f) => f.timestampUs))).toBeGreaterThanOrEqual(900_000_000);
+  });
+});
+
+/**
+ * Les deux horloges du son ré-encodé, mesurées pour le journal de fin de séance (22/09/2026 :
+ * sur Chrome Android, le son se décalait peu à peu de l'image, et un saut le recalait).
+ */
+describe("AudioTranscoder — horloges du son", () => {
+  /** Des blocs de 512 images, avec un trou de 40 ms au milieu — un fichier qui a perdu du son. */
+  function withGap(count: number, gapAt: number, gapSeconds: number) {
+    return (async function* () {
+      for (let i = 0; i < count; i++) {
+        yield {
+          planes: Array.from({ length: 6 }, () => new Float32Array(512)),
+          sampleRate: 48000,
+          timestampSeconds: (i * 512) / 48000 + (i >= gapAt ? gapSeconds : 0),
+        };
+      }
+    })();
+  }
+
+  /** Un encodeur qui date ses images en comptant ses échantillons depuis la première entrée. */
+  function countingEncoderClass() {
+    const Base = fakeEncoderClass();
+    return class extends Base {
+      private anchor: number | null = null;
+      private counted = 0;
+      private waiting = 0;
+      private sink: (c: unknown, m?: unknown) => void;
+      constructor(init: { output: (c: unknown, m?: unknown) => void; error: (e: unknown) => void }) {
+        super(init);
+        this.sink = init.output;
+      }
+      override encode(data: FakeAudioData) {
+        this.anchor ??= data.init.timestamp;
+        this.waiting += data.init.numberOfFrames;
+        while (this.waiting >= 1024) {
+          const timestamp = Math.round(this.anchor + (this.counted * 1e6) / 48000);
+          this.sink(
+            { timestamp, duration: Math.round((1024 / 48000) * 1e6), byteLength: 8, copyTo: (d: Uint8Array) => d.fill(7) },
+            { decoderConfig: { description: new Uint8Array([0x11, 0xb0]) } }
+          );
+          this.counted += 1024;
+          this.waiting -= 1024;
+        }
+      }
+    };
+  }
+
+  it("voit un trou du fichier qu'un encodeur qui compte ses échantillons ne voit pas", async () => {
+    // Cet encodeur compte : ses instants ne sautent pas le trou. C'est précisément le cas où le
+    // son prend de l'avance sur l'image, sans que rien ne le voie.
+    vi.stubGlobal("AudioEncoder", countingEncoderClass());
+    samples.mockImplementation(() => withGap(400, 200, 0.04));
+    const { AudioTranscoder } = await load();
+    const transcoder = await AudioTranscoder.open(source as never, track as never);
+    await transcoder.framesUpTo(5);
+    const stats = transcoder.timingStats;
+    expect(Math.abs(stats.sourceUs - 40_000)).toBeLessThan(1_000);
+    expect(Math.abs(stats.encoderUs)).toBeLessThan(1_000);
+  });
+
+  it("montre aussi l'encodeur qui se recale sur ses entrées : les deux écarts se suivent", async () => {
+    // Le trou tombe entre deux images : le double repart de l'instant de son entrée.
+    vi.stubGlobal("AudioEncoder", fakeEncoderClass());
+    samples.mockImplementation(() => withGap(400, 200, 0.04));
+    const { AudioTranscoder } = await load();
+    const transcoder = await AudioTranscoder.open(source as never, track as never);
+    await transcoder.framesUpTo(5);
+    const stats = transcoder.timingStats;
+    expect(Math.abs(stats.sourceUs - 40_000)).toBeLessThan(1_000);
+    expect(Math.abs(stats.encoderUs - 40_000)).toBeLessThan(1_000);
+  });
+
+  it("ne voit rien sur un flux continu, même sur des milliers d'images (pas d'arrondi qui s'additionne)", async () => {
+    vi.stubGlobal("AudioEncoder", fakeEncoderClass());
+    samples.mockImplementation(() => decoded(20_000));
+    const { AudioTranscoder } = await load();
+    const transcoder = await AudioTranscoder.open(source as never, track as never);
+    await transcoder.framesUpTo(200);
+    const stats = transcoder.timingStats;
+    expect(Math.abs(stats.sourceUs)).toBeLessThan(1_000);
+    expect(Math.abs(stats.encoderUs)).toBeLessThan(1_000);
+  });
+});
+
+
+describe("« Améliorer les dialogues » dans le transcodeur", () => {
+  // 11/10/2026. Désactivé : l'encodeur reçoit exactement ce que le décodeur rend (rien n'est
+  // instancié). Activé : le traitement passe sur chaque bloc, aux mêmes canaux, et repart à neuf
+  // à chaque saut.
+  const TONE = Array.from({ length: 6 }, (_, c) => {
+    const p = new Float32Array(512);
+    for (let i = 0; i < 512; i++) p[i] = 0.2 * Math.sin((2 * Math.PI * (300 + c * 200) * i) / 48000);
+    return p;
+  });
+  function toneBlocks(count: number, fromSeconds = 0) {
+    return (async function* () {
+      for (let i = 0; i < count; i++) yield { planes: TONE, sampleRate: 48000, timestampSeconds: fromSeconds + (i * 512) / 48000 };
+    })();
+  }
+  /** Le même faux encodeur, qui garde en plus les échantillons qu'on lui donne. */
+  function capturingEncoder() {
+    const Base = fakeEncoderClass();
+    const fed: { channels: number; data: Float32Array }[] = [];
+    class Capturing extends Base {
+      static fed = fed;
+      encode(data: FakeAudioData) {
+        const init = data.init as unknown as { numberOfChannels: number; data: Float32Array };
+        fed.push({ channels: init.numberOfChannels, data: init.data.slice() });
+        super.encode(data);
+      }
+    }
+    return Capturing;
+  }
+  const interleaved = (planes: Float32Array[]) => {
+    const out = new Float32Array(planes[0].length * planes.length);
+    planes.forEach((p, c) => p.forEach((v, i) => (out[i * planes.length + c] = v)));
+    return out;
+  };
+
+  it("désactivé : l'encodeur reçoit les échantillons du décodeur, tels quels", async () => {
+    const Encoder = capturingEncoder();
+    vi.stubGlobal("AudioEncoder", Encoder);
+    samples.mockImplementation((from: number) => toneBlocks(200, from));
+    const { AudioTranscoder } = await load();
+    for (const dialogue of [undefined, "off" as const]) {
+      Encoder.fed.length = 0;
+      const transcoder = await AudioTranscoder.open(source as never, track as never, 0, undefined, undefined, dialogue);
+      await transcoder.framesUpTo(0.5);
+      expect(Encoder.fed.length).toBeGreaterThan(0);
+      for (const block of Encoder.fed) {
+        expect(block.channels).toBe(6);
+        expect(block.data).toEqual(interleaved(TONE));
+      }
+      transcoder.close();
+    }
+  });
+
+  it("activé : chaque bloc est traité, aux mêmes six canaux, et le traitement repart à neuf après un saut", async () => {
+    const Encoder = capturingEncoder();
+    vi.stubGlobal("AudioEncoder", Encoder);
+    samples.mockImplementation((from: number) => toneBlocks(200, from));
+    const { AudioTranscoder } = await load();
+    const { DialogueEnhancer } = await import("@lumen/engine/dialogueEnhance");
+    const reset = vi.spyOn(DialogueEnhancer.prototype, "reset");
+    const transcoder = await AudioTranscoder.open(source as never, track as never, 0, undefined, undefined, "on");
+    const resetsAtOpen = reset.mock.calls.length;
+    Encoder.fed.length = 0;
+    await transcoder.framesUpTo(0.5);
+    const treated = Encoder.fed.filter((b) => b.channels === 6);
+    expect(treated.length).toBe(Encoder.fed.length);
+    expect(treated.some((b) => !b.data.every((v, i) => v === interleaved(TONE)[i]))).toBe(true);
+    transcoder.seekTo(60);
+    expect(reset.mock.calls.length).toBe(resetsAtOpen + 1);
+    transcoder.close();
+    reset.mockRestore();
+  });
+});
+
+describe("« Améliorer les dialogues » — le décodeur d'un AAC multicanal", () => {
+  // Un AAC 5.1 traité passe par le décodeur WebAssembly dont l'ordre est mesuré, sur tous les
+  // navigateurs. Sans traitement — ou en stéréo —, la route d'avant.
+  const aac51 = { number: 2, codecId: "A_AAC", language: "fra", audio: { sampleRate: 48000, channels: 6 } };
+  const aacStereo = { ...aac51, audio: { sampleRate: 48000, channels: 2 } };
+
+  it("demande le décodeur mesuré pour un AAC 5.1 traité, et seulement là", async () => {
+    vi.stubGlobal("AudioEncoder", fakeEncoderClass());
+    samples.mockImplementation(() => decoded(8));
+    const { AudioTranscoder } = await load();
+    const { SoftwareAudioTrack } = await import("@lumen/engine/softwareAudio");
+    const open = vi.mocked(SoftwareAudioTrack.open);
+    const optionsOf = () => open.mock.calls.at(-1)?.[4];
+
+    (await AudioTranscoder.open(source as never, aac51 as never, 0, undefined, undefined, "on")).close();
+    expect(optionsOf()).toEqual({ measuredAacDecoder: true });
+    (await AudioTranscoder.open(source as never, aac51 as never, 0, undefined, undefined, "off")).close();
+    expect(optionsOf()).toEqual({});
+    (await AudioTranscoder.open(source as never, aac51 as never)).close();
+    expect(optionsOf()).toEqual({});
+    (await AudioTranscoder.open(source as never, aacStereo as never, 0, undefined, undefined, "strong")).close();
+    expect(optionsOf()).toEqual({});
+  });
+});
+
+/**
+ * Le son qui commence après l'image (DECISIONS.md §148) : « The Circle », iPhone, 12/11/2026 — la
+ * piste n'a aucun bloc avant 30 s. Le transcodeur comble l'écart par du silence à chaque saut, et le
+ * dit à l'amorçage pour le journal ; sans trou, rien ne change.
+ */
+describe("AudioTranscoder — le son en retard sur l'image", () => {
+  it("un saut dans le trou rend du son dès l'instant demandé, silence compris", async () => {
+    vi.stubGlobal("AudioEncoder", fakeEncoderClass());
+    // Où qu'on le lui demande, le décodeur ne rend rien avant 30 s : c'est ce que fait mediabunny
+    // sur un fichier dont la piste commence là.
+    samples.mockImplementation(() => decoded(400, 30));
+    const { AudioTranscoder } = await load();
+    const transcoder = await AudioTranscoder.open(source as never, track as never, 10);
+
+    transcoder.seekTo(10);
+    const frames = await transcoder.framesUpTo(12);
+    expect(frames.length).toBeGreaterThan(0);
+    expect(frames[0].timestampUs).toBe(10_000_000);
+    // Contigu jusqu'à la borne : une trame AAC toutes les 1024 images (à l'arrondi des microsecondes
+    // près — l'encodeur factice se recale sur l'instant de chaque bloc qui ouvre une trame).
+    for (let i = 1; i < frames.length; i++) expect(Math.abs(frames[i].timestampUs - frames[i - 1].timestampUs - (1024 / 48000) * 1e6)).toBeLessThanOrEqual(2);
+    expect(frames[frames.length - 1].timestampUs).toBeLessThan(12_000_000);
+    transcoder.close();
+  });
+
+  it("enchaîne le vrai son là où il commence, sans trou", async () => {
+    vi.stubGlobal("AudioEncoder", fakeEncoderClass());
+    samples.mockImplementation(() => decoded(400, 30));
+    const { AudioTranscoder } = await load();
+    const transcoder = await AudioTranscoder.open(source as never, track as never, 0);
+    transcoder.seekTo(27);
+    const frames = await transcoder.framesUpTo(31);
+    const span = frames[frames.length - 1].timestampUs - frames[0].timestampUs;
+    expect(frames[0].timestampUs).toBe(27_000_000);
+    // Quatre secondes d'affilée, de 27 à 31 s (au-delà du seuil de 2 s) : le passage du silence au son ne laisse rien.
+    expect(span).toBeGreaterThan(3_900_000);
+    expect(frames.length).toBe(Math.round(span / ((1024 / 48000) * 1e6)) + 1);
+    transcoder.close();
+  });
+
+  it("dit à l'amorçage où vient le premier son depuis l'ouverture, pour le journal", async () => {
+    vi.stubGlobal("AudioEncoder", fakeEncoderClass());
+    const { AudioTranscoder } = await load();
+    samples.mockImplementation(() => decoded(400, 30));
+    const late = await AudioTranscoder.open(source as never, track as never, 0);
+    expect(late.firstPrimedSeconds).toBe(30);
+    late.close();
+    samples.mockImplementation((from: number) => decoded(400, from));
+    const ordinary = await AudioTranscoder.open(source as never, track as never, 120);
+    expect(ordinary.firstPrimedSeconds).toBe(120);
+    ordinary.close();
+  });
+
+  it("une piste copiée ailleurs, décodée pour son retard : un AAC 5.1 passe par le décodeur mesuré", async () => {
+    vi.stubGlobal("AudioEncoder", fakeEncoderClass());
+    samples.mockImplementation(() => decoded(8));
+    const { AudioTranscoder } = await load();
+    const { SoftwareAudioTrack } = await import("@lumen/engine/softwareAudio");
+    const open = vi.mocked(SoftwareAudioTrack.open);
+    const aac51 = { number: 2, codecId: "A_AAC", language: "fra", audio: { sampleRate: 48000, channels: 6 } };
+    (await AudioTranscoder.open(source as never, aac51 as never, 0, undefined, undefined, undefined, true)).close();
+    expect(open.mock.calls.at(-1)?.[4]).toEqual({ measuredAacDecoder: true });
+    (await AudioTranscoder.open(source as never, aac51 as never, 0, undefined, undefined, undefined, false)).close();
+    expect(open.mock.calls.at(-1)?.[4]).toEqual({});
+  });
+});

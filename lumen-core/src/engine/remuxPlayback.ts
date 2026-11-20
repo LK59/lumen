@@ -1,0 +1,703 @@
+// The remux path, assembled: file in, a playing <video> element out.
+//
+// Track lists, subtitle selection and lookup live here, next to the element they drive. A change
+// of audio track rebuilds the player (see `requestAudioTrack`). This was once shaped like the
+// public surface of a second player — a WebCodecs engine painting a canvas — so the component
+// could branch once between the two; that engine was removed on 2026-09-24 (docs/lecteur-canvas.md).
+
+import { probeDecodingInfo } from "./decodingInfo";
+import type { DialogueMode } from "./dialogueEnhance";
+import { takeLumenFacts } from "./lumenFacts";
+import { displayIsHdr, hdrLightCap } from "./hdrDisplay";
+import { NO_INDEX_REACH_SECONDS, reachable } from "./seekArrival";
+import { playerWarning, type PlayerWarning } from "./playerWarning";
+import { HttpByteSource, type ByteSource, type DiskChunks, type HeldBytes } from "./byteSource";
+import { fromMatroskaTrack, type PlayerTrack } from "./playerTrack";
+import { keptRangeAt, type MatroskaFile, type MatroskaTrack } from "./matroska";
+import { forgetMediaHeader, mediaHeaderKey, openMediaFile } from "./mediaFile";
+import { MseSource, type RecoveryFacts, type UnreadableZoneEvent } from "./mseSource";
+import { choosePlaybackPath, NATIVE_PATH, type ChosenPath } from "./pathSelector";
+import type { AudioLeadGap } from "./audioLeadGap";
+import type { SeekServed } from "./mseTypes";
+import { Remuxer, playableAudio, deliveredAudio, primeAudioDelivery, audioDelivery, dialogueCanShape, type TrackedCue } from "./remuxer";
+import { chooseAudioTrack, type TrackPreferences } from "../support/trackPreferences";
+import { trace, traceReset } from "./trace";
+import { diagMedia } from "./playbackDiagnosis";
+import { simultaneousText } from "./subtitleMarkup";
+
+/** L'attente maximale des octets gardés sur l'appareil, à l'ouverture — voir `RemuxPlaybackOptions.disk`. */
+const DISK_WAIT_MS = 150;
+
+/** Cues more than this far behind the playhead are dropped: a three-hour film is a lot of lines. */
+const CUE_HISTORY_SECONDS = 60;
+
+/**
+ * And this far ahead of it.
+ *
+ * Keeping only a window behind is not enough once seeking is involved: jump backwards and every
+ * line gathered further along the film is still "ahead", so nothing is ever dropped and the list
+ * grows with each seek. A window on both sides bounds it whatever the viewer does.
+ */
+const CUE_FUTURE_SECONDS = 120;
+
+export interface RemuxPlaybackOptions {
+  streamUrl: string;
+  /**
+   * La taille du fichier, quand la description du fichier la porte (`DirectPlayInfo.sizeBytes`).
+   * Épargne le HEAD de l'ouverture — un aller-retour entier avant les premiers octets. Voir
+   * `HttpByteSource.open`.
+   */
+  knownSize?: number | null;
+  /**
+   * La version du fichier selon Jellyfin (`DirectPlayInfo.fileVersion`, l'ETag de sa MediaSource).
+   * Nomme l'en-tête gardé en mémoire avec l'adresse : voir `mediaHeaderKey`.
+   */
+  fileVersion?: string | null;
+  /**
+   * Les morceaux de ce fichier gardés sur l'appareil pour une reprise instantanée, s'il y en a
+   * (`src/lib/resumeCache/`). Une promesse : l'ouverture ne l'attend que `DISK_WAIT_MS` au plus.
+   */
+  disk?: Promise<DiskChunks | null> | null;
+  startSeconds: number;
+  /**
+   * « Améliorer les dialogues » pour cette ouverture (`RemuxOptions.dialogue`) — absent : « off »,
+   * le chemin d'avant. Lu ici une fois et passé au remultiplexeur de cette ouverture seulement.
+   */
+  dialogue?: DialogueMode;
+  /** `facts` : ce que le relais emporte d'une zone illisible (`facts.unreadableZone`, §93). */
+  onError: (message: string, kind?: "network" | "playback", facts?: Record<string, unknown>) => void;
+  /** Une zone illisible tient la lecture, ou un saut l'a quittée — voir `MseCallbacks.onUnreadableZone`. */
+  onUnreadableZone?: (event: UnreadableZoneEvent) => void;
+  onWarning?: (warning: PlayerWarning) => void;
+  /** Play pressed and the clock not yet moving, or null once it is. See MseCallbacks. */
+  onStarting?: (startedAt: number | null) => void;
+  /** A playing clock that has stood still for seconds, once per stall. See MseCallbacks. */
+  onStall?: (facts: Record<string, unknown>) => void;
+  /**
+   * Ce que le serveur sait de la plage dynamique — `"DOVI"`, `"DOVIWithHDR10"`, `"HDR10"`, `"SDR"`…
+   *
+   * Descendu jusqu'ici pour une seule décision, mais elle est décisive : un Dolby Vision refusé
+   * par le navigateur se rattrape sur sa couche de base **quand il y en a une**, et n'a nulle part
+   * où aller quand il n'y en a pas. Le conteneur seul ne suffit pas à trancher — un fichier peut
+   * être en Dolby Vision sans porter d'enregistrement dans son en-tête —, alors que cette valeur
+   * vient de l'analyse du flux par le serveur et ne se trompe pas.
+   */
+  videoRangeType?: string | null;
+  /**
+   * Ce que ce compte veut entendre — pour **ouvrir** dessus, et non pour y basculer ensuite.
+   *
+   * Le pipeline se construisait sur la piste par défaut du *fichier*, le film démarrait, puis le
+   * lecteur appliquait la préférence du compte en défaisant ce qu'il venait de faire. Mesuré le
+   * 20/09/2026 sur quatre films : ça arrivait à chacun d'eux, donc c'était le cas normal et non
+   * l'exception. Le coût de ce geste inutile allait de 429 ms sur un fichier copié tel quel à
+   * 1 784 ms sur du DTS — et jusqu'à 7,9 s sur l'appareil le plus lent du foyer.
+   *
+   * Absentes, tout se passe comme avant : c'est le repli quand la préférence n'est pas encore
+   * chargée.
+   */
+  audioPreferences?: TrackPreferences | null;
+  /**
+   * La piste que le spectateur a choisie, quand ce pipeline en remplace un autre.
+   *
+   * Un pipeline reconstruit ouvrait sur la préférence du compte puis basculait vers le choix du
+   * spectateur — une seconde attente après la première. Depuis la livraison par piste, c'est pire
+   * qu'une attente : la reconstruction a lieu *parce que* la piste choisie n'a pas le format de
+   * l'autre, et basculer ensuite serait refaire la transition qu'elle évite. On ouvre donc dessus.
+   */
+  audioTrackNumber?: number | null;
+  /**
+   * Ouvrir sans lancer la lecture : un pipeline reconstruit pour un changement de piste pendant
+   * une pause. Sans cela, la garde de démarrage prenait l'élément resté à l'arrêt pour un
+   * démarrage raté et le relançait d'elle-même — relevé sur iPhone le 21/09/2026.
+   */
+  startPaused?: boolean;
+}
+
+/**
+ * Le chemin natif, ouvert et prêt à démarrer sur un élément vidéo — ou, si l'appelant change
+ * d'avis, à rendre ce qu'il tient (`discard`).
+ *
+ * Un fichier que ce chemin ne porte pas ne donne pas de sonde : `probePlaybackPath` rejette avec
+ * le motif, et l'hôte passe la main au lecteur serveur. (Il y avait une variante « webcodecs », le
+ * lecteur canevas, retirée le 24/09/2026 — voir docs/lecteur-canvas.md.)
+ */
+export type PathProbe = {
+  path: "remux";
+  start: (video: HTMLVideoElement) => Promise<RemuxPlayback>;
+  chosen: ChosenPath;
+  /**
+   * Les pistes son du fichier, dans l'ordre du fichier, et celle sur laquelle cette sonde a ouvert —
+   * connues avant `start`. Un hôte dont le serveur désigne une piste par son rang (Jellyfin : le n-ième
+   * flux son) a besoin de ses numéros pour rouvrir sur elle (`audioTrackNumber`) sans démarrer d'abord
+   * sur une autre.
+   */
+  audioTracks: PlayerTrack[];
+  audioTrack: number | null;
+  discard: () => void;
+  /*
+   * Il y avait aussi un chemin « direct » : un MP4 remis tel quel à `<video>`. Retiré le
+   * 22/09/2026 — un bon conteneur ne dit pas que tout se lit nativement. Sur les MP4 de la
+   * bibliothèque, il jouait l'E-AC3 muet sur Chrome et Firefox sans erreur ni repli, n'offrait ni
+   * menu de pistes ni langue du compte, n'affichait aucun sous-titre intégré, et un HEVC refusé
+   * finissait en écran d'erreur. Tout fichier passe désormais par le même traitement, qui ne fait
+   * rien (ou presque) quand rien n'est à faire : voir mediaFile.ts et mp4Demux.ts.
+   */
+};
+
+/**
+ * The audio track to open on.
+ *
+ * A track this path can carry comes before the file's own default, because those two disagree
+ * more often than one would think: a release marks its highest-quality track as default, and
+ * that is regularly DTS — which no browser decodes. Every DTS file in this library carries an
+ * AC-3 or AAC track beside it, so preferring the default would refuse, on a technicality, a file
+ * that plays perfectly on the track next to it. The default still decides among the ones that
+ * work, and if none do the default is returned anyway so the refusal names the real codec.
+ */
+/** Tous les combien de secondes de lecture la zone gardée suit la tête. */
+const KEEP_EVERY_SECONDS = 2;
+
+export function preferredAudio(file: MatroskaFile, preferences?: TrackPreferences | null): MatroskaTrack | null {
+  const audio = file.tracks.filter((t) => t.type === "audio");
+  const playable = audio.filter(playableAudio);
+
+  /**
+   * La langue du compte d'abord, quand elle désigne une piste que ce chemin sait porter.
+   *
+   * Posé **avant** la règle du défaut, et seulement sur les pistes jouables : une préférence qui
+   * désignerait une piste TrueHD ferait refuser le fichier entier alors qu'il joue très bien sur
+   * celle d'à côté. `chooseAudioTrack` rend `null` dès que rien ne correspond — le compte réglé
+   * sur « piste par défaut » compris —, et on retombe alors exactement sur ce qui suit.
+   *
+   * **C'est `chooseAudioTrack` et rien d'autre**, et ce n'est pas un détail d'implémentation :
+   * l'écran applique la même fonction dès que le film démarre, et bascule si la piste ouverte
+   * n'est pas la sienne. Ouvrir sur un autre choix — fût-il meilleur — ne supprimerait pas le
+   * changement qu'on cherche à éviter, il le rendrait seulement invisible dans le code.
+   *
+   * `rank` départage depuis le 20/09 les pistes d'une même langue par le nombre de canaux, avant
+   * le drapeau du fichier : entre une stéréo et une 5.1 anglaises, c'est la 5.1 — ici comme à
+   * l'écran, puisque c'est la même fonction. (Ce paragraphe disait l'inverse, écrit avant ce
+   * changement ; la règle « la plus riche » vaut aussi juste en dessous, sans préférence.)
+   */
+  if (preferences && playable.length > 0) {
+    /**
+     * Parmi les pistes jouables, et le prédicat sert à départager celles de la même langue.
+     *
+     * Deux règles se superposent, et elles ne disent pas la même chose :
+     *
+     *  * **ici**, on ouvre sur quelque chose qui joue — le film doit démarrer ;
+     *  * **à l'écran**, `chooseAudioTrack` voit toutes les pistes, et si la langue demandée
+     *    n'existe qu'en TrueHD il cède la place au lecteur serveur. C'est voulu : le spectateur
+     *    qui demande la VO obtient la VO, fût-ce par un autre lecteur.
+     *
+     * Les deux tombent d'accord dans le cas qui nous occupe — deux pistes de la même langue dont
+     * une seule joue, « Le Mans 66 » — et c'est là que le changement de piste disparaît.
+     */
+    // Et les canaux *livrés*, puis la copie, pour départager (29/09/2026, audit P5) — la même
+    // question que l'écran pose par `RemuxPlayback.deliveredAudio`.
+    const wanted = chooseAudioTrack(playable, preferences, playableAudio, deliveredAudio);
+    if (wanted) return wanted;
+  }
+  // Nothing here works: the file's own default is returned so the refusal names its real codec.
+  if (playable.length === 0) return audio.find((t) => t.isDefault) ?? audio[0] ?? null;
+
+  const preferred = audio.find((t) => t.isDefault) ?? audio[0];
+  const language = preferred?.language ?? null;
+  // Language first, then channel count. On this library the default track is regularly DTS in one
+  // language with only a stereo track beside it in another — silently switching language is a
+  // worse surprise than dropping from surround to stereo, so the language is held onto and the
+  // richest track in it wins. The menu still offers everything.
+  // « La plus riche » au sens de `rank` : les canaux livrés, puis la copie (29/09/2026, audit P5).
+  const sameLanguage = playable.filter((t) => t.language === language);
+  const pool = sameLanguage.length > 0 ? sameLanguage : playable;
+  return pool.reduce((best, t) => {
+    const [a, b] = [deliveredAudio(t), deliveredAudio(best)];
+    return a.channels > b.channels || (a.channels === b.channels && a.copied && !b.copied) ? t : best;
+  }, pool[0]);
+}
+
+/**
+ * La piste sur laquelle ouvrir : celle que le spectateur a choisie si ce pipeline en remplace un
+ * autre et qu'elle joue par ce chemin, sinon celle que le compte préfère (`preferredAudio`).
+ */
+export function openingAudio(
+  file: MatroskaFile,
+  preferences?: TrackPreferences | null,
+  chosen?: number | null
+): MatroskaTrack | null {
+  if (chosen !== null && chosen !== undefined) {
+    const track = file.tracks.find((t) => t.type === "audio" && t.number === chosen);
+    if (track && playableAudio(track)) return track;
+  }
+  return preferredAudio(file, preferences);
+}
+
+/**
+ * Works out whether this file can be played here, without committing to it.
+ *
+ * Resolves with the remux path ready to start, or rejects with the reason it cannot carry the
+ * file — which the player hands to the server player (`fallToStable`).
+ */
+export async function probePlaybackPath(options: RemuxPlaybackOptions): Promise<PathProbe> {
+  traceReset();
+  // Avant tout remultiplexage : le plafond de lumière HDR choisi sur cet appareil, s'il y en a
+  // un — voir `hdrDisplay.ts`.
+  const displayHdr = displayIsHdr();
+  // Lu une fois ici et passé au remultiplexeur de cette ouverture seulement (`RemuxOptions`) : une
+  // variable de module, posée à chaque ouverture, était lue par toutes les chaînes vivantes.
+  const lightCap = hdrLightCap();
+  trace("ouverture du flux");
+  trace(
+    `écran HDR : ${displayHdr === null ? "inconnu" : displayHdr ? "oui" : "non"}` +
+      (lightCap !== null ? ` — lumière HDR annoncée plafonnée à ${lightCap} nits (choix de l'appareil)` : "")
+  );
+  // Les octets gardés sur l'appareil, s'il y en a — jamais plus de `DISK_WAIT_MS` d'attente : un
+  // stockage lent ne doit pas coûter plus que le réseau qu'il est censé épargner.
+  const disk = options.disk
+    ? await Promise.race([options.disk.catch(() => null), new Promise<null>((resolve) => setTimeout(() => resolve(null), DISK_WAIT_MS))])
+    : null;
+  const source = await HttpByteSource.open(options.streamUrl, options.knownSize, disk);
+  trace(`flux ouvert — ${source.size} octets`);
+  try {
+    return await probeOpened(source, options, lightCap);
+  } catch (error) {
+    // Rien de ce qui lève ici ne rend la source à personne : elle est fermée, et sa lecture en
+    // avance avec elle. Seule l'erreur d'en-tête le faisait ; un choix de chemin qui levait —
+    // réseau coupé, refus au profit du lecteur serveur — ou un fichier sans image la laissaient
+    // ouverte pour un film que plus personne ne lisait (chasse aux défauts du 22/09/2026).
+    // L'erreur, elle, remonte telle quelle : un en-tête illisible part au lecteur serveur par
+    // l'appelant (`fallToStable`), une panne réseau à l'écran « connexion perdue ».
+    source.close();
+    throw error;
+  }
+}
+
+async function probeOpened(source: ByteSource, options: RemuxPlaybackOptions, lightCap: number | null): Promise<PathProbe> {
+  // Named by its URL, so opening the same file again — or rebuilding after the platform closed
+  // the source — does not pay for its header and index a second time. Matroska or MP4, told
+  // apart by the file's own first bytes.
+  //
+  // En reprise, sans lecture en avance : elle partirait du morceau 0, vers le début du film, qu'une
+  // ouverture à cette position ne lit pas — voir `HttpByteSource.holdReadahead`. Le même seuil que
+  // celui où `MseSource.open` positionne le lecteur : en deçà, la lecture part bien du début.
+  const headerAt = Date.now();
+  const resuming = options.startSeconds > NO_INDEX_REACH_SECONDS;
+  if (resuming) source.holdReadahead?.(true);
+  // Un en-tête rendu de mémoire ne lit rien : c'est la première réponse de la lecture qui dit la
+  // vraie taille. Si elle en corrige une périmée, le fichier a changé sous cette adresse, et
+  // l'en-tête gardé ne doit pas servir à la prochaine ouverture — une reconstruction, un changement
+  // de piste (audit B3).
+  const headerKey = mediaHeaderKey(options.streamUrl, options.fileVersion);
+  source.whenSizeCorrected?.(() => forgetMediaHeader(headerKey));
+  let file: MatroskaFile;
+  try {
+    file = await openMediaFile(source, headerKey);
+  } finally {
+    if (resuming) source.holdReadahead?.(false);
+  }
+  const headerMs = Date.now() - headerAt;
+  trace(
+    `en-tête ${headerMs < 15 ? "déjà connu" : "lu"} en ${headerMs} ms — ` +
+      `${file.tracks.length} pistes, ${file.cues.length} points d'index, ` +
+      file.tracks.map((t) => `${t.number}:${t.type}:${t.codecId}${t.language ? `/${t.language}` : ""}`).join(" ")
+  );
+
+  const videoTrack = file.tracks.find((t) => t.type === "video");
+  if (!videoTrack) throw new Error("Ce fichier ne contient aucune piste vidéo.");
+  // Ce que le navigateur produira de chaque piste à ré-encoder, demandé avant le choix : le
+  // classement compte les canaux livrés (audit P5), et l'écran relira les mêmes réponses.
+  await primeAudioDelivery(file);
+  const audioTrack = openingAudio(file, options.audioPreferences, options.audioTrackNumber);
+  trace(`piste audio retenue : ${audioTrack ? `${audioTrack.codecId} ${audioTrack.audio?.channels ?? "?"}ch ${audioTrack.language ?? "?"}` : "aucune"}`);
+  if (options.dialogue && options.dialogue !== "off") trace(`dialogues améliorés demandés (${options.dialogue === "strong" ? "encore plus fort" : "normal"})`);
+
+  // Ce que « Son par Lumen » a noté pour un pipeline précédent (un saut y rouvre le décodeur après sa
+  // ligne `start`) ne doit pas se lire comme celui de cette ouverture : la ligne de *JoJo* annonçait le
+  // DTS de l'épisode d'avant (19/11/2026). Oublié ici, juste avant d'ouvrir.
+  takeLumenFacts();
+  const chosen = await choosePlaybackPath({
+    source,
+    file,
+    videoTrack,
+    audioTrack,
+    dimensions: { width: videoTrack.video?.width ?? 1920, height: videoTrack.video?.height ?? 1080 },
+    videoRangeType: options.videoRangeType,
+    startSeconds: options.startSeconds,
+    remux: {
+      lightCapNits: lightCap,
+      ...(options.dialogue && options.dialogue !== "off" ? { dialogue: options.dialogue } : {}),
+    },
+  });
+
+  trace(`chemin choisi : ${NATIVE_PATH}`);
+
+  return {
+    path: "remux",
+    chosen,
+    audioTracks: chosen.remuxer.audioTracks().map((t) => ({ ...fromMatroskaTrack(t), delivered: deliveredAudio(t) })),
+    audioTrack: audioTrack?.number ?? null,
+    start: (video) => RemuxPlayback.start(video, source, file, videoTrack, audioTrack, chosen, options),
+    // For a caller that asked and then changed its mind: the remuxer holds the software decoder
+    // and the encoder, and the source holds the connection.
+    discard: () => {
+      chosen.remuxer.close();
+      source.close();
+    },
+  };
+}
+
+/** Une réplique, reconnue à sa piste, son début et son texte. */
+function cueKey(cue: TrackedCue): string {
+  return `${cue.track}:${cue.startSeconds.toFixed(3)}:${cue.text}`;
+}
+
+export class RemuxPlayback {
+  private mse: MseSource | null = null;
+  private cues: TrackedCue[] = [];
+  private currentSubtitle: number | null = null;
+  private destroyed = false;
+
+  private constructor(
+    private readonly video: HTMLVideoElement,
+    private readonly source: ByteSource,
+    private readonly file: MatroskaFile,
+    private readonly videoTrack: MatroskaTrack,
+    private audioTrack: MatroskaTrack | null,
+    private remuxer: Remuxer,
+    private readonly options: RemuxPlaybackOptions
+  ) {}
+
+  static async start(
+    video: HTMLVideoElement,
+    source: ByteSource,
+    file: MatroskaFile,
+    videoTrack: MatroskaTrack,
+    audioTrack: MatroskaTrack | null,
+    chosen: ChosenPath,
+    options: RemuxPlaybackOptions
+  ): Promise<RemuxPlayback> {
+    const playback = new RemuxPlayback(video, source, file, videoTrack, audioTrack, chosen.remuxer, options);
+    // The instance is only handed back once it is attached, so a rejection here leaves an object
+    // nobody can free: it holds the remuxer — hence an AudioDecoder and an AudioEncoder, of which
+    // the browser allows a fixed number at a time — the byte source and its connection. Firefox on
+    // Windows reaches this path for real: `MediaSource.isTypeSupported` claims a codec it then
+    // refuses as a SourceBuffer (see codecSupport.ts), and `addSourceBuffer` throws inside attach.
+    // Releasing it here rather than in the caller: nothing else ever held a reference to it.
+    try {
+      await playback.attach(chosen.plan, options.startSeconds);
+    } catch (error) {
+      // `destroy()` tolerates a half-built instance — `mse` is still null, `Remuxer.close()` and
+      // `AudioTranscoder.close()` are both guarded and idempotent — so it cannot replace the
+      // error that names the real reason on screen and in the technical report.
+      playback.destroy();
+      throw error;
+    }
+    return playback;
+  }
+
+  /**
+   * De quoi faire tourner la réserve d'avance en mémoire (`MemoryReserve`) à côté de ce lecteur : sa
+   * source, l'index du fichier, l'élément et l'avance du tampon. Null pour une source qui ne lit pas
+   * le réseau.
+   */
+  reserveContext(): { source: HttpByteSource; file: MatroskaFile; video: HTMLVideoElement; lead: () => number; delay: () => number } | null {
+    if (this.destroyed || !(this.source instanceof HttpByteSource)) return null;
+    return {
+      source: this.source,
+      file: this.file,
+      video: this.video,
+      lead: () => this.mse?.bufferedLead ?? 0,
+      delay: () => this.mse?.presentationDelay ?? 0,
+    };
+  }
+
+  /** Ce que la source tient en mémoire — voir `ByteSource.held`. Ne lève jamais. */
+  heldBytes(): HeldBytes | null {
+    try {
+      return this.source.held?.() ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Où la zone gardée a été posée pour la dernière fois, en secondes du lecteur. */
+  private keptAt = -Infinity;
+
+  /**
+   * Garde en mémoire les octets autour de la tête de lecture — voir `MAX_KEPT_CHUNKS` dans
+   * byteSource.ts. C'est ce qu'un changement de piste relit, et ce que la lecture en avance
+   * chassait du cache. Toutes les deux secondes de lecture, et à chaque saut : un calcul sur
+   * l'index déjà en mémoire, rien de plus.
+   */
+  private readonly keepAroundHead = (event?: Event) => {
+    if (this.destroyed || !this.source.keep) return;
+    const now = this.video.currentTime;
+    if (event?.type === "timeupdate" && Math.abs(now - this.keptAt) < KEEP_EVERY_SECONDS) return;
+    this.keptAt = now;
+    const range = keptRangeAt(this.file, Math.max(0, now - (this.mse?.presentationDelay ?? 0)), this.videoTrack.number);
+    if (range) this.source.keep(range.from, range.to);
+  };
+
+  private async attach(plan: Parameters<typeof MseSource.attach>[2], startSeconds: number): Promise<void> {
+    trace(`attachement de MediaSource — ${plan.videoMimeType} + ${plan.audioMimeType ?? "aucun audio"}`);
+    // Le débit que ce fichier demande, et l'élément dont on compte les images — voir playbackDiagnosis.ts.
+    diagMedia(this.source.size, plan.durationSeconds, this.video);
+    // Mesuré seulement : ce que le navigateur prédit (fluide, économe) entre dans la trace de l'ouverture.
+    probeDecodingInfo(plan.videoMimeType, this.videoTrack, this.source.size, plan.durationSeconds);
+    this.mse = await MseSource.attach(
+      this.video,
+      this.remuxer,
+      plan,
+      {
+        onError: this.options.onError,
+        onUnreadableZone: this.options.onUnreadableZone,
+        onWarning: this.options.onWarning,
+        onStarting: this.options.onStarting,
+        onStall: this.options.onStall,
+        onSubtitles: (cues) => this.collect(cues),
+      },
+      // Handed in rather than seeked to afterwards, so the first read happens where the viewer
+      // is resuming instead of at the beginning of the file.
+      startSeconds,
+      this.options.startPaused ?? false
+    );
+    this.video.addEventListener("timeupdate", this.keepAroundHead);
+    this.video.addEventListener("seeked", this.keepAroundHead);
+  }
+
+  private collect(cues: TrackedCue[]): void {
+    // Une relecture — un saut en arrière, une reprise, une coupure réseau — renvoie les répliques
+    // du passage relu, déjà là. Gardées deux fois, elles s'affichaient deux fois depuis que les
+    // répliques simultanées sont réunies (relu le 24/09/2026) ; la première trouvée les masquait.
+    const known = new Set(this.cues.map(cueKey));
+    for (const cue of cues) {
+      const key = cueKey(cue);
+      if (known.has(key)) continue;
+      known.add(key);
+      this.cues.push(cue);
+    }
+    if (this.cues.length <= 600) return;
+    const now = this.video.currentTime;
+    this.cues = this.cues.filter(
+      (cue) => cue.endSeconds >= now - CUE_HISTORY_SECONDS && cue.startSeconds <= now + CUE_FUTURE_SECONDS
+    );
+  }
+
+  get audioTracks(): PlayerTrack[] {
+    // Avec ce que ce chemin en livrerait — canaux reçus, copie —, pour que l'écran départage comme
+    // l'ouverture (`deliveredAudio`, DECISIONS §3, audit P5).
+    return this.remuxer.audioTracks().map((t) => ({ ...fromMatroskaTrack(t), delivered: deliveredAudio(t) }));
+  }
+
+  get subtitleTracks(): PlayerTrack[] {
+    return this.remuxer.subtitleTracks().map(fromMatroskaTrack);
+  }
+
+  get currentAudioTrack(): number | null {
+    return this.audioTrack?.number ?? null;
+  }
+
+  /**
+   * Ce que demande le passage à cette piste : `"rebuild"`, `"refused"`, ou `null` s'il n'y a rien
+   * à faire (piste inconnue, déjà jouée, lecteur détruit).
+   *
+   * **Il n'y a plus qu'une façon de changer de piste : reconstruire le lecteur**, à la même
+   * position, directement sur la nouvelle piste — l'appelant s'en charge. Il y en avait une
+   * seconde jusqu'au 22/09/2026, « dans le tampon » : vider le son et le relire en gardant
+   * l'image. Mesurée sur les trois moteurs, elle était plus lente (0,4 à 3,1 s en médiane, avec
+   * des queues de plusieurs secondes, contre 0,05 à 0,35 s pour la reconstruction) et laissait sur
+   * WebKit un décalage durable entre le son et l'image ; elle a été retirée.
+   *
+   * Refusé — un avertissement, la piste d'avant continue — sur un fichier sans index en cours de
+   * film : voir `switchNeedsIndex`. Une demande, et non une question : c'est ici que le refus
+   * est dit au spectateur, comme un saut refusé l'est par la source.
+   */
+  requestAudioTrack(trackNumber: number): "rebuild" | "refused" | null {
+    const track = this.file.tracks.find((t) => t.number === trackNumber && t.type === "audio");
+    if (!track || this.destroyed || track.number === this.audioTrack?.number) return null;
+    // Jamais une reconstruction vers une piste que ce chemin ne porte pas : elle rouvrirait sur la
+    // piste d'avant, et l'appelant la redemanderait — une boucle (23/09/2026). À lui de passer la
+    // main (voir `canCarryAudio`).
+    if (!playableAudio(track)) return "refused";
+    if (this.switchNeedsIndex) {
+      this.options.onWarning?.(playerWarning("noIndexAudio"));
+      return "refused";
+    }
+    return "rebuild";
+  }
+
+  /**
+   * Un changement de piste ici relirait le fichier depuis son début.
+   *
+   * La reconstruction rouvre à la position courante *par l'index*. Un fichier sans index n'a pas
+   * de grappe à désigner — `clusterOffsetForTime` retombe sur la première —, et le film
+   * reprendrait à zéro. Au tout début du film, en revanche, lire depuis le début *est* la bonne
+   * réponse : même seuil qu'un saut refusé.
+   */
+  private get switchNeedsIndex(): boolean {
+    return !reachable(this.remuxer.seekable, this.video.currentTime);
+  }
+
+  /**
+   * Whether this path could carry that track's sound at all — asked *before* anything is touched.
+   *
+   * A codec this path cannot carry will not be carried on the next attempt either, so the caller
+   * steps aside to a player that *can* carry it instead of rebuilding this one onto a refusal, or
+   * telling the viewer their language is unavailable.
+   */
+  /**
+   * « Améliorer les dialogues » aurait-il prise sur cette piste ? Oui si elle est déjà ré-encodée
+   * (DTS, TrueHD… là où le navigateur ne les prend pas), ou si notre chaîne sait la décoder pour la
+   * ré-encoder (`dialogueCanShape`). Non pour un AAC 5.1 ou un MP3 copiés : le menu le dit.
+   */
+  canShapeDialogue(trackNumber: number): boolean {
+    const track = this.file.tracks.find((t) => t.number === trackNumber && t.type === "audio");
+    if (!track) return true;
+    return audioDelivery(track) === "transcode" || dialogueCanShape(track);
+  }
+
+  canCarryAudio(trackNumber: number): boolean {
+    const track = this.file.tracks.find((t) => t.number === trackNumber && t.type === "audio");
+    // An unknown number is not a codec refusal: let the usual path answer it.
+    return track ? playableAudio(track) : true;
+  }
+
+  get currentSubtitleTrack(): number | null {
+    return this.currentSubtitle;
+  }
+
+  /**
+   * Scanned in place, on purpose.
+   *
+   * This is asked several times a second while a film plays. Filtering to the chosen track first
+   * allocated a fresh array of every line held, every time — and handed it to a helper that
+   * prunes its argument as it goes, so the pruning was thrown away with the copy. A direct scan
+   * allocates nothing and does not care that seeking leaves the lines out of order.
+   */
+  /**
+   * Où l'horloge du lecteur se tient par rapport à celle du fichier.
+   *
+   * Les lignes du conteneur sont déjà posées sur l'horloge du lecteur ; un fichier de sous-titres
+   * à côté du film, lui, est daté sur celle du fichier, et lu tel quel il arrivait d'autant en
+   * avance — un quart de seconde sur un film HEVC (23/09/2026).
+   */
+  get presentationDelay(): number {
+    return this.mse?.presentationDelay ?? 0;
+  }
+
+  /**
+   * `track` absent : la piste choisie. Donnée : une autre piste du fichier — le second sous-titre
+   * (DECISIONS.md §87), lu dans les mêmes lignes déjà en mémoire (toutes les pistes texte sont
+   * recueillies d'un seul passage), sans rien changer au filtre de la piste choisie.
+   */
+  subtitleAt(seconds: number, track: number | null = this.currentSubtitle): string | null {
+    if (track === null) return null;
+    return simultaneousText(
+      this.cues.filter((cue) => cue.track === track && cue.startSeconds <= seconds && seconds <= cue.endSeconds)
+    );
+  }
+
+  /**
+   * Changing subtitles is a change of filter and nothing else.
+   *
+   * Every text track's lines are already in hand, so there is nothing to fetch and nothing to
+   * disturb. Re-reading the file for the newly chosen track — which is what this did first —
+   * meant re-appending media the browser had already played, and it catches that up at speed:
+   * choosing a subtitle came with a second of fast-forward before playback settled.
+   */
+  selectSubtitleTrack(trackNumber: number | null): void {
+    this.currentSubtitle = trackNumber;
+  }
+
+  /**
+   * Voir `MseSource.openingHold` : ce que l'hôte attend avant `play()` à une ouverture depuis le
+   * début (26/10/2026), ou `null` — sans source aussi : il n'y a alors rien à retenir.
+   */
+  openingHold(): Promise<void> | null {
+    return this.mse?.openingHold() ?? null;
+  }
+
+  /** See MseSource.lost: the platform took the source, and only a rebuild brings it back. */
+  /** Voir `MseSource.seekPending`. Faux sans source : il n'y a alors rien en cours. */
+  get seekPending(): boolean {
+    return this.mse?.seekPending ?? false;
+  }
+
+  get lost(): boolean {
+    return this.mse?.lost ?? false;
+  }
+
+  /** Voir `MseSource.seekPathFor` : comment le saut vers cette cible a été servi, pour la ligne `seek`. */
+  seekPathFor(target: number): SeekServed | null {
+    return this.mse?.seekPathFor(target) ?? null;
+  }
+
+  /** Voir `MseSource.nextKeyframeAfter` : où rouvrir au-delà d'un passage qui a tué la source deux fois. */
+  nextKeyframeAfter(playerSeconds: number): number | null {
+    return this.mse?.nextKeyframeAfter(playerSeconds) ?? null;
+  }
+
+  /** Voir `MseSource.lossReport` : ce que la ligne `rebuild` dit de la perte. */
+  lossReport(): Record<string, unknown> {
+    return this.mse?.lossReport() ?? {};
+  }
+
+  get position(): number {
+    return this.mse?.position ?? 0;
+  }
+
+  seek(seconds: number): Promise<void> {
+    return this.mse?.seek(seconds) ?? Promise.resolve();
+  }
+
+  /** Le pire écart d'horloge du son ré-encodé, `null` quand le son est copié — voir `Remuxer.audioTiming`. */
+  /** Reprises, poussées, barreaux gravis et évictions sur la séance, pour la ligne `stop` — voir `MseSource.recoveryFacts`. */
+  recoveryFacts(): RecoveryFacts | null {
+    return this.mse?.recoveryFacts ?? null;
+  }
+
+  audioTiming(): { sourceMs: number; encoderMs: number } | null {
+    return this.remuxer.audioTiming();
+  }
+
+  /** Le son qui commence après l'image, et ce que ce pipeline en a fait — voir `Remuxer.audioLeadGap` (§148). */
+  audioLeadGap(): AudioLeadGap | null {
+    return this.remuxer.audioLeadGap();
+  }
+
+  get diagnostics(): Record<string, string> {
+    const remux = this.remuxer.diagnostics();
+    return {
+      Chemin: NATIVE_PATH,
+      Décodage: "matériel, par le navigateur",
+      Vidéo: `${this.videoTrack.codecId} ${this.videoTrack.video?.width ?? "?"}×${this.videoTrack.video?.height ?? "?"}`,
+      Audio: this.audioTrack ? `${this.audioTrack.codecId} ${this.audioTrack.audio?.channels ?? "?"} canaux` : "aucune",
+      // Worth stating plainly: on this path the sound is the one thing that may not be the
+      // file's own bytes, and knowing which of the two is happening explains everything else.
+      // A codec string is what the container says; a name is what a reader needs.
+      "Traitement audio": remux.transcodedCodec
+        ? `décodé puis ré-encodé en ${remux.transcodedCodec.startsWith("mp4a") ? "AAC" : remux.transcodedCodec === "opus" ? "Opus" : remux.transcodedCodec}`
+        : "copié tel quel",
+      "Décalage de présentation": `${(remux.presentationDelaySeconds * 1000).toFixed(0)} ms`,
+      "Images recalées": String(remux.clampedSamples),
+      Index: `${this.remuxer.videoCuePoints} points vidéo / ${this.file.cues.length}`,
+      // The spans themselves, not one number derived from them. A single figure hid which range
+      // it was measured against, and read as a large negative number while the player was in
+      // fact working correctly on a range it had not been told about.
+      ...(this.mse?.debug ?? {}),
+      "Sous-titres en mémoire": String(this.cues.length),
+    };
+  }
+
+  destroy(): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.video.removeEventListener("timeupdate", this.keepAroundHead);
+    this.video.removeEventListener("seeked", this.keepAroundHead);
+    this.mse?.destroy();
+    this.mse = null;
+    // Releases the software decoder and the encoder, when the sound was going through both.
+    this.remuxer.close();
+    this.source.close();
+  }
+}

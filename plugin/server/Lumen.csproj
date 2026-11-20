@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>Lumen.Jellyfin</RootNamespace>
+    <AssemblyName>Lumen</AssemblyName>
+    <!-- Quatre nombres : Jellyfin compare les versions de plugin ainsi, et nomme le dossier d'après elles. -->
+    <Version>0.1.2.0</Version>
+    <!-- Ce que cette version change, en une ligne : repris dans le manifeste du dépôt de plugins. -->
+    <PackageReleaseNotes>Works alongside other plugins that modify the web client page (File Transformation, JavaScript Injector, themes). The playback log now shows how many times faster Lumen is on the files both players have played.</PackageReleaseNotes>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <!--
+      Les assemblages du serveur, à la version visée. Ils ne sont pas copiés avec le plugin : le serveur
+      charge les siens, et une seconde copie dans le dossier du plugin serait un autre type du même nom.
+    -->
+    <PackageReference Include="Jellyfin.Controller" Version="$(JellyfinVersion)" ExcludeAssets="runtime" />
+    <PackageReference Include="Jellyfin.Model" Version="$(JellyfinVersion)" ExcludeAssets="runtime" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Configuration\configPage.html" />
+  </ItemGroup>
+
+</Project>

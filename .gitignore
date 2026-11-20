@@ -1,0 +1,18 @@
+node_modules/
+dist/
+bin/
+obj/
+*.log
+.env
+# Le Jellyfin de test et ses données : jamais dans le dépôt.
+test-jellyfin/
+# Médias de test copiés ou générés localement.
+media/
+# Sorties des bancs (elles nomment des fichiers de la bibliothèque locale).
+lumen-core/benches/out/
+
+# Cache NuGet des constructions du plugin, et ses paquets.
+plugin/.nuget/
+plugin/dist/
+# Le clone du dépôt de plugins publié (un autre dépôt git).
+plugin/depot/

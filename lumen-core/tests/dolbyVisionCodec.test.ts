@@ -1,0 +1,193 @@
+import { describe, it, expect, vi } from "vitest";
+import { dolbyVisionCodecString } from "@lumen/engine/codecConfig";
+import { planDolbyVision } from "@lumen/engine/pathSelector";
+
+/**
+ * La chaîne de codec Dolby Vision, construite depuis l'enregistrement du conteneur.
+ *
+ * La disposition des bits a été relevée sur un vrai fichier de cette bibliothèque puis confrontée
+ * à ce qu'en dit ffprobe, plutôt que lue dans une spécification — c'est la méthode qui a tranché
+ * quatre fois dans la journée du 19/09/2026, là où le raisonnement s'était trompé deux fois.
+ *
+ *     01 00 10 35 …  →  version 1.0, profil 8, niveau 6, rpu=1 el=0 bl=1
+ */
+const REEL = new Uint8Array([
+  0x01, 0x00, 0x10, 0x35, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+]);
+
+describe("dolbyVisionCodecString", () => {
+  it("lit le profil et le niveau de « Retour vers le futur II »", () => {
+    // ffprobe dit de ce fichier : dv_profile=8, dv_level=6. La chaîne doit dire la même chose.
+    expect(dolbyVisionCodecString(REEL)).toBe("dvh1.08.06");
+  });
+
+  // Deux chiffres, zéro devant compris : aucun navigateur ne reconnaît `dvh1.8.6`.
+  it("garde les deux chiffres, zéro devant compris", () => {
+    const profil5 = new Uint8Array([0x01, 0x00, (5 << 1) | 0x00, (6 << 3) | 0b101, ...new Array(20).fill(0)]);
+    expect(dolbyVisionCodecString(profil5)).toBe("dvh1.05.06");
+  });
+
+  // Un enregistrement tronqué ou vide ne doit pas produire une chaîne que personne ne reconnaîtra
+  // — mieux vaut ne rien proposer que proposer `dvh1.00.00`.
+  it("ne fabrique rien d'un enregistrement inutilisable", () => {
+    expect(dolbyVisionCodecString(new Uint8Array([0x01, 0x00]))).toBeNull();
+    expect(dolbyVisionCodecString(new Uint8Array(24))).toBeNull();
+  });
+});
+
+/**
+ * L'arbre de décision, éprouvé sans navigateur, sans fichier et sans appareil.
+ *
+ * Trois issues, dans l'ordre que le foyer a demandé : le Dolby Vision quand tout s'y prête, sa
+ * couche de base sinon, et le lecteur serveur quand il n'y a pas de couche de base du tout.
+ *
+ * C'est la seule partie de ce chantier où une erreur de raisonnement ne se verrait pas à la
+ * lecture — le reste est de la recopie d'octets, qui se vérifie à l'œil. D'où une fonction pure,
+ * et d'où ces cas.
+ */
+describe("planDolbyVision", () => {
+  const record = new Uint8Array([
+    0x01, 0x00, 0x10, 0x35, 0x10, ...new Array(19).fill(0),
+  ]);
+  const profil5 = new Uint8Array([0x01, 0x00, (5 << 1), (6 << 3) | 0b101, 0x00, ...new Array(19).fill(0)]);
+  const piste = (r: Uint8Array | null, codecId = "V_MPEGH/ISO/HEVC") => ({
+    codecId,
+    dolbyVision: r ? { type: "dvvC", record: r } : undefined,
+  });
+  const oui = () => true;
+  const non = () => false;
+
+  it("livre du Dolby Vision quand le navigateur l'accepte", () => {
+    const plan = planDolbyVision(piste(record), "DOVIWithHDR10", oui);
+    expect(plan.kind).toBe("dolby");
+    if (plan.kind === "dolby") {
+      expect(plan.codec).toBe("dvh1.08.06");
+      // La boîte est celle du conteneur, transmise telle quelle — jamais reconstruite.
+      expect(plan.box.record).toBe(record);
+      expect(plan.box.type).toBe("dvvC");
+    }
+  });
+
+  it("retombe sur la couche HDR10 quand le navigateur refuse", () => {
+    expect(planDolbyVision(piste(record), "DOVIWithHDR10", non).kind).toBe("hdr10");
+  });
+
+  // Le cas de « Disclosure Day » : profil 5, aucune couche de base. Un refus n'a nulle part où
+  // atterrir, et c'est exactement ce qui donnait des couleurs fausses avant qu'on le sache.
+  it("demande le lecteur serveur quand il n'y a pas de couche de base", () => {
+    const plan = planDolbyVision(piste(profil5), "DOVI", non);
+    expect(plan.kind).toBe("server");
+    if (plan.kind === "server") expect(plan.reason).toContain("couleurs fausses");
+  });
+
+  it("livre quand même le Dolby Vision d'un profil 5 si le navigateur l'accepte", () => {
+    // C'est tout l'intérêt du chantier pour ces deux fichiers-là : ils redeviennent lisibles
+    // nativement au lieu de coûter un ré-encodage 4K au serveur.
+    expect(planDolbyVision(piste(profil5), "DOVI", oui).kind).toBe("dolby");
+  });
+
+  it("ne touche à rien pour un fichier sans Dolby Vision", () => {
+    expect(planDolbyVision(piste(null), "HDR10", oui).kind).toBe("hdr10");
+    expect(planDolbyVision(piste(null), "SDR", non).kind).toBe("hdr10");
+  });
+
+  /**
+   * L'interrupteur, et ce qu'il garantit.
+   *
+   * Fermé, la sortie est celle d'avant à l'octet près : `hvc1`, HDR10, les 188 titres lus comme
+   * ils l'ont toujours été. C'est ce qui permet de lever un doute en changeant un mot.
+   */
+  it("ne livre rien quand l'interrupteur est fermé", () => {
+    expect(planDolbyVision(piste(record), "DOVIWithHDR10", oui, false).kind).toBe("hdr10");
+    // Et le profil 5 repart au serveur, comme avant le chantier.
+    expect(planDolbyVision(piste(profil5), "DOVI", oui, false).kind).toBe("server");
+  });
+
+  // Un enregistrement illisible n'est pas une raison de refuser un fichier qui a une couche de
+  // base : on ne sait pas l'annoncer, donc on livre ce qu'on sait livrer.
+  it("retombe proprement sur un enregistrement illisible", () => {
+    const casse = new Uint8Array([0x01, 0x00]);
+    expect(planDolbyVision(piste(casse), "DOVIWithHDR10", oui).kind).toBe("hdr10");
+    expect(planDolbyVision(piste(casse), "DOVI", oui).kind).toBe("server");
+  });
+});
+
+/**
+ * Ce que le balayage de la bibliothèque a trouvé, une heure après la livraison.
+ *
+ * « Marty Supreme » est en AV1 avec un Dolby Vision profil 10. Son enregistrement est lisible et
+ * produit une chaîne parfaitement formée — `dvh1.10.08` — qui est pourtant fausse : `dvh1` annonce
+ * du HEVC quand l'entrée écrite pour de l'AV1 est `av01`. Le type déclaré et la boîte écrite se
+ * seraient contredits, et le segment d'initialisation rejeté en bloc. Un film qui marchait serait
+ * devenu injouable, et aucune relecture de code ne l'avait vu.
+ */
+describe("planDolbyVision — le Dolby Vision n'est pas qu'une affaire de profil", () => {
+  const av1 = new Uint8Array([0x01, 0x00, (10 << 1), (8 << 3) | 0b101, 0x10, ...new Array(19).fill(0)]);
+
+  it("ne propose pas une chaîne HEVC pour une piste AV1", () => {
+    const plan = planDolbyVision(
+      { codecId: "V_AV1", dolbyVision: { type: "dvvC", record: av1 } },
+      "DOVIWithHDR10Plus",
+      () => true
+    );
+    // Sa couche de base est du HDR10 : il reprend exactement le chemin qu'il avait avant.
+    expect(plan.kind).toBe("hdr10");
+  });
+
+  it("n'en propose pas davantage pour de l'AVC", () => {
+    expect(
+      planDolbyVision({ codecId: "V_MPEG4/ISO/AVC", dolbyVision: { type: "dvcC", record: av1 } }, "DOVIWithHDR10", () => true).kind
+    ).toBe("hdr10");
+  });
+});
+
+/**
+ * Ce que le journal a montré le 20/09/2026, et que rien ne disait avant lui.
+ *
+ * « Disclosure Day » sur Chrome/Windows : le remultiplexage refuse en annonçant « passage au
+ * lecteur serveur », puis le chemin canevas est essayé quand même — il décode un 4K, échoue à
+ * convertir l'image (`allocationSize` sur une image opaque) et retombe enfin sur le repli qu'on
+ * avait déjà choisi deux étapes plus tôt.
+ *
+ * Le refus du Dolby Vision sans couche de base ne vise pas *un chemin*, il vise **ce lecteur** :
+ * il doit donc arrêter la chaîne. Ce test échoue sans le correctif — l'ancienne version rendait
+ * un chemin `webcodecs` au lieu de lever.
+ */
+describe("un refus qui vise le lecteur arrête la chaîne", () => {
+  const profil5 = new Uint8Array([0x01, 0x00, 5 << 1, (6 << 3) | 0b101, 0x00, ...new Array(19).fill(0)]);
+
+  // Ce navigateur accepte le HEVC ordinaire et refuse le Dolby Vision : exactement Chrome devant
+  // ce fichier, et la seule combinaison qui mène à l'issue « lecteur serveur ».
+  const navigateur = {
+    isTypeSupported: (mime: string) => !mime.includes("dvh1") && !mime.includes("dvhe"),
+  };
+
+  it("ne tente pas le canevas quand le Dolby Vision n'a pas de couche de base", async () => {
+    vi.stubGlobal("MediaSource", navigateur);
+    vi.stubGlobal("window", { ManagedMediaSource: navigateur });
+    const { choosePlaybackPath } = await import("@lumen/engine/pathSelector");
+
+    const videoTrack = {
+      codecId: "V_MPEGH/ISO/HEVC",
+      dolbyVision: { type: "dvcC", record: profil5 },
+      video: { pixelWidth: 3840, pixelHeight: 1606 },
+      codecPrivate: new Uint8Array([0x01, ...new Array(22).fill(0)]),
+      number: 1,
+      type: 1,
+    };
+
+    await expect(
+      choosePlaybackPath({
+        source: { size: 0, read: async () => new Uint8Array() },
+        file: { tracks: [videoTrack], timecodeScale: 1_000_000, duration: 0, cues: [], segmentStart: 0, segmentEnd: 0 },
+        videoTrack,
+        audioTrack: null,
+        dimensions: { width: 3840, height: 1606 },
+        videoRangeType: "DOVI",
+      } as never)
+    ).rejects.toThrow(/Aucun chemin de lecture/);
+
+    vi.unstubAllGlobals();
+  });
+});

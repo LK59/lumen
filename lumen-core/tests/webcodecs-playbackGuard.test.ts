@@ -1,0 +1,342 @@
+import { describe, it, expect, vi } from "vitest";
+import { PlaybackGuard, type GuardHost } from "@lumen/engine/playbackGuard";
+
+// The rules about the element's own clock, exercised directly rather than through everything that
+// feeds it. Every one of them was measured on a device, and the comments in the guard say which —
+// these say what would break if the rule went away.
+
+function ranges(...spans: [number, number][]) {
+  return {
+    length: spans.length,
+    start: (i: number) => spans[i][0],
+    end: (i: number) => spans[i][1],
+  } as unknown as TimeRanges;
+}
+
+function fakeVideo(at = 0) {
+  const target = new EventTarget();
+  return Object.assign(target, {
+    currentTime: at,
+    paused: false,
+    playbackRate: 1,
+    play: vi.fn(function (this: { paused: boolean }) {
+      this.paused = false;
+      return Promise.resolve();
+    }),
+    pause: vi.fn(function (this: { paused: boolean }) {
+      this.paused = true;
+    }),
+  }) as unknown as HTMLVideoElement & { play: ReturnType<typeof vi.fn>; pause: ReturnType<typeof vi.fn> };
+}
+
+function build(options: { at?: number; playable?: TimeRanges } = {}) {
+  const video = fakeVideo(options.at ?? 0);
+  const seeks: { at: number; because: string }[] = [];
+  const targets: number[] = [];
+  const host: GuardHost = {
+    destroyed: false,
+    delaySeconds: 0.2,
+    playable: options.playable ?? ranges([0, 100]),
+    seek: async (at, because) => void seeks.push({ at, because }),
+    noteSeekTarget: (at) => void targets.push(at),
+  };
+  const starting: (number | null)[] = [];
+  const guard = new PlaybackGuard(video, host, (at) => starting.push(at));
+  return { guard, video, host, seeks, targets, starting };
+}
+
+const tick = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+describe("PlaybackGuard", () => {
+  it("remembers exactly where the picture stopped, and settles it at once", () => {
+    // The element's clock does not stop where the button was pressed: the sound already handed to
+    // the hardware plays out, and the clock follows the sound. Asking the element to be where it
+    // already is runs the seek algorithm, which discards what is queued.
+    const { guard, video } = build({ at: 12 });
+    (video as unknown as { paused: boolean }).paused = true;
+    guard.paused();
+
+    expect(video.currentTime).toBe(12);
+    expect(guard.debug["Dernière pause"]).toContain("12.000");
+  });
+
+  it("re-states the position only for a drift worth correcting, and only a few times", async () => {
+    // Each re-statement runs the seek algorithm, and on iOS that re-renders the sound around the
+    // position — audible, as a tenth of a second replayed. Once is the fix; every eighty
+    // milliseconds for as long as the clock creeps is a stuck record.
+    const { guard, video } = build({ at: 12 });
+    (video as unknown as { paused: boolean }).paused = true;
+    guard.paused();
+
+    const assertions = () => Number(/recalé ×(\d+)/.exec(guard.debug["Dernière pause"])?.[1] ?? 0);
+    // One already, made at the pause itself — that is the correction that works.
+    expect(assertions()).toBe(1);
+
+    // Below the threshold: left alone.
+    (video as unknown as { currentTime: number }).currentTime = 12.1;
+    await tick(200);
+    expect(assertions()).toBe(1);
+
+    // Above it, repeatedly: corrected, then it stops.
+    for (let i = 0; i < 12; i++) {
+      (video as unknown as { currentTime: number }).currentTime += 0.4;
+      await tick(70);
+    }
+    expect(assertions()).toBeGreaterThan(1);
+    expect(assertions()).toBeLessThanOrEqual(3);
+    guard.destroy();
+  });
+
+  it("lets a resume land where the sound stopped rather than pulling it back", () => {
+    // Measured: the picture freezes at the button, the sound the hardware held plays on for about
+    // half a second, and the clock reports that at the moment of resuming. Nothing was skipped.
+    const { guard, video, seeks } = build({ at: 12 });
+    (video as unknown as { paused: boolean }).paused = true;
+    guard.paused();
+
+    (video as unknown as { currentTime: number }).currentTime = 12.49;
+    (video as unknown as { paused: boolean }).paused = false;
+    guard.playing();
+
+    expect(video.currentTime).toBe(12.49);
+    expect(seeks).toEqual([]);
+  });
+
+  it("puts the playhead back when the system reclaimed the position during the pause", () => {
+    // A gap far larger than the drain is a real discontinuity: media the system took back while
+    // nothing was playing, which runs to seconds.
+    const { guard, video } = build({ at: 12 });
+    (video as unknown as { paused: boolean }).paused = true;
+    guard.paused();
+
+    (video as unknown as { currentTime: number }).currentTime = 40;
+    (video as unknown as { paused: boolean }).paused = false;
+    guard.playing();
+
+    expect(video.currentTime).toBe(12);
+  });
+
+  it("ne retient pas une pause d'un démarrage qui n'a jamais eu lieu", () => {
+    // Le cas décrit : une lecture fantôme, fermée avant sa première image. L'élément
+    // signale une pause à zéro — mais personne n'a rien regardé, et cette position ne décrit rien
+    // qu'il faille retrouver.
+    const { guard, video, seeks } = build({ at: 0, playable: ranges([1049, 1080]) });
+    // Une lecture est demandée, et l'élément y renonce sans jamais présenter d'image.
+    guard.playing();
+    (video as unknown as { paused: boolean }).paused = true;
+    guard.paused();
+
+    (video as unknown as { currentTime: number }).currentTime = 1049.1;
+    (video as unknown as { paused: boolean }).paused = false;
+    guard.playing();
+
+    expect(video.currentTime).toBeCloseTo(1049.1, 2);
+    expect(seeks.map((s) => s.at)).not.toContain(0);
+  });
+
+  it("ne ramène pas la lecture à une pause d'avant l'ouverture", () => {
+    // Le cas forcé sur appareil : « Reprendre », fermer pendant que ça charge — la tête est
+    // encore à zéro — puis « Reprendre » à nouveau. L'élément avait signalé une pause à 0, qui
+    // n'en était pas une : c'est un démarrage auquel il renonce, faute de média.
+    const { guard, video, seeks } = build({ at: 0, playable: ranges([648, 680]) });
+    (video as unknown as { paused: boolean }).paused = true;
+    guard.paused();
+
+    // La seconde lecture pose sa tête là où l'on reprend.
+    guard.opened(648.2);
+    (video as unknown as { currentTime: number }).currentTime = 648.2;
+    (video as unknown as { paused: boolean }).paused = false;
+    guard.playing();
+
+    // Sans quoi la reprise après pause y voyait un saut en avant de dix minutes et ramenait le
+    // film à l'ancre de la tentative précédente, c'est-à-dire au début.
+    expect(video.currentTime).toBeCloseTo(648.2, 2);
+    expect(seeks.map((s) => s.at)).not.toContain(0);
+  });
+
+  it("shows a wait when play is pressed, and lifts it when the clock moves", () => {
+    const { guard, video, starting } = build({ at: 5 });
+    guard.playing();
+    expect(starting.at(-1)).toEqual(expect.any(Number));
+
+    (video as unknown as { currentTime: number }).currentTime = 5.5;
+    guard.clockTicked();
+    expect(starting.at(-1)).toBeNull();
+  });
+
+  it("does not take the opening's landing for playback, and lifts the wait only when the clock really moves", () => {
+    // Sur iPhone, l'ouverture depuis le début pose la tête sur le premier média (0 → 0,27 s sur un
+    // fichier à images B). Ce pas levait l'attente : un tiers des ouvertures restaient figées
+    // 1,5 s sur une image arrêtée, jusqu'à la poussée (Her, 10/10/2026).
+    const { guard, video, starting } = build({ at: 0, playable: ranges([0.23, 30]) });
+    guard.opened(0);
+    guard.playing();
+    expect(guard.awaitingFirstPicture).toBe(true);
+
+    guard.nudgeIntoBuffer();
+    expect(video.currentTime).toBeCloseTo(0.27, 2);
+    guard.clockTicked();
+    expect(starting.at(-1)).toEqual(expect.any(Number));
+    expect(guard.awaitingFirstPicture).toBe(true);
+
+    (video as unknown as { currentTime: number }).currentTime = 0.5;
+    guard.clockTicked();
+    expect(starting.at(-1)).toBeNull();
+    expect(guard.awaitingFirstPicture).toBe(false);
+  });
+
+  it("counts a push of a frozen clock as a placement, not as playback", () => {
+    const { guard, video, starting } = build({ at: 3 });
+    guard.playing();
+    guard.headPlaced(3.08);
+    (video as unknown as { currentTime: number }).currentTime = 3.08;
+    guard.clockTicked();
+    expect(starting.at(-1)).toEqual(expect.any(Number));
+  });
+
+  it("never leaves a wait behind when the source dies", () => {
+    // A wait nobody will ever answer is a spinner for ever.
+    const { guard, starting } = build({ at: 5 });
+    guard.playing();
+    guard.destroy();
+    expect(starting.at(-1)).toBeNull();
+  });
+
+  it("steps onto media a seek produced after its target, and only while it has not moved", () => {
+    // An index is not exact. Asking a file for 1568 s produced media beginning at 1570.6, and no
+    // amount of waiting would ever make it cover 1568.
+    const { guard, video } = build({ at: 100, playable: ranges([102.6, 130]) });
+    (video as unknown as { paused: boolean }).paused = true;
+
+    // Without a seek behind it, a gap that size is a hole and is left alone.
+    guard.nudgeIntoBuffer();
+    expect(video.currentTime).toBe(100);
+
+    guard.seekServed(100);
+    guard.nudgeIntoBuffer();
+    // A hair inside the media, never exactly on its first instant — see LANDING_INSET.
+    expect(video.currentTime).toBeCloseTo(102.64, 3);
+
+    // The licence expires with the landing: a pause much later may not step eight seconds.
+    (video as unknown as { currentTime: number }).currentTime = 110;
+    guard.nudgeIntoBuffer();
+    expect(video.currentTime).toBe(110);
+  });
+
+  it("closes a gap the size of the presentation delay while playing, and no more", () => {
+    const near = build({ at: 100, playable: ranges([100.25, 130]) });
+    near.guard.nudgeIntoBuffer();
+    expect(near.video.currentTime).toBeCloseTo(100.29, 3);
+
+    const far = build({ at: 100, playable: ranges([101.5, 130]) });
+    far.guard.nudgeIntoBuffer();
+    expect(far.video.currentTime).toBe(100);
+  });
+
+  it("starts a film the element gave up on, once there is something to play", async () => {
+    // Measured on an iPhone opening an episode from the beginning. A file with B-frames presents
+    // its first picture 210 ms in; play() was called before any of that existed, the element
+    // abandoned the attempt and went back to paused with the playhead short of everything, and
+    // the film then sat at 0:00 with thirty seconds buffered. Nothing could move it: the
+    // playhead was not stepped onto the media because the element was paused, and the element
+    // was paused because there was nothing under the playhead.
+    const { guard, video } = build({ at: 0, playable: ranges([0.21, 30]) });
+    guard.opened(0);
+
+    guard.playing(); // the element fires this as soon as play() is called
+    (video as unknown as { paused: boolean }).paused = true;
+    (video as unknown as { currentTime: number }).currentTime = 0;
+    guard.paused(); // and gives up a moment later, before any frame
+
+    guard.mediaArrived();
+    expect(video.currentTime).toBeCloseTo(0.25, 3);
+    expect(video.play).toHaveBeenCalled();
+  });
+
+  it("does not start a film opened to stay paused", async () => {
+    // 21/09/2026, iPhone: a change of track during a pause rebuilds the player, and the new one
+    // opens standing still — which this took for a start the element had given up on, and
+    // started the film under the viewer. An opening that owes no start is left where it is.
+    const { guard, video } = build({ at: 336, playable: ranges([336, 360]) });
+    guard.opened(336, false);
+    (video as unknown as { paused: boolean }).paused = true;
+    guard.mediaArrived();
+    expect(video.play).not.toHaveBeenCalled();
+  });
+
+  it("does not start a film that played and was then stopped", async () => {
+    // The film got as far as moving, so whoever stopped it meant to. Starting it again under
+    // them would be the player arguing.
+    const { guard, video } = build({ at: 5, playable: ranges([5, 30]) });
+    guard.opened(5);
+    (video as unknown as { currentTime: number }).currentTime = 12;
+    (video as unknown as { paused: boolean }).paused = true;
+    guard.paused();
+
+    guard.mediaArrived();
+    expect(video.play).not.toHaveBeenCalled();
+  });
+
+  it("stops insisting once opening is plainly over", async () => {
+    // A viewer stopping a film that never started cannot be told apart from a start that failed,
+    // so the window in which this may insist is the length of an opening and no longer.
+    const { guard, video } = build({ at: 0, playable: ranges([0.21, 30]) });
+    guard.opened(0);
+    (video as unknown as { paused: boolean }).paused = true;
+    (guard as unknown as { openedAt: number }).openedAt = Date.now() - 60_000;
+
+    guard.mediaArrived();
+    expect(video.play).not.toHaveBeenCalled();
+  });
+
+  it("starts a film whose element never even announced the attempt", async () => {
+    // The case the first fix missed, and the one that kept turning up: when the refusal is
+    // immediate there is no play event and therefore no pause event either, so waiting for that
+    // pair to arrive is waiting for something that already did not happen.
+    const { guard, video } = build({ at: 0, playable: ranges([0.21, 30]) });
+    guard.opened(0);
+    (video as unknown as { paused: boolean }).paused = true;
+
+    guard.mediaArrived();
+    expect(video.currentTime).toBeCloseTo(0.25, 3);
+    expect(video.play).toHaveBeenCalled();
+  });
+
+  it("gives up asking rather than fighting an element that will not start", async () => {
+    const { guard, video } = build({ at: 0, playable: ranges([0.21, 30]) });
+    guard.opened(0);
+    for (let attempt = 0; attempt < 5; attempt++) {
+      guard.playing();
+      (video as unknown as { paused: boolean }).paused = true;
+      guard.paused();
+      guard.mediaArrived();
+    }
+    expect((video.play as ReturnType<typeof vi.fn>).mock.calls.length).toBeLessThanOrEqual(2);
+  });
+});
+
+
+/**
+ * Une pause qui arrive en plein saut ne s'approprie pas le saut.
+ *
+ * Mettre en pause puis sauter dans la même tâche livre `pause` avant `seeking`. La pause
+ * « réaffirmait » alors la position — la cible du saut — et la déclarait comme un pas de ce
+ * lecteur : le gestionnaire de saut, y reconnaissant son propre pas, ne chargeait jamais le média
+ * de la cible (relevé le 23/09/2026).
+ */
+describe("PlaybackGuard — pause pendant un saut", () => {
+  it("ne déclare pas la cible du spectateur comme son propre pas", () => {
+    const { guard, video, targets } = build({ at: 1800 });
+    Object.assign(video, { paused: true, seeking: true });
+    guard.paused();
+    expect(targets).toEqual([]);
+    expect(guard.debug["Dernière pause"]).not.toContain("recalé");
+  });
+
+  it("garde son ancre pour une pause ordinaire", () => {
+    const { guard, video, targets } = build({ at: 12 });
+    Object.assign(video, { paused: true, seeking: false });
+    guard.paused();
+    expect(targets).toEqual([12]);
+  });
+});

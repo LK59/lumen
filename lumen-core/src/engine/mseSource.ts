@@ -1,0 +1,2367 @@
+// Feeds remuxed segments to a real <video> element through MediaSource.
+//
+// This is the path that costs the least and gives the most: the browser decodes in hardware,
+// composites the picture itself, drives its own audio clock, and handles HDR natively. Nothing
+// here touches a pixel or a sample — it only decides what to hand over and when.
+//
+// Anything that goes wrong is reported, never worked around silently. A player that quietly falls
+// back leaves you unable to tell a path that works from a path that was never used.
+
+import { playerWarning } from "./playerWarning";
+import type { Remuxer, RemuxPlan } from "./remuxer";
+import { trace, traceRecent } from "./trace";
+import { diagInterval, diagNow, diagStallFacts } from "./playbackDiagnosis";
+import { describeNetwork, isNetworkFailure, isReadAbandoned } from "./byteSource";
+import { networkUnstable } from "../support/networkTrouble";
+import { isUnreadableZone } from "./unreadableZone";
+import { BufferQueue } from "./bufferQueue";
+import { rangeAround, startJustAfter } from "./timeRanges";
+import { PlaybackGuard } from "./playbackGuard";
+import { NO_INDEX_REACH_SECONDS, reachable, seekArrived } from "./seekArrival";
+import { LANDING_REACH_SECONDS, SeekLifecycle, landingFor } from "./seekLifecycle";
+import { containerAccepts, playabilityOf, sourceConstructor, type MediaSourceCtor } from "./mseSupport";
+import {
+  FROZEN_SEEKING_MS, MIN_BUFFER_SECONDS, PLAYED_TO_CLEAR_SECONDS, STALL_REPORT_MS, STALL_REPORT_COOLDOWN_MS,
+  RUNAWAY_REPORT_SECONDS, STALL_TRACE_MS, MAX_APPEND_FAILURES, NETWORK_KEEP_LEAD_SECONDS, NETWORK_RETRY_DELAYS_MS, ONE_FRAME_S,
+  NETWORK_TRIM_MARGIN_SECONDS, NETWORK_OUTAGE_GIVE_UP_MS, OUTAGE_STARVED_LEAD_SECONDS, STALL_TIMEOUT_MS, WATCHDOG_MS,
+  EVICTION_REFILLS_PER_MINUTE, SOURCE_OPEN_TIMEOUT_MS, MISPLACED_SECONDS, FRUITLESS_APPENDS, PRE_ROLL_SECONDS,
+  TRACED_APPENDS, TRACED_APPENDS_PER_SEEK, KEEP_BEHIND_SECONDS, TRIM_SLACK_SECONDS, KEYFRAME_TRIM_MARGIN, NEXT_KEYFRAME_MARGIN,
+  PREPEND_SHARE_OF_AHEAD, PREPEND_STOP_MARGIN_S,
+} from "./mseTuning";
+import { frameQuality, playableSpans, spansAll, spansNear } from "./mseSpans";
+import { LossRecord, type SentFragment } from "./mseLossRecord";
+import { UnreadableZoneHold } from "./mseZoneHold";
+import { BufferPlanner } from "./mseBufferPlanner";
+import { RecoveryLadder } from "./mseRecoveryLadder";
+import { FrozenClockWatch } from "./mseFrozenClock";
+import { OpeningStartHold } from "./mseStartHold";
+import type { MseCallbacks, RecoveryFacts, SeekServed } from "./mseTypes";
+import type { BufferBudget, ByteRate } from "./bufferBudget";
+
+// Kept exported from here as well: every caller of these already reaches for this module, and
+// moving where they live should not mean touching a dozen call sites.
+export { containerAccepts, playabilityOf } from "./mseSupport";
+export type { MseCallbacks, RecoveryFacts, UnreadableZoneEvent, UnreadableZoneNotice } from "./mseTypes";
+
+export class MseSource {
+  private readonly source: MediaSource | ManagedMediaSource;
+  private videoBuffer: SourceBuffer | null = null;
+  private audioBuffer: SourceBuffer | null = null;
+  private videoOps: BufferQueue | null = null;
+  private audioOps: BufferQueue | null = null;
+  /** Consecutive refused appends. A single one is worth retrying; a run of them is not. */
+  private appendFailures = 0;
+  /** Nouveaux essais réseau faits sans vider le tampon depuis le dernier envoi réussi. */
+  private networkRetries = 0;
+  private networkRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private networkRetryGeneration = 0;
+  /**
+   * La lecture a repris après une coupure sans vider le tampon : le premier segment relu remplace
+   * ce que le tampon tient déjà à partir de son propre début, qui est retiré juste avant l'envoi.
+   */
+  private trimBeforeNextAppend = false;
+  /**
+   * Plus aucune lecture jusqu'au nouvel essai : le lecteur de fichier est resté là où l'erreur l'a
+   * laissé, peut-être au milieu d'une grappe, et seul le nouvel essai le repositionne. Sans ce
+   * verrou, le premier `timeupdate` relançait le remplissage sur ce lecteur-là. Un saut le lève :
+   * il repositionne tout lui-même.
+   */
+  private networkHold = false;
+  /**
+   * Une coupure en pleine lecture tenue (§97) : le tampon gardé quelle que soit l'avance, de nouveaux
+   * essais sans fin (`NETWORK_RETRY_DELAYS_MS`, puis le dernier), jusqu'à la borne de
+   * `watchForOutage`. Retombe au premier envoi accepté.
+   */
+  private outageHold = false;
+  /** La main est passée à l'hôte pour une coupure (§97) : plus rien ne part d'ici. */
+  private networkGaveUp = false;
+  /**
+   * Everything about the element's own clock — pausing, resuming, landing after a seek, starting
+   * a film the element gave up on. A different subject from moving bytes, with a
+   * different kind of evidence behind it, so it lives in its own file.
+   */
+  private readonly guard: PlaybackGuard;
+  /** Pas de démarrage dû à l'ouverture : la garde ne relance pas un élément laissé à l'arrêt. */
+  private startPaused = false;
+  private objectUrl: string | null = null;
+  /** The read loop in flight, if any. A seek has to let it finish before moving the reader. */
+  private fillTask: Promise<void> | null = null;
+  private destroyed = false;
+  private ended = false;
+  /** Bumped by every seek, so appends already in flight are recognised as stale and dropped. */
+  private generation = 0;
+  private pending: Promise<void> = Promise.resolve();
+  /** Le saut : demandé, servi, en route, arrivé — voir `SeekLifecycle`. */
+  private readonly seekState = new SeekLifecycle();
+  /** Le dernier saut servi et comment — voir `seekPathFor`. */
+  private lastServed: SeekServed | null = null;
+  /** La dernière position où l'élément jouait sans sauter — où revenir d'un saut refusé. */
+  private lastPlayedAt = 0;
+  private delaySeconds = 0;
+  /**
+   * Où le film doit s'ouvrir, tant que le média n'est pas encore là pour l'y recevoir.
+   *
+   * Voir `placePendingStart`. `null` dès que la tête y a été posée, et dès le départ pour une
+   * ouverture au début, qui n'a personne à attendre.
+   */
+  private pendingStart: number | null = null;
+  /**
+   * Le départ d'une ouverture depuis le début, retenu jusqu'à la première image — voir
+   * `OpeningStartHold` (26/10/2026). `null` pour une reprise, une ouverture laissée à l'arrêt, et
+   * dès que le départ est permis.
+   */
+  private startHold: OpeningStartHold | null = null;
+  private lastAppendAt = 0;
+  /**
+   * Jusqu'où le lecteur de fichier a lu, **sur l'horloge du fichier** — celle de
+   * `segment.endSeconds` et de `Remuxer.seekTo`, sans le décalage de présentation. Qui la compare
+   * au tampon ou à la tête lui ajoute `delaySeconds` ; qui y range une position du lecteur le lui
+   * retire (`toFileClock`). Le commentaire la disait sur l'horloge du lecteur, et trois écrivains sur quatre l'ont
+   * cru : le nouvel essai d'une coupure réseau retirait le décalage une seconde fois, repartait du
+   * groupe d'avant quand la lecture s'était arrêtée pile sur une image clé, et ce groupe, commencé
+   * sous la tête, faisait vider les deux tampons (audit du 29/09/2026).
+   */
+  private readUpTo = 0;
+  private seeksServed = 0;
+  /**
+   * Les retraits en cours de ce lecteur, par tampon — ce qui distingue, dans `bufferedchange`, nos
+   * propres purges de celles que le système décide seul. Voir `removeRange`.
+   */
+  private readonly ownRemovals = new Map<SourceBuffer, number>();
+  /** Les écouteurs `bufferedchange`, pour les retirer à la destruction. */
+  private readonly evictionListeners: [SourceBuffer, EventListener][] = [];
+  /** Plages retirées par le navigateur sur la séance, et parmi elles celles devant la tête. */
+  private evictions = 0;
+  private evictionsAhead = 0;
+  /** Les relectures d'éviction de la dernière minute, et celle qui attend la lecture en cours. */
+  private evictionRefills: number[] = [];
+  private evictionRefillQueued = false;
+  /** L'échelle des reprises — voir `RecoveryLadder`. */
+  private readonly ladder: RecoveryLadder;
+  private watchdogTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * La profondeur visée et le budget — voir `BufferPlanner`. Construit à la place des champs qu'il
+   * reprend, pour lire le plafond du navigateur au même moment. `targetBuffer`, `videoRate` et
+   * `audioRate` restent lisibles ici sous leur nom : `quotaHit` abaisse la cible, `runFill` mesure le
+   * débit, et webcodecs-mseSource.test.ts les lit sur l'instance.
+   */
+  private readonly planner = new BufferPlanner({
+    anchor: () => this.anchor,
+    videoOps: () => this.videoOps,
+    audioOps: () => this.audioOps,
+  });
+  private get targetBuffer(): number {
+    return this.planner.targetBuffer;
+  }
+  private set targetBuffer(seconds: number) {
+    this.planner.targetBuffer = seconds;
+  }
+  private get videoRate(): ByteRate {
+    return this.planner.videoRate;
+  }
+  private get audioRate(): ByteRate {
+    return this.planner.audioRate;
+  }
+  /**
+   * L'horloge figée et la position redemandée à l'ouverture — voir `FrozenClockWatch`.
+   * `frozenSince`, `frozenNudges` et `lastPlayingAt` restent lisibles et écrivables ici sous leur
+   * nom : webcodecs-mseSource.test.ts les lit, et recule les deux instants pour simuler le temps.
+   */
+  private readonly clock: FrozenClockWatch;
+  private get frozenSince(): number | null {
+    return this.clock.frozenSince;
+  }
+  private set frozenSince(at: number | null) {
+    this.clock.frozenSince = at;
+  }
+  private get frozenNudges(): number {
+    return this.clock.frozenNudges;
+  }
+  private set frozenNudges(n: number) {
+    this.clock.frozenNudges = n;
+  }
+  private get lastPlayingAt(): number {
+    return this.clock.lastPlayingAt;
+  }
+  private set lastPlayingAt(at: number) {
+    this.clock.lastPlayingAt = at;
+  }
+  /**
+   * Handed to the host: nothing more this source can try. Reads as `lost`, so the host's own
+   * rebuild — its budget, its skip past a place that failed twice — takes over from here.
+   */
+  private stuck = false;
+  /** La zone illisible (§93) — voir `UnreadableZoneHold`. */
+  private readonly zones: UnreadableZoneHold;
+  /** Où reprendre après `handOver` — voir `position`. */
+  private handedOverAt: number | null = null;
+  /** For the stall line: where the clock was, since when, and whether this stall was written. */
+  private stallClockAt = -1;
+  private stallSince: number | null = null;
+  private stallReported = false;
+  private lastStallReportAt = -Infinity;
+  /** The clock as last seen by the watchdog, to tell playback from a jump. */
+  private tickClockAt = -1;
+  /**
+   * Secondes d'horloge écoulées sans média sous la tête, depuis la dernière fois qu'il y en avait.
+   * Voir `RUNAWAY_REPORT_SECONDS`.
+   */
+  private runawaySeconds = 0;
+  /** Le tour où la tête hors de sa place a été traitée — pour que le chien de garde n'agisse pas deux fois. */
+  private headAwayHandledAt = -1;
+
+  private constructor(
+    private readonly video: HTMLVideoElement,
+    private readonly remuxer: Remuxer,
+    private readonly plan: RemuxPlan,
+    private readonly callbacks: MseCallbacks,
+    Source: MediaSourceCtor
+  ) {
+    this.source = new Source();
+    // The getters below need the instance by reference: a property cannot be a getter over it.
+    const self = this;
+    // Handed a narrow view of the source rather than the source itself: the guard decides *when*
+    // the playhead should move, and this half remains the only thing that moves media.
+    this.guard = new PlaybackGuard(
+      video,
+      {
+        get destroyed() {
+          return self.destroyed;
+        },
+        get delaySeconds() {
+          return self.delaySeconds;
+        },
+        get playable() {
+          return self.playable;
+        },
+        seek: (seconds, because) => this.seek(seconds, because),
+        noteSeekTarget: (seconds) => {
+          // Un pas volontaire autour de la cible la déplace : ce n'est pas un départ.
+          this.seekState.moved(seconds);
+          // L'atterrissage de l'ouverture depuis le début passe par là (`nudgeIntoBuffer`). Pas
+          // pendant que son départ est retenu : l'élément est à l'arrêt et ne partira qu'avec son
+          // image — la position redemandée relancerait le saut qu'on attend (`OpeningStartHold`).
+          if (!this.startHold?.holding) this.armOpeningReassert(seconds);
+        },
+      },
+      callbacks.onStarting
+    );
+    this.loss = new LossRecord({
+      video,
+      get videoBuffer() {
+        return self.videoBuffer;
+      },
+      get audioBuffer() {
+        return self.audioBuffer;
+      },
+      stateFacts: (now) => this.stateFacts(now),
+    });
+    this.zones = new UnreadableZoneHold({
+      get destroyed() {
+        return self.destroyed;
+      },
+      get delaySeconds() {
+        return self.delaySeconds;
+      },
+      get anchor() {
+        return self.anchor;
+      },
+      get lead() {
+        return self.lead;
+      },
+      bufferedEnd: () => this.bufferedEnd(),
+      video,
+      remuxer,
+      callbacks,
+      elementState: () => this.elementState(),
+    });
+    this.ladder = new RecoveryLadder({
+      seek: (playerSeconds, because) => this.seek(playerSeconds, because),
+      remuxer,
+      toFileClock: (playerSeconds) => this.toFileClock(playerSeconds),
+      get playerEnd() {
+        return self.playerEnd;
+      },
+      get delaySeconds() {
+        return self.delaySeconds;
+      },
+    });
+    this.clock = new FrozenClockWatch({
+      get destroyed() {
+        return self.destroyed;
+      },
+      video,
+      guard: this.guard,
+      seekState: this.seekState,
+      get lead() {
+        return self.lead;
+      },
+      get playable() {
+        return self.playable;
+      },
+      recover: (target) => this.recover(target),
+      handOver: (at) => this.handOver(at),
+    });
+  }
+
+  static async attach(
+    video: HTMLVideoElement,
+    remuxer: Remuxer,
+    plan: RemuxPlan,
+    callbacks: MseCallbacks,
+    startSeconds = 0,
+    /** Ouvrir sans qu'un démarrage soit dû — voir `RemuxPlaybackOptions.startPaused`. */
+    startPaused = false
+  ): Promise<MseSource> {
+    const Source = sourceConstructor();
+    if (!Source) throw new Error("Ce navigateur ne propose pas MediaSource.");
+
+    const instance = new MseSource(video, remuxer, plan, callbacks, Source);
+    instance.startPaused = startPaused;
+    await instance.open(startSeconds);
+    return instance;
+  }
+
+  /** L'avance sous la tête, en secondes — ce que la réserve d'avance en mémoire (`MemoryReserve`) regarde avant de prendre le lien. */
+  get bufferedLead(): number {
+    return this.lead;
+  }
+
+  /**
+   * Le départ retenu d'une ouverture depuis le début — voir `OpeningStartHold` : la promesse que
+   * l'hôte attend avant d'appeler `play()`, ou `null` quand rien n'est retenu (une reprise, une
+   * ouverture laissée à l'arrêt, un départ déjà permis), et alors rien ne change pour lui.
+   */
+  openingHold(): Promise<void> | null {
+    return this.startHold?.holding ? this.startHold.released : null;
+  }
+
+  /** Where the player's clock sits relative to the file's. Already applied to every seek here. */
+  get presentationDelay(): number {
+    return this.delaySeconds;
+  }
+
+  private appendsTraced = 0;
+  /**
+   * Envois depuis le dernier saut (ou l'ouverture) : seuls les premiers sont tracés. Écrite à
+   * chaque segment jusqu'au 22/09/2026, la ligne « après envoi » occupait à elle seule les quarante
+   * étapes des lignes `seek` et `stall`, et masquait ce qui s'y était passé.
+   */
+  private appendsSinceSeek = 0;
+  /** Le premier envoi après un saut écrit ce que le réseau a coûté — voir `NetworkWindow`. */
+  private seekNetworkPending = false;
+
+  /**
+   * Le relevé d'une perte — voir `LossRecord`. Les fragments envoyés restent lisibles ici sous leur
+   * nom : `performSeek` les vide, et webcodecs-mseSource.test.ts les lit sur l'instance.
+   */
+  private readonly loss: LossRecord;
+  private get sentFragments(): SentFragment[] {
+    return this.loss.sentFragments;
+  }
+  private set sentFragments(fragments: SentFragment[]) {
+    this.loss.sentFragments = fragments;
+  }
+  private get fragmentsSinceSeek(): number {
+    return this.loss.fragmentsSinceSeek;
+  }
+  private set fragmentsSinceSeek(n: number) {
+    this.loss.fragmentsSinceSeek = n;
+  }
+
+  private async open(startSeconds: number): Promise<void> {
+    // AirPlay cannot carry a managed stream, and Safari refuses to attach one until this is set.
+    this.video.disableRemotePlayback = true;
+
+    trace("attente de sourceopen");
+    /**
+     * Borné dans le temps.
+     *
+     * `sourceopen` n'arrive jamais quand l'élément a été repris entre-temps — une autre source
+     * posée dessus, une page mise en arrière-plan qui le vide. L'ouverture attendait alors pour
+     * toujours, et le lecteur avec elle, sans erreur à montrer ni reconstruction à tenter (relu le
+     * 23/09/2026). L'événement arrive en quelques millisecondes quand il arrive : quinze secondes
+     * ne coupent rien de légitime, et changent une attente sans fin en échec qui se rattrape.
+     */
+    let openTimer: ReturnType<typeof setTimeout> | undefined;
+    const opened = new Promise<void>((resolve, reject) => {
+      this.source.addEventListener("sourceopen", () => resolve(), { once: true });
+      openTimer = setTimeout(
+        () => reject(new Error(`MediaSource jamais ouverte en ${SOURCE_OPEN_TIMEOUT_MS / 1000} s. ${this.elementState()}`)),
+        SOURCE_OPEN_TIMEOUT_MS
+      );
+    });
+
+    try {
+      // Preferred: the element holds the source object directly, with no URL to leak.
+      (this.video as unknown as { srcObject: unknown }).srcObject = this.source;
+    } catch {
+      this.objectUrl = URL.createObjectURL(this.source as MediaSource);
+      this.video.src = this.objectUrl;
+    }
+    if (!this.objectUrl && !(this.video as unknown as { srcObject: unknown }).srcObject) {
+      this.objectUrl = URL.createObjectURL(this.source as MediaSource);
+      this.video.src = this.objectUrl;
+    }
+
+    try {
+      await opened;
+    } catch (error) {
+      this.destroy();
+      throw error;
+    } finally {
+      clearTimeout(openTimer);
+    }
+    if (this.destroyed) return;
+
+    // From here on the element holds the source: the object URL keeps the MediaSource alive and
+    // `video.src` still points at it. `addSourceBuffer` is a real failure path — Firefox on
+    // Windows can claim support for a codec through `MediaSource.isTypeSupported` and then refuse
+    // it here (see codecSupport.ts) — and the init appends below can reject too. Without this the
+    // object outlived its own failure to open, since `revokeObjectURL` only ever runs in destroy().
+    try {
+      trace("MediaSource ouverte, création des tampons");
+      this.videoBuffer = this.source.addSourceBuffer(this.plan.videoMimeType);
+      this.videoBuffer.mode = "segments";
+      this.videoOps = new BufferQueue(this.videoBuffer, () => this.elementState());
+      if (this.plan.audioMimeType) {
+        this.audioBuffer = this.source.addSourceBuffer(this.plan.audioMimeType);
+        this.audioBuffer.mode = "segments";
+        this.audioOps = new BufferQueue(this.audioBuffer, () => this.elementState());
+      }
+      this.watchEvictions(this.videoBuffer, "vidéo");
+      if (this.audioBuffer) this.watchEvictions(this.audioBuffer, "audio");
+
+      await this.appendTo(this.videoOps, this.plan.videoInit, this.generation);
+      trace("segment d'initialisation vidéo accepté");
+      if (this.audioOps && this.plan.audioInit) {
+        await this.appendTo(this.audioOps, this.plan.audioInit, this.generation);
+        trace("segment d'initialisation audio accepté");
+      }
+
+      // Positioned before the first read, not after it. Filling thirty seconds from the beginning
+      // and then throwing all of it away is what made resuming a part-watched episode feel slow.
+      //
+      // Le lecteur est envoyé chercher le bon endroit tout de suite ; la *tête*, elle, attend que
+      // ce média soit arrivé — voir `placePendingStart`. Déplacer la tête ici, alors que seuls les
+      // segments d'initialisation ont été envoyés et que le tampon est vide, laissait WebKit dans
+      // un `seeking` qu'il ne résolvait plus jamais : mesuré sur un iPhone, un film rouvert à
+      // 23:24 restait figé avec trente secondes de média sous la tête et pas une image décodée,
+      // pendant que le chien de garde redemandait la position toutes les 1,8 s sans effet. Un saut
+      // *pendant* la lecture n'a jamais eu ce défaut — là, le média et le décodeur existent déjà,
+      // et c'est toute la différence.
+      // Jamais au-delà du dernier instant du film : une reprise enregistrée tout au bout — une
+      // séance fermée pendant le générique de fin — attendait un média qui n'existe pas, et
+      // l'ouverture restait sur son chargement.
+      if (this.plan.durationSeconds > 0) startSeconds = Math.min(startSeconds, Math.max(0, this.plan.durationSeconds - 2));
+      if (startSeconds > NO_INDEX_REACH_SECONDS && reachable(this.remuxer.seekable, startSeconds)) {
+        this.remuxer.seekTo(startSeconds);
+        // La cible, pas le jeton « déplacement de la source » : la tête n'est écrite qu'à
+        // l'arrivée du média (`placePendingStart`, qui pose alors le jeton). Posé ici, il restait
+        // en place quand le spectateur sautait avant cette arrivée — l'ouverture n'a alors jamais
+        // lieu —, et un retour à la position d'ouverture dans les deux secondes (+10 s puis −10 s
+        // juste après une reconstruction) passait pour la source et était ignoré (fuzz du
+        // 24/09/2026, graine 20124805).
+        this.seekState.serving(startSeconds);
+        this.pendingStart = startSeconds;
+      }
+      // Opening a film is a request to be somewhere, and it is about to be answered with media
+      // that begins a fraction of a second later — a file with B-frames presents its first picture
+      // 210 ms in. Declared as a landing so the playhead may be put onto that media even though
+      // the element, having nothing to play yet, is still paused.
+      //
+      // Pour une ouverture différée, la même déclaration est refaite au moment où la tête est
+      // posée : c'est là que le film s'ouvre vraiment, et l'annoncer ici la placerait à un endroit
+      // où la tête n'ira pas.
+      if (this.pendingStart === null) this.guard.opened(this.video.currentTime, !this.startPaused);
+      // Et son départ attend l'image (26/10/2026) : l'atterrissage se fait élément à l'arrêt, et
+      // l'hôte n'appelle `play()` qu'ensuite (`openingHold`). Une reprise n'en a pas besoin — sa
+      // tête est posée avant le départ, et elle ne s'est jamais figée là (0 sur 221) ; une
+      // ouverture laissée à l'arrêt n'a pas de départ à retenir.
+      if (this.pendingStart === null && !this.startPaused) {
+        this.startHold = new OpeningStartHold({
+          video: this.video,
+          headOnMedia: () => this.isBufferedAt(this.video.currentTime),
+          released: (timedOut) => {
+            this.startHold = null;
+            // Parti sur une borne, sans image : le départ redevient celui d'avant, et la position
+            // redemandée de l'ouverture avec lui (`OPENING_REASSERT_MS`).
+            if (timedOut) this.armOpeningReassert(this.video.currentTime);
+          },
+        });
+      }
+
+      // The element's own verdict, recorded when it is delivered. Everything so far learned of it
+      // second-hand, when some later operation tripped over the wreckage — so the report showed the
+      // consequence and never the moment.
+      this.video.addEventListener("error", this.onElementError);
+      this.source.addEventListener("sourceclose", this.onSourceClosed);
+
+      // The system says when it wants data; a page that fetches regardless gets throttled.
+      this.source.addEventListener("startstreaming", this.request);
+      this.video.addEventListener("timeupdate", this.request);
+      this.video.addEventListener("waiting", this.request);
+      // Not merely a hint to fetch more. On this path the transport controls write straight to the
+      // element, as they do for any <video>, so this event is the *only* notice that the viewer
+      // asked to be somewhere else. Without it the element waits at a time nothing will ever be
+      // appended to, while the reader keeps grinding forward from wherever it was — which looks
+      // exactly like the player decoding every frame up to the target before resuming.
+      this.video.addEventListener("seeking", this.onSeeking);
+      this.video.addEventListener("seeked", this.onSeeked);
+      this.video.addEventListener("pause", this.guard.paused);
+      this.video.addEventListener("play", this.onPlay);
+      this.video.addEventListener("playing", this.request);
+      this.video.addEventListener("playing", this.onPlaying);
+      if (typeof window !== "undefined" && typeof window.addEventListener === "function") window.addEventListener("online", this.onOnline);
+      this.lastAppendAt = Date.now();
+      this.watchdogTimer = setInterval(this.watchdog, WATCHDOG_MS);
+
+      // Started, not waited for. Filling runs until there is a comfortable amount of media, and
+      // waiting for that before declaring the player ready makes the whole session hostage to it:
+      // a browser that accepts segments and keeps nothing from them leaves the depth at zero, the
+      // loop reading the film from end to end, and the viewer looking at a spinner that has no
+      // reason to ever stop. The element reports its own readiness, and the controls show the wait.
+      void this.fill();
+    } catch (error) {
+      // Each step of destroy() is guarded or optional, so tearing a half-open source down cannot
+      // replace the error that names why the file would not open.
+      this.destroy();
+      throw error;
+    }
+  }
+
+  /** The clock moved: the guard decides what that means, the source reads on. */
+  private readonly request = () => {
+    this.guard.clockTicked();
+    void this.fill();
+  };
+
+  /**
+   * A clock is only frozen relative to the last time the element said it was running.
+   *
+   * Both events reset it, and both matter: `play` is fired the moment playback is *asked* for,
+   * `playing` when it actually gets going, and between the two sits the whole of the resume
+   * machinery putting the position back where the viewer left it. Counting through that window
+   * meant the frozen-clock check could push the playhead of an element that had just been handed
+   * back — which is precisely what that machinery spends its time getting right.
+   */
+  private readonly onResumed = () => {
+    this.clock.frozenSince = null;
+    this.clock.lastClockAt = -1;
+  };
+
+  /** `playing` : l'élément repart vraiment — `play` n'est que la demande. */
+  private readonly onPlaying = () => {
+    this.onResumed();
+    this.clock.lastPlayingAt = Date.now();
+    this.clock.settleOpeningReassert();
+    this.clock.armOpeningGracePush();
+  };
+
+  private readonly onPlay = () => {
+    this.onResumed();
+    this.guard.playing();
+    void this.fill();
+  };
+
+  private readonly onElementError = () => {
+    trace(`l'élément a échoué : ${this.elementState()}`);
+    this.noteLoss();
+  };
+
+  private readonly onSourceClosed = () => {
+    trace(`la MediaSource s'est fermée — ${this.elementState()}`);
+    this.noteLoss();
+  };
+
+  private noteLoss(): void {
+    this.loss.noteLoss();
+  }
+
+  /**
+   * L'image clé indexée qui suit cet instant (au moins une demi-seconde après), sur l'horloge du lecteur, juste dans
+   * son groupe (`NEXT_KEYFRAME_MARGIN`), ou null — sans index, ou trop près de la fin. Où rouvrir après une perte
+   * répétée au même endroit (`PlayerLifecycle.sourceLost`) : une image abîmée dans le fichier (enquête du 17/11/2026,
+   * *Game of Thrones* S05E10 et S01E01) se décode mal à chaque passage, et le groupe suivant n'en dépend pas. Le même
+   * calcul que l'échelle de reprise (`RecoveryLadder.nextKeyframeAfter`). Ne lève jamais : sur le chemin d'une panne.
+   */
+  nextKeyframeAfter(playerSeconds: number): number | null {
+    try {
+      if (!this.remuxer.seekable) return null;
+      const fileSeconds = this.remuxer.keyframeAfter(this.toFileClock(playerSeconds) + 0.5);
+      if (fileSeconds === null) return null;
+      const next = fileSeconds + this.delaySeconds + NEXT_KEYFRAME_MARGIN;
+      return next < this.playerEnd - 1 ? next : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Comment le saut vers `target` a été servi — `mémoire`, `devant` ou `complet` —, ou null : servi
+   * pour une autre cible (un geste plus récent, ou celui-ci pas encore servi), ou refusé. Pour la
+   * ligne `seek` ; ne lève jamais.
+   */
+  seekPathFor(target: number): SeekServed | null {
+    const served = this.lastServed;
+    return served && Math.abs(served.target - target) < 0.05 ? served : null;
+  }
+
+  /** Voir `LossRecord.lossReport`. */
+  lossReport(): Record<string, unknown> {
+    return this.loss.lossReport();
+  }
+
+  private readonly onSeeking = () => {
+    if (this.destroyed) return;
+    const target = this.video.currentTime;
+    this.seekState.started(target, Date.now());
+    // This object's own move, already being served — serving it again would clear the buffers
+    // it is in the middle of refilling.
+    if (this.seekState.isOwnMove(target)) return void this.fill();
+    // L'état des deux tampons au moment du geste (24/09/2026). Trois sauts de +10 s « dans le
+    // chargé » ont trouvé, 0,7 s plus tard, la cible sans média — et rien ne disait si elle
+    // l'avait vraiment été, ni dans quel tampon : la trace du saut le dit maintenant.
+    trace(`saut de l'élément vers ${target.toFixed(1)} s — vidéo ${spansNear(this.videoBuffer, target)} · audio ${this.audioBuffer ? spansNear(this.audioBuffer, target) : "aucun"}`);
+    // A deliberate move settles the question of where playback belongs — et c'est vrai aussi d'un
+    // saut dans ce qui est déjà chargé. Oublié sur ce raccourci jusqu'au 22/09/2026 : pause, saut
+    // en avant, Lecture, et la garde ramenait la tête à sa position de pause.
+    this.guard.forgetPause();
+    // A step inside what is already buffered needs no work from the file at all — sauf si un saut
+    // précédent est encore en cours : il va vider ces tampons et poser la tête sur sa propre cible,
+    // et ce geste-ci, le dernier, disparaissait dessous. Un doigt qui repasse sur une zone encore
+    // chargée pendant une rafale se retrouvait ramené à l'avant-dernière position (trouvé par le
+    // fuzz le 24/09/2026, graine 30054481). Par la voie normale, le dernier geste l'emporte.
+    if (this.isBufferedAt(target) && this.seekState.requested === null) {
+      this.lastServed = { target, path: "mémoire", keptS: null };
+      return void this.fill();
+    }
+    // À moins d'une image avant le début de ce qui est chargé : la tête est posée sur ce début plutôt
+    // que de tout relire (28/10/2026). Après un saut, la zone chargée commence à l'image clé de son
+    // arrivée, et un « −10 s » qui retombe dessus la manquait de quelques millisecondes — l'audio
+    // y commence 30 ms avant l'image (Braveheart sur Firefox, au banc) — : un saut complet, 1,2 à
+    // 1,5 s d'attente en 4K, pour une image d'écart. Ce n'est pas un saut calé sur une image clé :
+    // la cible ne bouge que d'une image au plus, et seulement vers du média déjà là. Le `seeking`
+    // que ce déplacement provoque repasse ici, sur du chargé.
+    if (this.seekState.requested === null) {
+      const edge = startJustAfter(this.playable, target, ONE_FRAME_S);
+      if (edge !== null) {
+        trace(`saut à ${Math.round((edge - target) * 1000)} ms du chargé — posé sur son début (${edge.toFixed(2)} s)`);
+        this.lastServed = { target, path: "mémoire", keptS: null };
+        this.video.currentTime = edge;
+        return;
+      }
+    }
+    void this.seek(target);
+  };
+
+  /**
+   * What the element can actually play.
+   *
+   * Not the video buffer's own ranges: an element plays only where *every* track it is using has
+   * media, and the media element reports precisely that intersection. Audio after a seek starts
+   * consistently a fraction of a second later than video, so measuring the video buffer alone is
+   * optimistic by exactly that much — it reports the playhead as covered while the element is
+   * still waiting for sound.
+   */
+  private get playable(): TimeRanges {
+    return this.video.buffered;
+  }
+
+  /**
+   * Une position du lecteur sur l'horloge du fichier — celle de `Remuxer.seekTo`, de
+   * `keyframeAtOrBefore` et de `readUpTo`. Écrite à la main sept fois avant le 22/10/2026 ; c'est
+   * précisément la conversion que « trois écrivains sur quatre » s'étaient trompés de sens (voir
+   * `readUpTo`).
+   */
+  private toFileClock(playerSeconds: number): number {
+    return Math.max(0, playerSeconds - this.delaySeconds);
+  }
+
+  /** La fin du film sur l'horloge du lecteur ; sans durée connue, aucune. */
+  private get playerEnd(): number {
+    return this.plan.durationSeconds > 0 ? this.plan.durationSeconds + this.delaySeconds : Infinity;
+  }
+
+  /** How far the playhead is from the nearest media, or 0 when it is standing on some. */
+  private distanceToMedia(seconds: number): number {
+    const ranges = this.playable;
+    if (ranges.length === 0) return Infinity;
+    if (rangeAround(ranges, seconds, 0) >= 0) return 0;
+    let best = Infinity;
+    for (let i = 0; i < ranges.length; i++) {
+      best = Math.min(best, Math.abs(ranges.start(i) - seconds), Math.abs(ranges.end(i) - seconds));
+    }
+    return best;
+  }
+
+  private isBufferedAt(seconds: number): boolean {
+    return this.distanceToMedia(seconds) === 0;
+  }
+
+  /** True while the system wants data. Plain MediaSource has no such signal, so it always does. */
+  private get streamingWanted(): boolean {
+    const managed = this.source as ManagedMediaSource;
+    return typeof managed.streaming === "boolean" ? managed.streaming : true;
+  }
+
+  /**
+   * Où le lecteur travaille — la tête, ou la position qu'elle n'a pas encore rejointe.
+   *
+   * Tout ce qui mesure « ce qu'on a d'avance » partait de `currentTime`, ce qui était juste tant
+   * que la tête était toujours là où le film s'ouvre. Une ouverture en cours de film envoie
+   * maintenant son média *avant* de déplacer la tête — c'est ce qui évite à WebKit un `seeking`
+   * qu'il ne résout jamais (voir `pendingStart`). Pendant ces quelques centaines de
+   * millisecondes, la tête est à zéro et le média arrive à 1200 s : mesurée depuis la tête,
+   * l'avance vaut donc zéro segment après segment.
+   *
+   * Deux conclusions fausses en découlaient, et les deux ramenaient le film à son début : le
+   * détecteur de segments sans effet concluait que le navigateur ne retenait rien, et le contrôle
+   * d'égarement, que le lecteur remplissait un endroit où personne n'était. « Reprendre »
+   * repartait de zéro — deux fois sur trois, selon la vitesse à laquelle l'élément publie ses
+   * plages.
+   */
+  private get anchor(): number {
+    return this.pendingStart ?? this.video.currentTime;
+  }
+
+  /** How much media sits between the playhead and the end of its own run. */
+  private get lead(): number {
+    return this.bufferedEnd() - this.anchor;
+  }
+
+  /**
+   * Jusqu'où chaque tampon, pris seul, couvre la tête — additionné.
+   *
+   * La profondeur jouable est l'*intersection* des deux tampons. Quand la piste audio s'arrête
+   * avant l'image — un générique muet, une piste plus courte que le film —, cette intersection ne
+   * grandit plus alors que l'image, elle, continue d'arriver sous la tête : huit segments plus
+   * tard, la boucle concluait que le navigateur ne retenait rien, et le film était reconstruit au
+   * lieu de finir (relu le 23/09/2026). Seule la plage *sous la tête* compte, tampon par tampon :
+   * du média posé ailleurs n'est pas un progrès, et reste ce que la garde doit attraper.
+   */
+  private laneProgress(): number {
+    const now = this.anchor;
+    let total = 0;
+    for (const ops of [this.videoOps, this.audioOps]) {
+      try {
+        const ranges = ops?.buffer.buffered;
+        if (!ranges) continue;
+        for (let i = 0; i < ranges.length; i++) {
+          if (ranges.start(i) <= now + 0.1 && now < ranges.end(i)) total += ranges.end(i);
+        }
+      } catch {
+        // Tampon retiré de sa source : il ne progresse plus.
+      }
+    }
+    return total;
+  }
+
+  /**
+   * How far the media runs on from the playhead without a gap.
+   *
+   * The range containing the playhead, not simply the last one. After a seek backwards there can
+   * be a later range left over, and measuring against that would report a deep buffer while the
+   * playhead sits in front of nothing at all — the player would then quietly stop fetching.
+   */
+  private bufferedEnd(): number {
+    const ranges = this.playable;
+    const now = this.anchor;
+    const i = rangeAround(ranges, now, 0.1);
+    return i >= 0 ? ranges.end(i) : now;
+  }
+
+  private fill(): Promise<void> {
+    // Held onto rather than merely guarded against. A seek must wait for a read already in
+    // flight: moving the reader out from under it would leave the demuxer mid-cluster. The
+    // earlier version only refused to start a second loop, so a seek's own refill could return
+    // immediately without doing anything and playback would sit there waiting.
+    if (this.fillTask) return this.fillTask;
+    this.fillTask = this.runFill().finally(() => {
+      this.fillTask = null;
+    });
+    return this.fillTask;
+  }
+
+  private async runFill(): Promise<void> {
+    // Une zone illisible : le lecteur de fichier est resté devant elle, et il n'y a rien d'autre à lire.
+    if (this.destroyed || this.ended || this.networkHold || this.networkGaveUp || this.zones.zone || this.zones.zoneHanded) return;
+    // À chaque battement d'horloge aussi, pas seulement après un envoi : une avance bornée par la
+    // place du son (`audioRoom`) n'envoie plus rien, et l'arrière qui la bornait ne serait alors
+    // retiré qu'une fois l'avance tombée au plancher.
+    this.trimBehind();
+    const generation = this.generation;
+    // Media accepted but not retained leaves the depth where it was. A handful of segments that
+    // change nothing is a browser quietly discarding what it is given, and reading the rest of
+    // the film to find that out is the worst possible answer.
+    let deepestSoFar = this.bufferedEnd();
+    let furthestLanes = this.laneProgress();
+    let fruitless = 0;
+
+    try {
+      while (!this.destroyed && this.generation === generation) {
+        const lead = this.lead;
+        // Sauf pendant un ajout devant (`performSeek`) : l'avance gardée remplit la cible dès que
+        // l'ajout touche le chargé, mais le groupe d'images qui l'ouvre reste à relire jusqu'à la
+        // borne — sans quoi le raccord, et la licence d'atterrissage qui l'attend, n'arriveraient
+        // qu'une fois l'avance consommée. Borné : l'écart et un groupe d'images.
+        if (lead >= this.aheadTarget && !this.remuxer.stopAhead) break;
+        // Above the floor the system's word is final; below it, the media is needed to play at
+        // all and a refusal would strand the player with an empty buffer and a spinner.
+        if (lead >= MIN_BUFFER_SECONDS && !this.streamingWanted) break;
+        // A seek is waiting. Reading thirty more seconds of a place the viewer has already left
+        // is what makes a second seek feel like it does nothing for several seconds.
+        if (this.seekState.requested !== null) break;
+
+        const builtFrom = diagNow();
+        const segment = await this.remuxer.nextSegment();
+        diagInterval("segment", builtFrom);
+        if (this.generation !== generation || this.destroyed || this.networkGaveUp) break;
+        // La borne d'un ajout devant (`performSeek`), pas la fin du fichier : la suite est déjà là.
+        // D'ordinaire vue avec le dernier segment, plus bas ; ici, une borne trouvée sans rien avant.
+        if (!segment && this.remuxer.stoppedShort) {
+          this.joinKept();
+          continue;
+        }
+        if (this.appendsTraced < TRACED_APPENDS) {
+          this.appendsTraced++;
+          trace(
+            segment
+              ? `segment ${this.appendsTraced} construit — jusqu'à ${segment.endSeconds.toFixed(1)} s, ` +
+                  `${segment.video.reduce((n, f) => n + f.byteLength, 0)} o vidéo en ` +
+                  `${segment.video.length} fragment(s), ${segment.audio?.byteLength ?? 0} o audio`
+              : "le remultiplexeur ne produit plus de segment (fin du fichier)"
+          );
+        }
+
+        if (!segment) {
+          this.ended = true;
+          // Through the queue, for the same reason as the duration above: ending a stream while
+          // a buffer is updating throws, and here the throw would be read as a refused append —
+          // the film would be recovered from, at its own end, instead of simply finishing.
+          //
+          // Et après la file du son : `endOfStream` lève si *l'un ou l'autre* tampon travaille, et
+          // un retrait derrière la tête (`trimBehind`, `evict`) n'est jamais attendu — il pouvait
+          // encore occuper le tampon du son. L'erreur était avalée, `ended` déjà vrai, et rien ne
+          // réessayait : le flux pouvait ne jamais être déclaré fini (relevé le 27/09/2026,
+          // docs/cycle-de-vie-lecteur.md). Une opération vide dans sa file attend qu'il soit libre.
+          if (this.audioOps) await this.audioOps.enqueue(() => {}).catch(() => {});
+          if (this.generation !== generation || this.destroyed) break;
+          if (this.videoOps) await this.videoOps.enqueue(() => this.endStream()).catch(() => this.endStream());
+          else this.endStream();
+          this.reseekAfterEnd();
+          break;
+        }
+
+        // The delay is only known once the first segment has been built, and the duration has to
+        // account for it: the media now ends that much later than the file does.
+        if (this.delaySeconds === 0) {
+          this.delaySeconds = this.remuxer.diagnostics().presentationDelaySeconds;
+          const duration = this.plan.durationSeconds + this.delaySeconds;
+          // Guarded rather than assumed. Setting a MediaSource's duration throws outright while
+          // any of its buffers is updating, and eviction queues a removal without waiting for
+          // it — so this could land in that window and abort a fill loop that had nothing wrong
+          // with it. What it costs when it fails is the far end of the scrub bar, briefly.
+          if (this.source.readyState === "open" && duration > 0 && Number.isFinite(duration)) {
+            try {
+              this.source.duration = duration;
+            } catch {
+              // Busy. The next segment sets it, and nothing depends on it being set now.
+            }
+          }
+        }
+
+        if (segment.subtitles.length > 0) this.callbacks.onSubtitles?.(segment.subtitles);
+
+        // Première relecture après une coupure gardée : ce segment recommence à l'image clé qui
+        // précède l'endroit où la lecture s'était arrêtée, sur du média déjà là. Ce qu'il va
+        // remplacer est retiré d'abord — jamais deux fois les mêmes images dans le tampon, ce qui
+        // n'arrive nulle part ailleurs dans ce lecteur — et tout ce qui précède reste.
+        // Lu avant d'être effacé : ce segment relu n'entre pas dans la mesure du débit, plus bas.
+        const reread = this.trimBeforeNextAppend;
+        if (this.trimBeforeNextAppend) {
+          this.trimBeforeNextAppend = false;
+          const from = this.remuxer.diagnostics().segmentStartSeconds + this.delaySeconds;
+          // Le groupe relu commence sous la tête ou juste devant : le retirer enlèverait l'image en
+          // cours — un groupe de 25 s, ou un nouvel essai tardif qui a vu l'avance fondre. Garder le
+          // tampon n'a alors plus d'objet : la reprise habituelle, comme avant ce mécanisme.
+          if (from < this.video.currentTime + NETWORK_TRIM_MARGIN_SECONDS) {
+            trace(`coupure réseau : le groupe relu commence à ${from.toFixed(2)} s, sous la tête — reprise habituelle`);
+            this.recover(this.anchor);
+            break;
+          }
+          trace(`coupure réseau : relecture depuis ${from.toFixed(2)} s, le tampon d'avant est gardé`);
+          for (const queue of [this.videoOps, this.audioOps]) {
+            if (queue) await this.clearFrom(queue, from);
+          }
+          if (this.generation !== generation || this.destroyed) break;
+          // La profondeur vient de reculer au début du groupe relu : mesurée contre celle d'avant
+          // le retrait, la relecture d'un long groupe passait pour « rien retenu ».
+          deepestSoFar = this.bufferedEnd();
+          furthestLanes = this.laneProgress();
+          fruitless = 0;
+        }
+
+        if (this.videoOps) {
+          // One call per fragment. Handing over a whole keyframe group at once is what this
+          // splitting exists to stop — see Remuxer.fragmentise — so joining them back together
+          // here would undo all of it.
+          for (const fragment of segment.video) {
+            await this.appendTo(this.videoOps, fragment, generation);
+            if (this.generation !== generation || this.destroyed) break;
+          }
+        }
+        if (segment.audio && this.audioOps) await this.appendTo(this.audioOps, segment.audio, generation);
+        // A seek arrived while those were in flight: this loop's appends were discarded, so its
+        // reading of where the media is would be about a position no longer being served.
+        if (this.generation !== generation || this.destroyed) break;
+
+        // Le débit de ce segment, pour le budget en octets : ce qui vient d'être envoyé, sur la durée
+        // qu'il couvre depuis la fin du précédent.
+        // Pas le premier après un saut ou une ouverture : il repart de l'image clé d'avant la cible,
+        // et sa durée comptée depuis la cible gonflerait le débit.
+        // Ni le premier relu (`reread`) après une éviction ou une coupure gardée, pour la même
+        // raison : `readUpTo` est alors le trou (`refillEvicted`), qui tombe n'importe où dans le
+        // segment. Ses octets couvraient tout le segment, sa durée seulement ce qui suit le trou —
+        // un débit ×2,5 à ×10 qui, dans la fenêtre de `ByteRate`, pouvait diviser par deux l'avance
+        // visée sur WebKit pendant une douzaine de segments, juste après une éviction (audit du
+        // 22/10/2026). `appendsSinceSeek` n'est pas remis à zéro pour autant : il règle aussi le
+        // nombre de traces après un saut.
+        if (this.appendsSinceSeek > 0 && !reread) {
+          const covered = segment.endSeconds - this.readUpTo;
+          this.videoRate.record(segment.video.reduce((n, f) => n + f.byteLength, 0), covered);
+          if (segment.audio) this.audioRate.record(segment.audio.byteLength, covered);
+        }
+        this.readUpTo = segment.endSeconds;
+        // Le dernier segment d'un ajout devant : le remultiplexeur a fermé son groupe sur la borne. Le
+        // raccord se fait tout de suite, pas au prochain tour — l'avance gardée remplit déjà la cible,
+        // et la boucle s'arrêterait avant de le demander.
+        if (this.remuxer.stoppedShort) this.joinKept();
+        this.trimBehind();
+        // Avant le reste : tant que la tête n'est pas posée, il n'y a ni atterrissage à faire ni
+        // démarrage à réclamer.
+        this.placePendingStart();
+        this.guard.nudgeIntoBuffer();
+        // La tête vient peut-être d'atterrir : le départ retenu regarde si son image est là.
+        this.startHold?.check();
+        this.lastAppendAt = Date.now();
+
+        if (this.seekNetworkPending) {
+          this.seekNetworkPending = false;
+          // La première image du saut est là : la lecture en avance reprend en entier.
+          this.remuxer.seekSettled?.();
+          // Mesure seulement : jamais sur le chemin d'une lecture.
+          try {
+            const network = this.remuxer.networkSinceSeek?.();
+            if (network) trace(`réseau depuis le saut : ${describeNetwork(network)}`);
+          } catch {
+            /* rien */
+          }
+        }
+        const depth = this.bufferedEnd();
+        if (++this.appendsSinceSeek <= TRACED_APPENDS_PER_SEEK) {
+          trace(`après envoi : tampon jusqu'à ${depth.toFixed(1)} s, tête à ${this.video.currentTime.toFixed(1)} s`);
+        }
+        // There is something to play now, which there was not when the element was first asked
+        // to. Only acts on a start the element abandoned; a viewer's own pause is left alone.
+        // À chaque envoi, et non plus au rythme de la trace : les deux étaient liés par accident.
+        // Sauf pendant que le départ d'une ouverture depuis le début est retenu : relancé ici, il
+        // partirait avant son image, ce que la retenue existe pour éviter (`OpeningStartHold`).
+        if (!this.startHold?.holding) this.guard.mediaArrived();
+        const lanes = this.laneProgress();
+        if (depth > deepestSoFar + 0.01 || lanes > furthestLanes + 0.01) {
+          deepestSoFar = Math.max(deepestSoFar, depth);
+          furthestLanes = Math.max(furthestLanes, lanes);
+          fruitless = 0;
+        } else if (
+          segment.endSeconds + this.delaySeconds <= this.anchor &&
+          this.anchor - (segment.endSeconds + this.delaySeconds) <= PRE_ROLL_SECONDS
+        ) {
+          // Encore avant la cible : un saut repart de l'image clé qui la précède, parfois de douze
+          // secondes plus tôt quand l'index ment (voir `Remuxer.backUp`), et ce média-là ne couvre
+          // pas la tête — il n'a pas à le faire. Compté, il faisait conclure que le navigateur ne
+          // retenait rien avant même d'avoir atteint la cible (relu le 24/09/2026). La lecture
+          // d'avance est bornée par le remultiplexeur ; au-delà de la cible, la garde reprend.
+        } else if (++fruitless >= FRUITLESS_APPENDS) {
+          throw new Error(
+            `Le navigateur n'a rien retenu des ${FRUITLESS_APPENDS} segments qui lui ont été envoyés. ${this.elementState()}`
+          );
+        }
+
+        // The reader is filling a place the viewer is not. Something failed to tell us they
+        // moved — an event that did not fire, a seek that did not reach here — and the reader
+        // would otherwise read its way there one segment at a time, which is exactly what a
+        // seek looks like when it appears to recalculate the whole film. The watchdog cannot
+        // catch this on its own: media *is* arriving, just nowhere useful.
+        // An empty buffer is not a misplaced reader.
+        //
+        // `distanceToMedia` answers Infinity when nothing is buffered, and nothing is buffered
+        // for a moment after every seek — the element's ranges are the
+        // *intersection* of the two buffers, so emptying the audio one empties them entirely.
+        // Read as a distance, that is "infinitely far from the media", and this fired a recovery
+        // at the exact moment the loop was already fetching what was missing. Each recovery is a
+        // fresh seek, which empties the buffers again, which fires another: three recoveries in
+        // nine seconds, and Safari closes the source. Only media that exists and is genuinely
+        // far away means the reader is in the wrong place.
+        //
+        // Et rien de tout cela ne s'applique tant que la tête n'a pas été posée. Une ouverture en
+        // cours de film demande son média *avant* de déplacer la tête — c'est ce qui évite à
+        // WebKit de rester bloqué sur un `seeking` qu'il ne résout plus (voir `pendingStart`). Le
+        // média est alors loin de la tête par construction, pendant les quelques dizaines de
+        // millisecondes qui séparent le premier envoi de la première plage tamponnée visible.
+        // Lu comme un égarement, ce délai déclenchait un saut vers la tête, c'est-à-dire vers
+        // zéro : on cliquait « Reprendre », le remultiplexeur ouvrait bien à 1315 s, et le film
+        // repartait du début. Deux fois sur trois, selon la vitesse à laquelle l'élément publie
+        // ses plages — d'où une reprise qui semblait marcher « quand elle voulait ».
+        // Et rien de tout cela tant que la tête n'a pas atterri : le lecteur remplit alors vers
+        // une position que personne n'occupe encore, par construction, et `placePendingStart` l'y
+        // posera dès que le média la couvrira. Il n'y a rien à récupérer, seulement à attendre.
+        //
+        // Ni pendant un saut dont le lecteur approche encore : il repart de l'image clé qui précède
+        // la cible, et quand le groupe d'images est plus long que `MISPLACED_SECONDS`, le premier
+        // média arrive loin *derrière* la tête par construction. *WALL·E* (28/09/2026, iPhone) : un
+        // générique en un seul groupe de 35 s, un saut à la dernière seconde ; chaque envoi lisait
+        // « média à 32.9 s de la tête », chaque reprise relançait la lecture depuis la même image
+        // clé, trois fois, puis l'abandon laissait la tête sur une image jamais envoyée —
+        // chargement sans fin au lieu de l'écran de fin. Même borne que la garde « rien retenu ».
+        const approaching =
+          this.video.seeking &&
+          segment.endSeconds + this.delaySeconds <= this.anchor &&
+          this.anchor - (segment.endSeconds + this.delaySeconds) <= PRE_ROLL_SECONDS;
+        const distance = this.pendingStart !== null || approaching ? 0 : this.distanceToMedia(this.anchor);
+        if (Number.isFinite(distance) && distance > MISPLACED_SECONDS) {
+          trace(
+            `reprise : média à ${distance.toFixed(1)} s de la tête (${this.anchor.toFixed(1)} s), ` +
+              `lecteur à ${this.readUpTo.toFixed(1)} s — vidéo ${spansNear(this.videoBuffer, this.anchor)} · ` +
+              `audio ${this.audioBuffer ? spansNear(this.audioBuffer, this.anchor) : "aucun"}`
+          );
+          // Vers la cible du saut en cours s'il y en a un, pas vers la tête partie ailleurs : c'était
+          // une relecture pour rien, suivie de celle vers la cible (22/09/2026).
+          if (this.recover(this.seekState.intent?.target ?? this.anchor)) break;
+        }
+      }
+    } catch (error) {
+      if (this.destroyed) return;
+      // Une zone illisible (§93) : ni segment refusé ni panne réseau, et aucune reprise — relire le
+      // même endroit relirait les mêmes zéros, trois fois. Ce qui est déjà là se joue ; la main
+      // passe au lecteur serveur à la fin de ce qui est sûr.
+      if (isUnreadableZone(error)) {
+        if (this.generation === generation) this.zones.holdAtZone(error);
+        return;
+      }
+      // Une lecture coupée par un saut : ce n'est pas un segment refusé, et il n'y a rien à
+      // reprendre — le saut qui l'a coupée repositionne tout derrière.
+      if (isReadAbandoned(error)) return;
+      if (this.networkGaveUp) return;
+      // Une coupure en pleine lecture (§97) : tenue, bornée par le temps — jamais l'échelle des
+      // envois refusés, qui relançait la patience d'une minute à chaque reprise. Avant la première
+      // image de ce pipeline, l'ouverture garde son chemin d'avant : l'hôte a le sien (35 s, §77/§78).
+      if (isNetworkFailure(error) && this.clock.lastPlayingAt > 0) {
+        this.holdThroughOutage(generation, error);
+        return;
+      }
+      if (isNetworkFailure(error) && this.keepThroughNetworkFailure(generation)) return;
+      // Reported by the viewer as a freeze that a second seek or a language change undoes — so
+      // nothing was actually lost, and declaring playback over was the wrong answer. A refused
+      // append is retried from where the playhead is; only a run of them is a real fault.
+      this.appendFailures += 1;
+      if (this.appendFailures <= MAX_APPEND_FAILURES && this.recover(this.anchor)) {
+        // Traced, not shown. The viewer saw nothing: the segment was fetched again and the film
+        // did not stop. A banner here interrupts somebody to tell them about a problem that has
+        // already been solved — the record is the right place for it.
+        trace(`segment refusé, repris — ${this.elementState()}`);
+        return;
+      }
+      // Déjà passée à l'hôte (`handOver`), qui reconstruit : une seconde erreur lancerait une
+      // seconde reconstruction par-dessus la première.
+      if (this.stuck) return;
+      const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+      this.callbacks.onError(`${detail} ${this.elementState()}`, isNetworkFailure(error) ? "network" : "playback");
+    }
+  }
+
+  private async appendTo(queue: BufferQueue, data: Uint8Array, generation: number): Promise<void> {
+    if (this.destroyed || this.generation !== generation) return;
+    try {
+      const sentFrom = diagNow();
+      await queue.enqueue(() => queue.buffer.appendBuffer(data as BufferSource));
+      diagInterval("append", sentFrom, data.byteLength);
+      // Pour le journal d'une perte seulement — voir `lastGoodBuffered`, `sentFragments`.
+      const video = queue === this.videoOps;
+      if (video) this.loss.rememberFragment(data);
+      this.loss.rememberBuffered(video ? "envoi vidéo" : "envoi audio");
+      this.appendFailures = 0;
+      this.networkRetries = 0;
+      if (this.outageHold) {
+        this.outageHold = false;
+        trace("coupure réseau : le média arrive de nouveau");
+      }
+    } catch (error) {
+      // The buffer is full rather than broken: drop what is behind the playhead and try again.
+      //
+      // « Again » ne se faisait pas : le segment refusé était perdu, le lecteur passait au suivant,
+      // et le tampon gardait un trou que la lecture trouvait plus tard — un arrêt sur image sans
+      // cause visible (relu le 23/09/2026). L'erreur remonte donc, une fois la place faite, jusqu'à
+      // la reprise de la boucle, qui relit depuis la tête : le segment perdu est demandé à nouveau,
+      // et une série de refus finit comme n'importe quelle série de segments refusés.
+      if (error instanceof DOMException && error.name === "QuotaExceededError") this.quotaHit();
+      throw error;
+    }
+  }
+
+  /**
+   * Un retrait de ce lecteur, compté le temps qu'il dure — voir `onBufferedChange`.
+   *
+   * Compté dans l'opération elle-même, pas à la mise en file : un retrait qui attend derrière un
+   * envoi ne doit pas couvrir une éviction faite *pendant* cet envoi, qui est justement le moment
+   * où le navigateur fait de la place.
+   */
+  private removeRange(queue: BufferQueue, from: number, to: number): Promise<void> {
+    const buffer = queue.buffer;
+    let started = false;
+    const removal = queue.enqueue(() => {
+      started = true;
+      this.ownRemovals.set(buffer, (this.ownRemovals.get(buffer) ?? 0) + 1);
+      buffer.remove(from, to);
+    });
+    // Une branche à part, pour le journal d'une perte (`lastGoodBuffered`) : la promesse rendue
+    // garde exactement son enchaînement, et un retrait refusé ne relève rien.
+    removal.then(
+      () => this.loss.rememberBuffered("retrait"),
+      () => {}
+    );
+    return removal
+      .finally(() => {
+        if (started) this.ownRemovals.set(buffer, Math.max(0, (this.ownRemovals.get(buffer) ?? 1) - 1));
+      });
+  }
+
+  /**
+   * Écoute ce que le navigateur retire de lui-même (24/09/2026).
+   *
+   * ManagedMediaSource — Safari, sur iPhone comme sur Mac — a le droit de retirer du média d'un
+   * tampon quand la mémoire manque, et le dit par `bufferedchange` avec les plages retirées. Rien
+   * ne l'écoutait : trois sauts ont trouvé leur cible vidée sans qu'on puisse dire si c'était le
+   * système ou ce lecteur. Les MediaSource ordinaires n'ont pas cet événement, ni ce droit.
+   */
+  private watchEvictions(buffer: SourceBuffer, lane: "vidéo" | "audio"): void {
+    if (!("onbufferedchange" in buffer)) return;
+    const listener: EventListener = (event) => this.onBufferedChange(buffer, lane, event as BufferedChangeEvent);
+    buffer.addEventListener("bufferedchange", listener);
+    this.evictionListeners.push([buffer, listener]);
+  }
+
+  private onBufferedChange(buffer: SourceBuffer, lane: "vidéo" | "audio", event: BufferedChangeEvent): void {
+    // Jamais sur le chemin d'une lecture : ce n'est qu'une écoute.
+    try {
+      if (this.destroyed) return;
+      const removed = event.removedRanges;
+      if (!removed || removed.length === 0) return;
+      // Nos propres retraits — un saut, la place faite derrière la tête — sont déjà dans la trace.
+      if ((this.ownRemovals.get(buffer) ?? 0) > 0) return;
+      const head = this.anchor;
+      const spans: string[] = [];
+      let aheadFrom = Infinity;
+      for (let i = 0; i < removed.length; i++) {
+        const start = removed.start(i);
+        const end = removed.end(i);
+        if (spans.length < 4) spans.push(`${start.toFixed(2)}–${end.toFixed(2)}`);
+        // Devant la tête, ou sous elle : ce que la lecture va chercher.
+        if (end > head + 0.1) aheadFrom = Math.min(aheadFrom, Math.max(start, head));
+      }
+      const ahead = Number.isFinite(aheadFrom);
+      this.evictions += 1;
+      if (ahead) this.evictionsAhead += 1;
+      trace(
+        `le navigateur a retiré ${lane} ${spans.join(" · ")} — tête à ${head.toFixed(1)} s` +
+          (ahead ? `, devant elle dès ${aheadFrom.toFixed(1)} s` : "")
+      );
+      if (ahead) this.refillEvicted();
+    } catch {
+      /* rien */
+    }
+  }
+
+  /**
+   * Relit tout de suite ce que le navigateur a retiré devant la tête.
+   *
+   * Sans cela, on le découvrait au pire moment : la tête arrivait sur le trou et s'arrêtait, ou un
+   * saut « dans le chargé » tombait sur du vide — et le chien de garde reprenait après coup. Le
+   * trou commence là où le média s'interrompt devant la tête ; le lecteur y est renvoyé, et la
+   * suite est celle d'une coupure réseau gardée (`trimBeforeNextAppend`) : ce qui suit le trou est
+   * retiré puis relu d'un seul tenant, et un groupe relu qui commencerait sous la tête devient une
+   * reprise ordinaire.
+   */
+  private refillEvicted(): void {
+    if (this.evictionRefillQueued) return;
+    const now = Date.now();
+    this.evictionRefills = this.evictionRefills.filter((at) => now - at < 60_000);
+    if (this.evictionRefills.length >= EVICTION_REFILLS_PER_MINUTE) {
+      trace("retraits répétés : la relecture est laissée au remplissage ordinaire");
+      return;
+    }
+    this.evictionRefills.push(now);
+    this.evictionRefillQueued = true;
+    const generation = this.generation;
+    void (async () => {
+      // Le lecteur ne se déplace jamais sous une lecture en cours — voir `performSeek`.
+      try {
+        await this.fillTask?.catch(() => {});
+      } finally {
+        this.evictionRefillQueued = false;
+      }
+      // Un saut, une reprise, une coupure gardée ou une destruction entre-temps : ils
+      // repositionnent tout eux-mêmes.
+      if (this.destroyed || this.stuck || this.generation !== generation || this.networkHold) return;
+      if (this.seekState.requested !== null || this.pendingStart !== null) return;
+      const hole = this.bufferedEnd();
+      // Déjà relu, ou le trou est au-delà de ce qui avait été lu : rien à faire.
+      if (hole >= this.readUpTo + this.delaySeconds - 0.5) return;
+      if (hole <= this.video.currentTime + 0.1) {
+        trace(`relecture de ce que le navigateur a retiré : sous la tête, à ${this.anchor.toFixed(1)} s`);
+        if (!this.recover(this.anchor)) this.handOver(this.anchor);
+        return;
+      }
+      trace(`relecture de ce que le navigateur a retiré, depuis ${hole.toFixed(1)} s`);
+      this.remuxer.seekTo(this.toFileClock(hole));
+      // Sur l'horloge du fichier, comme la lecture qui vient de lui être demandée.
+      this.readUpTo = this.toFileClock(hole);
+      this.ended = false;
+      this.trimBeforeNextAppend = true;
+      void this.fill();
+    })();
+  }
+
+  private get budget(): BufferBudget | null {
+    return this.planner.budget;
+  }
+
+  private get aheadTarget(): number {
+    return this.planner.aheadTarget;
+  }
+
+  /**
+   * Retire nous-mêmes ce qui est derrière la tête au-delà du budget, au lieu de laisser WebKit
+   * choisir quoi jeter au milieu d'un envoi — souvent juste après un saut, pendant que la tête
+   * se déplace. Pas pendant un saut : la tête n'y est pas encore à sa place.
+   */
+  //
+  // Le son jusqu'à la limite exacte, lui : chacune de ses trames est une image clé, et rien de ce
+  // qui précède la tête n'emporte celle qu'on entend. Borné comme l'image à l'image clé de la tête,
+  // il gardait derrière lui tout un groupe — 28 s sur *Ford v Ferrari* — dans un plafond de 5,5 Mo.
+  private trimBehind(): void {
+    const budget = this.budget;
+    if (!budget || this.seekState.pending || this.video.seeking) return;
+    // Une source fermée (décodeur tombé sur iPhone, 21/10/2026) : `buffered` d'un tampon qui
+    // n'y est plus lève InvalidStateError, et la levée remontait de `runFill` en rejet non géré —
+    // une erreur navigateur au journal pour une panne que la reconstruction réparait déjà.
+    if (this.source.readyState === "closed") return;
+    // Et une source encore « open » dont les tampons sont déjà retirés (12/11/2026, iPhone, *The Circle* repris
+    // après 38 min en arrière-plan) : iOS reprend les tampons avant que la source ne se dise fermée, et la même
+    // levée repartait au journal comme erreur navigateur pendant que la reconstruction reprenait le film. Un
+    // élagage n'est qu'un ménage : il ne lève jamais.
+    try {
+      const wanted = this.video.currentTime - budget.behindSeconds;
+      for (const queue of [this.videoOps, this.audioOps]) {
+        const buffer = queue?.buffer;
+        if (!queue || !buffer || buffer.buffered.length === 0) continue;
+        const until = this.behindCut(queue, wanted, 0);
+        if (until <= 0) continue;
+        if (buffer.buffered.start(0) >= until - TRIM_SLACK_SECONDS) continue;
+        void this.removeRange(queue, 0, until).catch(() => {});
+      }
+    } catch {
+      // Un tampon retiré par la plateforme : la perte de la source est signalée par ailleurs (`lost`).
+    }
+  }
+
+  /**
+   * Un saut encore en cours quand la fin du flux est déclarée est relancé, au même endroit.
+   *
+   * Les films de Pixar de la bibliothèque finissent par ~30 s de son sans image (*WALL·E* : image
+   * jusqu'à 5904,8 s, son jusqu'à 5934,5 s ; *Là-haut* : 5767,8 / 5798,5). Là, seule la fin du flux
+   * rend la tête lisible : une MediaSource `ended` prolonge la dernière plage de chaque piste
+   * jusqu'à la plus tardive, et la queue sans image entre dans les plages de l'élément. Un saut
+   * demandé *après* la fin arrive en un instant ; un saut demandé *avant* — la dernière seconde,
+   * depuis le début du film — restait `seeking` pour toujours sur Safari, `readyState` à 4, média
+   * présent : WebKit ne réexamine pas un saut en cours quand les plages changent ainsi (28/09/2026,
+   * iPhone). Le réaffecter relance l'algorithme ; la cible est alors dans les plages, et
+   * `onSeeking` n'a rien à relire (`isBufferedAt`).
+   */
+  //
+  // Seulement si la cible est dans les plages — le seul cas où relancer sert —, et comme un geste
+  // de cette source (`expectOwnMove`) : `onSeeking` n'a alors rien à relire. Sans ces deux gardes,
+  // une cible hors des plages relançait un saut, qui relisait jusqu'à la fin, qui relançait… en
+  // boucle (relecture du 28/09/2026, prouvée par un test).
+  private reseekAfterEnd(): void {
+    try {
+      if (this.destroyed || !this.video.seeking) return;
+      const target = this.video.currentTime;
+      if (!this.isBufferedAt(target)) return;
+      trace(`fin du flux déclarée pendant un saut vers ${target.toFixed(1)} s — saut relancé sur place`);
+      this.seekState.expectOwnMove(target);
+      this.video.currentTime = target;
+    } catch {
+      /* le chien de garde reste là */
+    }
+  }
+
+  /** Declares the stream over, if it still can be. Never throws. */
+  private endStream(): void {
+    try {
+      if (this.source.readyState === "open") this.source.endOfStream();
+    } catch {
+      // Already ended, or torn down under us.
+    }
+  }
+
+  /**
+   * The browser has taken all it will hold.
+   *
+   * Two things follow, and only the first of them was being done. Media behind the playhead is
+   * dropped, which frees room — *unless* the playhead has not travelled far enough for there to
+   * be any, which in the first half-minute of a film is always. In that case every segment sent
+   * is refused and silently dropped, and after eight of them the fill loop concludes the browser
+   * is keeping nothing at all and hands the film away. The cause and the diagnosis would have
+   * had nothing to do with each other.
+   *
+   * So the target comes down instead, to a little less than what is actually being held. That is
+   * measured rather than guessed, it costs nothing on a browser that never refuses anything —
+   * which is every browser tested here — and it lasts only as long as this MediaSource.
+   */
+  private quotaHit(): void {
+    const held = this.lead;
+    this.evict();
+    // Rien devant la tête au moment du refus : ce n'est pas une mesure de ce que le navigateur
+    // peut tenir. Pris pour tel, un refus à 0 s ramenait la cible à huit secondes jusqu'à la fin
+    // du film (Mac, 24/09/2026, « tampon plein à 0.0 s : on vise 8 s pour ce fichier »).
+    if (held < 1) {
+      trace(`tampon plein à ${held.toFixed(1)} s devant la tête : cible gardée à ${this.targetBuffer} s`);
+      return;
+    }
+    const room = Math.max(MIN_BUFFER_SECONDS, Math.floor(held * 0.75));
+    if (room < this.targetBuffer) {
+      trace(`tampon plein à ${held.toFixed(1)} s : on vise ${room} s pour ce fichier`);
+      this.targetBuffer = room;
+    }
+  }
+
+  /**
+   * Jusqu'où retirer derrière la tête sans lui retirer son image.
+   *
+   * La norme MSE prolonge un `remove(0, until)` jusqu'à l'image clé qui suit `until` : si la tête
+   * est dans le même groupe d'images, tout ce groupe part avec, l'image sous la tête comprise —
+   * `buffered` passait de 0–30 à 20–30 pour un retrait jusqu'à 11,5 s, tête à 16 s, dans Chromium,
+   * Firefox et WebKit (banc du 25/09/2026). Avec des groupes de 28 s (*Ford v Ferrari*) ou 52 s
+   * (*1917*) et un budget de quelques secondes derrière, chaque envoi recoupait le groupe en cours :
+   * arrêts, relectures, puis saut à l'image clé suivante. Le retrait s'arrête donc un peu avant
+   * l'image clé qui ouvre le groupe de la tête ; l'image clé suivante de `until` est alors celle-là.
+   * Sans index, on ne sait pas où elle est : `unknown`.
+   */
+  private behindLimit(until: number, unknown: number): number {
+    if (until <= 0) return until;
+    try {
+      if (!this.remuxer.seekable) return unknown;
+      const file = this.remuxer.keyframeAtOrBefore(this.toFileClock(this.video.currentTime));
+      if (file === null) return 0;
+      return Math.min(until, file + this.delaySeconds - KEYFRAME_TRIM_MARGIN);
+    } catch {
+      return unknown;
+    }
+  }
+
+  /**
+   * Jusqu'où retirer derrière la tête dans ce tampon — la règle commune à `trimBehind` et `evict`.
+   *
+   * Le son jusqu'à `wanted` exactement, chacune de ses trames étant une image clé ; l'image jusqu'à
+   * l'image clé de la tête (`behindLimit`), ou `unknown` sans index. `evict` bornait les deux
+   * tampons à celle de l'image, que `trimBehind` avait quittée pour le son le 01/10/2026 : sur un
+   * refus de quota, le son gardait derrière lui tout le groupe de la tête, et rien n'en partait
+   * quand l'image n'avait rien à céder (borne ≤ 0) — `quotaHit` mesurait ensuite sa nouvelle cible
+   * sur un tampon encombré de son inutile (audit du 22/10/2026).
+   */
+  private behindCut(queue: BufferQueue, wanted: number, unknown: number): number {
+    return queue === this.audioOps ? wanted : this.behindLimit(wanted, unknown);
+  }
+
+  private evict(): void {
+    // Sans index, le plafond est atteint quand même : on retire comme avant, faute de mieux.
+    const wanted = this.video.currentTime - (this.budget?.behindSeconds ?? KEEP_BEHIND_SECONDS);
+    // Chaque tampon sa borne, et le `<= 0` testé pour chacun : celle de l'image ne dit rien de ce
+    // que le son peut céder. (Pas de `TRIM_SLACK_SECONDS` ici : sous un plafond plein, tout compte.)
+    const cuts = [this.videoOps, this.audioOps].flatMap((queue) => (queue ? [{ queue, until: this.behindCut(queue, wanted, wanted) }] : []));
+    const said = cuts.filter(({ until }) => until > 0).map(({ queue, until }) => `${queue === this.audioOps ? "son" : "image"} jusqu'à ${until.toFixed(1)} s`);
+    // Traced either way, including when there is nothing to free: whether this ever happens on a
+    // real device was, until now, unknowable from the record.
+    trace(`éviction demandée à ${this.video.currentTime.toFixed(1)} s — ${said.length === 0 ? "rien derrière la tête" : said.join(", ")}`);
+    for (const { queue, until } of cuts) {
+      const buffer = queue.buffer;
+      if (until <= 0 || !buffer || buffer.buffered.length === 0 || buffer.buffered.start(0) >= until) continue;
+      // Queued rather than fired at the buffer directly: eviction is triggered by a full buffer
+      // in the middle of an append, which is exactly when the buffer is busy.
+      void this.removeRange(queue, 0, until).catch(() => {});
+    }
+  }
+
+  /**
+   * Moves playback to a point on the *player's* clock. The remuxer works on the file's clock, so
+   * the presentation delay is taken off here and nowhere else.
+   */
+  seek(playerSeconds: number, because = "le viseur"): Promise<void> {
+    trace(`saut demandé vers ${playerSeconds.toFixed(1)} s (${because}) — tête à ${this.video.currentTime.toFixed(1)} s`);
+    // Coalesced, not queued. Dragging a scrub bar across a film asks to be in dozens of places;
+    // serving each in turn means every one of them is stale before its media arrives, and the
+    // picture never catches up with the finger.
+    this.seekState.request(playerSeconds);
+    // Tout de suite, sans attendre que le saut soit servi : les lectures réseau de la position
+    // quittée sont coupées, et celles du saut partent. Sans ça, le saut attendait la fin d'une
+    // lecture déjà inutile — jusqu'à deux secondes depuis un serveur lointain (22/09/2026).
+    // Gardé : une détection qui lève sur le chemin d'un saut ne doit pas devenir l'échec du saut.
+    if (this.remuxer.seekable) {
+      try {
+        this.remuxer.prepareSeek?.(this.toFileClock(playerSeconds));
+      } catch {
+        /* le saut se fera sans avance */
+      }
+    }
+    this.pending = this.pending
+      .then(() => {
+        const target = this.seekState.requested;
+        if (target === null || this.destroyed) return;
+        // Deliberately not cleared here. The flag is what tells the read loop to stop filling a
+        // place the viewer has left, and it has to stay up for as long as that is still true —
+        // which is until the reader has actually been moved, inside performSeek.
+        return this.performSeek(target);
+      })
+      .catch((error) => {
+        if (this.destroyed) return;
+        // Given the same second chance as a refused append, and for the same reason: a seek that
+        // lands on a buffer operation the browser declines has lost nothing that cannot be read
+        // again. Declaring playback over on the first one is what turned "one seek too many"
+        // into a dead player.
+        this.appendFailures += 1;
+        const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+        if (this.appendFailures <= MAX_APPEND_FAILURES && this.recover(this.anchor)) {
+          trace(`saut refusé, repris — ${detail}`);
+          return;
+        }
+        if (this.stuck) return;
+        this.callbacks.onError(`${detail} ${this.elementState()}`, isNetworkFailure(error) ? "network" : "playback");
+      });
+    return this.pending;
+  }
+
+  private async performSeek(requested: number): Promise<void> {
+    if (this.destroyed) return;
+
+    // Un saut demandé remplace l'ouverture, il ne s'y ajoute pas. Sans cette ligne, sauter avant
+    // que la tête ait été posée la ramènerait ensuite au point d'ouverture — le film repartirait
+    // tout seul là où on venait de le quitter.
+    this.pendingStart = null;
+
+    // Clamped to the media, as a media element clamps its own currentTime. Without this, asking
+    // for a time past the end sends the reader somewhere there is nothing to read, and the
+    // recovery machinery then tries again and again to reach a place that does not exist.
+    const end = this.playerEnd;
+    const playerSeconds = Math.min(Math.max(0, requested), Math.max(0, end - 0.25));
+
+    // A file with no index cannot be reached at a time. Restarting from the beginning and
+    // reading forward would look like the player thinking very hard and then, minutes later,
+    // arriving — so it is refused, and playback carries on where it was.
+    if (!reachable(this.remuxer.seekable, playerSeconds)) {
+      this.callbacks.onWarning?.(playerWarning("noIndexSeek"));
+      // Refusé, donc servi : sans cela la demande restait pendante, et le film se figeait au bout
+      // de ce qui était chargé (22/09/2026). La tête revient là où elle jouait — pas à la dernière
+      // position posée par la source, qui pouvait être l'ouverture à 0,24 s.
+      this.seekState.served(requested);
+      this.seekState.drop();
+      this.seekState.moved(this.lastPlayedAt);
+      this.video.currentTime = this.lastPlayedAt;
+      return;
+    }
+
+    // Une zone illisible tient la lecture (§93). Un saut dedans — entre le relais prévu et le
+    // premier point d'index qui la suit — passe la main tout de suite, là où il visait ; tout autre
+    // saut la quitte : le lecteur de fichier repart d'ailleurs, et la retrouvera s'il y revient.
+    if (this.zones.zone) {
+      const zone = this.zones.zone;
+      if (playerSeconds >= zone.switchAt && (zone.resumeAfter === null || playerSeconds < zone.resumeAfter)) {
+        this.seekState.served(requested);
+        this.seekState.drop();
+        this.zones.arriveAtZone(playerSeconds, "saut dans la zone");
+        return;
+      }
+      this.zones.zone = null;
+      trace(`zone illisible quittée par un saut vers ${playerSeconds.toFixed(1)} s`);
+      this.zones.notifyZone({ kind: "left", zone, target: playerSeconds });
+    }
+    if (this.zones.zoneHanded) return;
+
+    this.generation += 1;
+    this.ended = false;
+    this.seekState.serving(playerSeconds);
+    // Sur l'horloge du fichier : là où le lecteur de fichier va être envoyé, plus bas.
+    this.readUpTo = this.toFileClock(playerSeconds);
+    this.seeksServed += 1;
+    // The refill starting below deserves the same grace as any other: without this the watchdog
+    // sees a playhead on nothing, does not know a seek has just served it, and seeks again to
+    // the very same place — doubling the work at exactly the moment it is most wanted elsewhere.
+    this.lastAppendAt = Date.now();
+
+    // The loop breaks on the generation check, but only once whatever read it is awaiting comes
+    // back. Moving the reader before then would corrupt it.
+    await this.fillTask?.catch(() => {});
+    // Détruite pendant l'attente — une reconstruction pour un changement de piste, une passe au
+    // lecteur serveur : cette source n'a plus rien à dire à l'élément, que le lecteur suivant est
+    // en train d'ouvrir, et y écrire son ancienne cible le déplaçait (relu le 24/09/2026).
+    if (this.destroyed) return;
+
+    // Pendant cette attente — une lecture réseau qui finit, deux secondes sur un serveur lointain —
+    // d'autres sauts ont pu arriver : un doigt qui glisse sur la barre. Servir celui-ci lirait une
+    // position déjà abandonnée, que le dernier attendrait à son tour (banc du 22/09/2026 : cinq
+    // sauts en 0,6 s, 6,5 s pour arriver au dernier). On sert directement le plus récent.
+    const latest = this.seekState.requested;
+    if (latest !== null && latest !== requested) return this.performSeek(latest);
+
+    // Juste avant le chargé : on le garde, et seul ce qui manque est lu devant lui (18/11/2026).
+    // Après une ouverture ou un saut, le chargé commence à l'image clé d'arrivée, et un « −10 s »
+    // la manque d'environ cinq secondes : 79 des 210 sauts hors du chargé relevés du 11 au 18/11,
+    // qui vidaient tout — les trente secondes d'avance comprises — pour relire les mêmes octets
+    // (323 ms médians en 1080p sur iPhone, 776 ms en 4K, 1,4 s en 4K sur Mac ; *Drive*, de 1947 à
+    // 1937 s, 10,2 s). La tête va bien à la cible demandée, pas à une image clé.
+    const kept = this.keptAfter(playerSeconds);
+    this.lastServed = {
+      target: requested,
+      path: kept ? "devant" : "complet",
+      keptS: kept ? Math.round((Math.min(kept.end, kept.keepUntil) - kept.start) * 10) / 10 : null,
+    };
+    if (kept) {
+      // L'avance gardée ne dépasse pas celle d'un saut ordinaire : elle courait depuis la tête
+      // d'avant, plus loin, et le budget en octets de WebKit (105 Mo par tampon sur iPhone) ne
+      // tiendrait pas l'écart en plus — WebKit retirerait alors lui-même, devant la tête aussi.
+      if (kept.end > kept.keepUntil) {
+        await Promise.all([this.videoOps, this.audioOps].map((queue) => (queue ? this.clearFrom(queue, kept.keepUntil) : null)));
+        if (this.destroyed) return;
+      }
+      try {
+        trace(
+          `ajout devant : la cible est à ${(kept.start - playerSeconds).toFixed(2)} s du chargé, gardé — reste vidéo ` +
+            `${spansAll(this.videoBuffer)} · audio ${spansAll(this.audioBuffer)} ; lecture de l'image clé d'avant la cible jusqu'à ce début`
+        );
+      } catch {
+        /* rien */
+      }
+      this.fragmentsSinceSeek = 0;
+    } else {
+      // No abort() here any more. Cancelling an operation mid-flight leaves the buffer's parser in
+      // a state the next append has to be careful about, and the queue already guarantees that
+      // whatever was running has finished before this removal starts.
+      // Chronométré piste par piste, de la demande à son `updateend` : la preuve au journal que le
+      // vidage a eu lieu et ce qu'il a laissé, au lieu de la déduire du code (14/10/2026).
+      // Les deux tampons en même temps : chacun a sa file et son `updating`, rien ne lie leurs
+      // retraits. L'un après l'autre, un saut attendait la somme — « vidéo 119 ms, audio 68 ms »
+      // sur un iPhone, 187 ms avant le premier octet du nouveau média (journal relu le 20/10/2026).
+      const clearFrom = Date.now();
+      const clearMs = (
+        await Promise.all(
+          [this.videoOps, this.audioOps].map(async (queue) => {
+            if (!queue) return null;
+            await this.clear(queue);
+            return `${queue === this.videoOps ? "vidéo" : "audio"} ${Date.now() - clearFrom} ms`;
+          })
+        )
+      ).filter((entry): entry is string => entry !== null);
+      if (this.destroyed) return;
+      try {
+        trace(
+          `vidage fait (${clearMs.join(", ")}) — reste vidéo ${spansAll(this.videoBuffer)} · audio ${spansAll(this.audioBuffer)}`
+        );
+      } catch {
+        /* rien */
+      }
+      // Ce qui a été envoyé avant ce vidage n'est plus dans les tampons.
+      this.sentFragments = [];
+      this.fragmentsSinceSeek = 0;
+    }
+    // La même question après le vidage, qui attend lui aussi le navigateur — des centaines de
+    // millisecondes sur un appareil lent. Un geste arrivé pendant ce temps était écrasé : la tête,
+    // que le spectateur venait de poser, repartait sur la cible abandonnée. Le saut suivant la
+    // ramenait d'ordinaire ; mais une source perdue entre les deux faisait reprendre, puis
+    // reconstruire, à l'ancienne position (fuzz du 24/09/2026, graine 901806).
+    const newer = this.seekState.requested;
+    if (newer !== null && newer !== requested) return this.performSeek(newer);
+    // La licence d'atterrissage — poser la tête sur le premier média à moins de 15 s après la
+    // cible — vaut pour le média *de ce saut*, et n'est donc accordée qu'une fois les tampons
+    // vidés. Accordée avant, elle laissait la garde, pendant le vidage, poser la tête sur l'ancien
+    // média : « −10 s » depuis 62 s, avec un tampon qui commençait à 60,2 s, devenait 60,2 s. La
+    // suite du saut réécrivait 52 s d'ordinaire ; une reconstruction dans l'intervalle (un
+    // changement de piste) repartait de 60 s (fuzz du 24/09/2026, graine 10133935).
+    // Pour un ajout devant, accordée seulement une fois le raccord fait (`joinKept`) : avant, le
+    // premier média après la cible est le chargé gardé, et la tête y aurait été posée — le « −10 s »
+    // devenait un « −5 s ».
+    if (!kept) this.guard.seekServed(playerSeconds);
+    // Les tampons viennent d'être vidés et le lecteur va être repositionné : plus rien à retirer
+    // ni à retenir pour une coupure gardée plus tôt.
+    this.trimBeforeNextAppend = false;
+    this.networkHold = false;
+
+    // Un ajout devant s'arrête à l'image clé qui suit le début du chargé : il relit le premier groupe
+    // d'images du chargé, qui remplace le sien à l'identique. S'arrêter sur le début même laisserait
+    // un trou — une reprise sur une image clé CRA en écarte les images RASL (`isRaslPicture`), qui se
+    // montrent juste avant elle — que le groupe relu, lui, comble.
+    if (kept) this.remuxer.seekTo(this.toFileClock(playerSeconds), this.toFileClock(kept.start) + PREPEND_STOP_MARGIN_S);
+    else this.remuxer.seekTo(this.toFileClock(playerSeconds));
+    this.seekNetworkPending = true;
+    this.appendsSinceSeek = 0;
+    // Only when the element is not already there: reassigning would fire another seeking event
+    // and start this over.
+    //
+    // Le `seeking` de cette écriture-là est attendu comme celui de la source, et seulement de
+    // celle-là : le jeton était posé dès le début du service, avant l'attente de la lecture en cours
+    // — une seconde et plus sur un réseau lent —, et un spectateur qui sautait pendant ce temps pile
+    // à cette position (« −10 s » puis « +10 s », une rafale qui y revient) voyait son geste pris
+    // pour celui de la source et ignoré. Trouvé par le fuzz le 24/09/2026 (graine 30063323).
+    if (Math.abs(this.video.currentTime - playerSeconds) > 0.05) {
+      this.seekState.expectOwnMove(playerSeconds);
+      this.video.currentTime = playerSeconds;
+    }
+
+    // Served: the reader is where it was asked to be. Anything asked for after this point is a
+    // new seek, and the refill below is free to run.
+    // La demande telle qu'elle a été faite, pas la cible ramenée dans le film : comparée ainsi
+    // corrigée, un saut au-delà de la fin (+30 s dans les dernières secondes) ne la libérait jamais,
+    // et le remplissage comme le chien de garde restaient arrêtés devant elle (22/09/2026).
+    this.seekState.served(requested);
+
+    // Not awaited. A seek is finished the moment the reader is repositioned; waiting for thirty
+    // seconds of media to be fetched before admitting so means the next seek queues behind a
+    // download of a place the viewer has already left.
+    void this.fill();
+  }
+
+  /**
+   * Le chargé qu'un saut vers `target` peut garder : la plage jouable qui commence après la cible, à
+   * au plus `PREPEND_SHARE_OF_AHEAD` de l'avance visée — ou null, et le saut vide tout comme avant.
+   * `keepUntil` : jusqu'où la garder, l'avance d'un saut ordinaire depuis la cible.
+   */
+  private keptAfter(target: number): { start: number; end: number; keepUntil: number } | null {
+    const ranges = this.playable;
+    if (rangeAround(ranges, target, 0) >= 0) return null;
+    let start = Infinity;
+    let end = 0;
+    for (let i = 0; i < ranges.length; i++) {
+      if (ranges.start(i) > target && ranges.start(i) < start) {
+        start = ranges.start(i);
+        end = ranges.end(i);
+      }
+    }
+    if (!Number.isFinite(start)) return null;
+    const ahead = this.aheadTarget;
+    if (start - target > ahead * PREPEND_SHARE_OF_AHEAD) return null;
+    return { start, end, keepUntil: target + ahead };
+  }
+
+  /**
+   * L'ajout devant est arrivé à sa borne : ce qu'il a lu rejoint le chargé gardé, et la lecture
+   * reprend au bout de celui-ci — comme après une éviction (`refillEvicted`) : le groupe qui contient
+   * ce bout est retiré puis relu d'un seul tenant (`trimBeforeNextAppend`).
+   *
+   * Si le raccord n'a pas pris (un trou subsiste), le bout est celui de l'ajout, et cette même
+   * relecture retire le chargé gardé pour le relire : le saut ordinaire, en un peu plus long. Et si
+   * la tête n'est encore sur rien, le groupe relu commence sous elle : la reprise habituelle.
+   */
+  private joinKept(): void {
+    const join = this.bufferedEnd();
+    trace(
+      `ajout devant fait : vidéo ${spansNear(this.videoBuffer, this.anchor)} · audio ` +
+        `${this.audioBuffer ? spansNear(this.audioBuffer, this.anchor) : "aucun"} — lecture reprise à ${join.toFixed(1)} s`
+    );
+    // La licence d'atterrissage retenue par `performSeek` : le média de ce saut est maintenant là.
+    this.guard.seekServed(this.video.currentTime);
+    this.remuxer.seekTo(this.toFileClock(join));
+    this.readUpTo = this.toFileClock(join);
+    this.trimBeforeNextAppend = true;
+  }
+
+  /**
+   * Pose la tête de lecture à l'ouverture — une fois le média arrivé, jamais avant.
+   *
+   * C'est la moitié différée de l'ouverture à une position non nulle. Le remultiplexeur a été
+   * envoyé au bon endroit dès le départ ; il ne restait qu'à attendre que ce qu'il rapporte soit
+   * réellement sous la tête avant de l'y déplacer. Un `currentTime` posé sur un tampon vide est
+   * une demande que WebKit accepte et n'honore jamais.
+   *
+   * Deux façons d'être arrivé, et la seconde compte autant que la première : la plage peut
+   * contenir la cible, ou commencer juste après elle — un fichier à images B présente sa première
+   * image 210 ms plus tard, et une ouverture qui tomberait dans cet intervalle attendrait un
+   * instant que le fichier ne contient pas. On se pose alors au début de la plage, comme le fait
+   * déjà l'atterrissage après un saut.
+   */
+  private placePendingStart(): void {
+    const target = this.pendingStart;
+    if (target === null) return;
+    // Le même atterrissage qu'après un saut — voir `landingFor`.
+    const landing = landingFor(this.video.buffered, target, LANDING_REACH_SECONDS);
+    if (landing === null) return;
+    this.pendingStart = null;
+    trace(
+      landing === target
+        ? `ouverture : le média couvre ${landing.toFixed(1)} s, la tête y est posée`
+        : `ouverture : le média commence après ${target.toFixed(1)} s, la tête est posée à ${landing.toFixed(2)} s`
+    );
+    this.seekState.moved(landing);
+    this.guard.headPlaced(landing);
+    this.video.currentTime = landing;
+    this.guard.opened(landing, !this.startPaused);
+    this.armOpeningReassert(landing);
+  }
+
+  /** Retire d'un tampon tout ce qui suit cet instant — voir `trimBeforeNextAppend`. */
+  private async clearFrom(queue: BufferQueue, from: number): Promise<void> {
+    if (queue.buffer.buffered.length === 0 || this.source.readyState === "closed") return;
+    const end = Number.isFinite(this.source.duration) ? this.source.duration + 1 : 1e9;
+    if (from >= end) return;
+    await this.removeRange(queue, Math.max(0, from), end).catch(() => {
+      // Refusé : l'envoi qui suit remplacera la même plage, comme la norme le prévoit.
+    });
+  }
+
+  /**
+   * Une lecture réseau a échoué, nouvelles tentatives comprises : garder le tampon et réessayer.
+   *
+   * La reprise habituelle passe par un saut, qui vide les deux tampons. Pendant un redéploiement
+   * du serveur — plusieurs par jour, deux ou trois secondes de réponses refusées — c'était jusqu'à
+   * trente secondes d'image jetées et un chargement à l'écran, alors que le film avait de quoi
+   * tenir (relu le 24/09/2026). Tant qu'il reste une avance confortable, la lecture reprend donc
+   * plus tard, là où elle s'était arrêtée, sans rien toucher à ce qui est déjà là.
+   *
+   * Prudente à dessein : au-dessous de `NETWORK_KEEP_LEAD_SECONDS`, après quatre essais, ou si un
+   * saut est passé entre-temps, rien de tout cela — la reprise habituelle, comme avant. Et le
+   * chien de garde reste là : si l'avance s'épuise pendant l'attente, il reprend à sa façon.
+   */
+  private keepThroughNetworkFailure(generation: number): boolean {
+    if (this.destroyed || this.stuck) return false;
+    if (this.lead < NETWORK_KEEP_LEAD_SECONDS) return false;
+    if (this.networkRetries >= NETWORK_RETRY_DELAYS_MS.length) return false;
+    const delay = NETWORK_RETRY_DELAYS_MS[this.networkRetries];
+    this.networkRetries += 1;
+    trace(`coupure réseau avec ${this.lead.toFixed(1)} s d'avance : tampon gardé, nouvel essai dans ${delay / 1000} s`);
+    this.retryReadLater(generation, delay);
+    return true;
+  }
+
+  /**
+   * Une coupure en pleine lecture (DECISIONS.md §97), une fois que ce pipeline a joué : le tampon est
+   * gardé quelle que soit l'avance, et la lecture retentée sans compter (1, 2, 4, 8 s, puis toutes les
+   * 8 s ; tout de suite à `online`). Ce n'est plus l'échelle des envois refusés : la reprise y vidait
+   * les tampons pour relire la même plage, sur le même réseau absent, et chaque essai relançait la
+   * patience d'une minute de la lecture. La borne est le temps, pas le nombre d'essais :
+   * `watchForOutage`, à la tête à court de média. Le réseau revenu avant elle, la lecture reprend là
+   * où elle s'était arrêtée, sans reconstruction.
+   */
+  private holdThroughOutage(generation: number, error: unknown): void {
+    if (this.destroyed || this.stuck || this.networkGaveUp) return;
+    const delay = NETWORK_RETRY_DELAYS_MS[Math.min(this.networkRetries, NETWORK_RETRY_DELAYS_MS.length - 1)];
+    this.networkRetries += 1;
+    this.outageHold = true;
+    const detail = error instanceof Error ? error.message : String(error);
+    trace(`coupure réseau (${detail.slice(0, 80)}), ${this.lead.toFixed(1)} s d'avance : tampon gardé, essai n°${this.networkRetries} dans ${delay / 1000} s`);
+    this.retryReadLater(generation, delay);
+  }
+
+  /** Relit plus tard là où la lecture s'était arrêtée, le tampon gardé — voir `trimBeforeNextAppend`. */
+  private retryReadLater(generation: number, delay: number): void {
+    this.networkHold = true;
+    if (this.networkRetryTimer) clearTimeout(this.networkRetryTimer);
+    this.networkRetryGeneration = generation;
+    this.networkRetryTimer = setTimeout(() => this.retryReadNow(generation), delay);
+  }
+
+  private retryReadNow(generation: number): void {
+    if (this.networkRetryTimer) clearTimeout(this.networkRetryTimer);
+    this.networkRetryTimer = null;
+    // Un saut, une reprise ou une destruction entre-temps a tout repositionné : rien à reprendre.
+    if (this.destroyed || this.generation !== generation || this.networkGaveUp) return;
+    this.networkHold = false;
+    // `readUpTo` est déjà sur l'horloge du fichier : lui retirer le décalage repartait du groupe
+    // d'avant quand la lecture s'était arrêtée pile sur une image clé — sous la tête, donc vidage.
+    this.remuxer.seekTo(this.readUpTo);
+    this.trimBeforeNextAppend = true;
+    void this.fill();
+  }
+
+  /** Le réseau revient pendant qu'une coupure attend son prochain essai : il part tout de suite. */
+  private readonly onOnline = () => {
+    if (!this.outageHold || !this.networkHold || this.networkRetryTimer === null) return;
+    trace("coupure réseau : le navigateur est de nouveau en ligne, nouvel essai tout de suite");
+    this.retryReadNow(this.networkRetryGeneration);
+  };
+
+  /**
+   * La borne d'une coupure en pleine lecture (DECISIONS.md §97), au chien de garde : ce pipeline a
+   * joué, le spectateur veut jouer (ni pause ni fin, page visible), la tête est à court de média, et
+   * le réseau n'a rien livré depuis `NETWORK_OUTAGE_GIVE_UP_MS` sous une demande. Alors la main passe
+   * à l'hôte (`onError(…, "network")`) : l'écran « connexion perdue », la ligne `network`, et le
+   * nouvel essai de l'hôte au retour du réseau. Un lien lent livre ses morceaux : jamais ici.
+   */
+  private watchForOutage(): void {
+    if (this.networkGaveUp || this.stuck || this.destroyed || this.ended || this.clock.lastPlayingAt === 0) return;
+    if (this.video.paused) return;
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+    const starved = this.lead < OUTAGE_STARVED_LEAD_SECONDS || (typeof this.video.readyState === "number" && this.video.readyState < 3);
+    if (!starved) return;
+    const silent = this.networkSilentMs();
+    if (silent < NETWORK_OUTAGE_GIVE_UP_MS) return;
+    this.networkGaveUp = true;
+    this.networkHold = false;
+    this.outageHold = false;
+    if (this.networkRetryTimer) clearTimeout(this.networkRetryTimer);
+    this.networkRetryTimer = null;
+    const why = `coupure réseau : aucun octet reçu depuis ${Math.round(silent / 1000)} s`;
+    trace(`${why} — la main passe à l'hôte`);
+    this.callbacks.onError(`${why} ${this.elementState()}`, "network");
+  }
+
+  private networkSilentMs(): number {
+    try {
+      return (this.remuxer as { networkSilentMs?: () => number }).networkSilentMs?.() ?? 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  private async clear(queue: BufferQueue): Promise<void> {
+    // « ended » n'empêche pas de retirer : la spécification rouvre la source d'elle-même. Refusé
+    // jusqu'au 22/09/2026, ce qui laissait l'ancienne piste dans le tampon quand on changeait de
+    // langue une fois la fin du flux déclarée. Seule une source fermée n'a plus rien à vider.
+    if (queue.buffer.buffered.length === 0 || this.source.readyState === "closed") return;
+    // A finite end rather than Infinity: it is what the specification's examples use and what
+    // every implementation is exercised against.
+    const end = Number.isFinite(this.source.duration) ? this.source.duration + 1 : 1e9;
+    await this.removeRange(queue, 0, end).catch(() => {
+      // A removal the browser declines is not worth failing a seek over; the append that follows
+      // will overwrite the range anyway.
+    });
+  }
+
+  /**
+   * Arrivé : la tête est où le saut voulait qu'elle soit, et le saut n'est plus surveillé. Un
+   * `seeked` loin de la cible, lui, ne vaut pas arrivée — voir `watchForHeadAway`.
+   *
+   * Il y avait ici, du 22/09/2026 au soir, une horloge arrêtée pendant les sauts sous WebKit
+   * (vitesse 0, rendue à l'arrivée). Retirée après deux bancs iPhone : Safari a replacé une tête à
+   * son ancienne position l'horloge arrêtée comme sans elle — c'est le filet qui l'a rattrapée les
+   * deux fois —, elle rendait muettes l'horloge figée et les blocages, et Safari ne signale aucune
+   * image à vitesse 0, si bien qu'on ne pouvait pas non plus l'attendre.
+   */
+  private readonly onSeeked = () => {
+    if (this.destroyed) return;
+    this.clock.settleOpeningReassert();
+    this.seekState.arrive(this.video.currentTime);
+  };
+
+  /**
+   * The safety net, and the only part of this that does not depend on being told anything.
+   *
+   * Everything else here reacts to an event: the element announcing a seek, the system asking
+   * for data, a buffer reporting an append. Each of those can fail to arrive — a browser that
+   * does not fire seeking in some state, a system that stops asking and never starts again, an
+   * append quietly rejected — and the symptom is always identical and always the same fault:
+   * the playhead is somewhere no media is, and the reader is filling somewhere else.
+   *
+   * So rather than trying to enumerate the causes, this watches the one fact that matters and
+   * seeks to wherever the viewer actually is. It is checked on a timer precisely because the
+   * failure mode is that no event comes.
+   */
+  private readonly watchdog = () => {
+    // A paused element is not stalled, and the frame it is showing is already on screen. Seeking
+    // underneath it would move the picture for no reason and land the resume elsewhere.
+    if (this.destroyed) return;
+    // Une zone illisible (§93) : la main est passée, ou elle passe quand la tête arrive au relais —
+    // jamais une reprise au bout de ce qui est sûr, qui relirait la zone.
+    if (this.zones.zoneHanded || (this.zones.zone && this.zones.checkZoneArrival())) return;
+    if (!this.video.seeking && this.seekState.intent === null) this.lastPlayedAt = this.video.currentTime;
+    // Before anything returns early: a stall is exactly the case where every check below has
+    // decided there is nothing to do, and that decision is what the log line has to show.
+    this.watchForStall();
+    // La borne d'une coupure en pleine lecture (§97), avant tout ce qui rend la main plus bas.
+    this.watchForOutage();
+    if (this.networkGaveUp) return;
+    // Handed to the host, which is rebuilding: another seek from here would only race it.
+    if (this.stuck) return;
+    if (this.ended || !this.videoBuffer || this.video.paused) return;
+
+    const now = this.video.currentTime;
+    // La tête a quitté sa place et vient d'être renvoyée : rien d'autre à faire à ce tour.
+    if (this.headAwayHandledAt === now) return;
+    // A seek already on its way: leave it to arrive. Pushing the playhead in the middle of one
+    // would be this player seeking against itself.
+    if (this.seekState.requested !== null) return;
+    // Une ouverture qui attend son média non plus. La tête est restée là où l'élément l'a laissée
+    // — zéro — pendant que le film s'ouvre ailleurs, et c'est exactement ce que `pendingStart`
+    // organise. « Rien sous la tête » est donc l'état normal ici, pas une panne : la ramener
+    // ferait repartir du début un film qu'on venait de demander à reprendre.
+    if (this.pendingStart !== null) return;
+    // On media: the only stall left is a clock that has stopped anyway, which is its own check.
+    if (this.isBufferedAt(now)) return this.watchForFrozenClock(now);
+
+    // A read is in progress, so media is on its way; whether it is on its way to the right place
+    // is the read loop's own business, and it checks. Waiting on a clock instead would mean
+    // guessing how long a segment takes to arrive — and guessing short, as a 4K file over a slow
+    // link showed, means seeking again to the very place already being fetched.
+    if (this.fillTask) return;
+    // Une coupure tenue attend son prochain essai (§97) : une reprise relirait sur le même réseau
+    // absent en vidant les tampons. La borne est `watchForOutage`.
+    if (this.outageHold) return;
+
+    // Nothing is being read and the playhead is on nothing: whatever failed to say so, the
+    // viewer is somewhere this player is not serving.
+    if (Date.now() - this.lastAppendAt < STALL_TIMEOUT_MS) return;
+    trace(
+      `reprise : rien sous la tête à ${now.toFixed(1)} s, ` +
+        `dernier envoi il y a ${Date.now() - this.lastAppendAt} ms, ${this.elementState()}`
+    );
+    if (!this.recover(now)) this.handOver(now);
+  };
+
+  /**
+   * Notes whether the clock is really running, and writes a stall to the log when it is not.
+   *
+   * 22/09/2026 : a −10 s skip on an iPhone landed just before a keyframe, `seeked` fired, and the
+   * clock then sat between 166 and 167 s for nineteen seconds under a spinner, until the viewer
+   * seeked elsewhere. The log held the `seek` line and nothing after it: which recovery ran, what
+   * the buffers held, whether anything was being read — all of it stayed on the phone.
+   *
+   * "Stood still" is measured as covering less than a second in `STALL_REPORT_MS`, not as an
+   * unchanged value: the pushes and recoveries move the clock by fractions of a second, and a
+   * stall they fail to cure must not read as playback.
+   */
+  private watchForStall(): void {
+    const now = this.video.currentTime;
+    const running = !this.video.paused && !this.video.ended;
+    // What really playing looks like from a 250 ms tick: forward, by less than a jump. A seek is
+    // neither, and does not count towards leaving the ladder.
+    const delta = now - this.tickClockAt;
+    this.tickClockAt = now;
+    // Et avec du média sous la tête (chasse du 18/11/2026) : une horloge qui court sans rien dessous
+    // comptait ses trois secondes — le délai même où la tête partie se déclare (`RUNAWAY_REPORT_SECONDS`)
+    // —, et chaque reprise d'une tête partie remettait l'échelle à zéro ; elle ne montait jamais
+    // jusqu'à l'image clé suivante ni au passage de main.
+    if (running && !this.video.seeking && delta > 0 && delta < 0.6 && this.isBufferedAt(now)) {
+      this.ladder.playedSinceTrouble += delta;
+      if (this.ladder.playedSinceTrouble >= PLAYED_TO_CLEAR_SECONDS) {
+        this.ladder.escalation = 0;
+        this.ladder.unplayedAttempts = 0;
+      }
+    }
+
+    if (!running) {
+      this.stallSince = null;
+      return;
+    }
+    if (!this.stuck && this.watchForHeadAway(now, delta)) {
+      this.stallSince = null;
+      this.headAwayHandledAt = now;
+      return;
+    }
+    // Un saut qui attend son média n'est pas un blocage : c'est l'attente du réseau, et la ligne
+    // `seek` en porte déjà la durée. Compté, il écrivait une ligne `stall` à chaque saut lent
+    // depuis un serveur lointain (banc du 22/09/2026 : quatre « blocages », tous des sauts).
+    // Un saut resté `seeking` alors que le média est là, lui, reste compté — c'est le WebKit qui
+    // ne résout pas son saut (1917 sur iPhone).
+    if (this.video.seeking && !this.isBufferedAt(now)) {
+      this.stallSince = null;
+      return;
+    }
+    // Même chose pour une ouverture en cours de film qui attend son premier média : la tête est
+    // encore à zéro, la cible plus loin, et la ligne écrivait un « blocage » à 0 s pour ce qui
+    // n'était que le réseau (Love Story, 23/09/2026 : 5,8 s d'ouverture, un stall à 0 s).
+    if (this.pendingStart !== null && !this.isBufferedAt(this.pendingStart)) {
+      this.stallSince = null;
+      return;
+    }
+    if (this.stallSince === null || Math.abs(now - this.stallClockAt) >= 1) {
+      this.stallClockAt = now;
+      this.stallSince = Date.now();
+      this.stallReported = false;
+      return;
+    }
+    const stalledMs = Date.now() - this.stallSince;
+    if (stalledMs < STALL_REPORT_MS || this.stallReported) return;
+    // Marked even when the cooldown holds it back: this stall has had its chance to be written.
+    this.stallReported = true;
+    if (Date.now() - this.lastStallReportAt < STALL_REPORT_COOLDOWN_MS) return;
+    this.lastStallReportAt = Date.now();
+    trace(`lecture bloquée depuis ${(stalledMs / 1000).toFixed(1)} s à ${now.toFixed(2)} s — ${this.elementState()}`);
+    // Instrumentation on the path that is already failing: it must not become the failure.
+    try {
+      this.callbacks.onStall?.(this.stallReport(now, stalledMs));
+    } catch {
+      /* the log is not worth a player */
+    }
+  }
+
+  /**
+   * La tête hors de sa place — un seul détecteur pour les deux formes qu'on lui a connues.
+   *
+   * - **Pendant un saut** : elle s'éloigne de sa cible sans y être arrivée. Banc iPhone du
+   *   22/09/2026 : trois sauts sur huit films partis de 20 à 650 s au-delà de leur cible, et un
+   *   Titanic ramené par Safari à son ancienne position. L'élément se disait en train de sauter, ce
+   *   qui rendait aveugles toutes les autres surveillances. Renvoyée vers sa **cible**.
+   * - **Après** : l'horloge avance trois secondes sans rien sous la tête (2012 sur iPhone : 658
+   *   images pour 55 s regardées, la tête posée à chaque envoi sur la fin de la vidéo reçue). Aucune
+   *   cible à retrouver : reprise là où elle est, ce qui relit depuis l'image clé.
+   *
+   * Deux détecteurs jusqu'au 22/09/2026, qui écrivaient chacun leur ligne et appelaient chacun les
+   * reprises ; un seul désormais, pour un seul fait. Par l'échelle habituelle des reprises, écrit
+   * comme un blocage (`runaway`), une ligne par minute au plus.
+   */
+  private watchForHeadAway(now: number, delta: number): boolean {
+    const intent = this.seekState.intent;
+    if (intent) {
+      if (this.seekState.requested !== null || seekArrived(now, intent.target)) return false;
+      // Encore en train de sauter : la tête n'est pas égarée, elle n'est pas arrivée. Un navigateur
+      // applique `currentTime` aussitôt et n'émet `seeking` qu'ensuite ; dans cet intervalle, une
+      // rafale a déjà déplacé la tête vers une cible dont on n'a pas encore été averti. Banc iPhone
+      // du 22/09/2026, Titanic : cinq sauts en 0,4 s, et le détecteur ramenait la tête 935 s en
+      // arrière — il défaisait le dernier saut demandé. Quand l'élément se posera, `seeked` dira
+      // s'il est arrivé, et ce même détecteur tranchera alors avec la bonne cible.
+      //
+      // Borné, pour qu'un saut qui ne se pose jamais reste rattrapé : la même attente que pour une
+      // horloge figée pendant un saut (`FROZEN_SEEKING_MS`). L'intervalle qu'elle couvre se compte
+      // en millisecondes ; six secondes plus tard, `seeking` aurait déjà renouvelé la cible.
+      if (this.video.seeking && Date.now() - intent.since < FROZEN_SEEKING_MS) return false;
+      this.seekState.drop();
+      this.headAway(`saut parti ailleurs : visé ${intent.target.toFixed(1)} s, tête à ${now.toFixed(1)} s — on y retourne`, now, intent.target, {
+        seekTarget: intent.target,
+        stalledMs: Date.now() - intent.since,
+      });
+      return true;
+    }
+    // Une ouverture en attente de son média, ou un saut en cours : la tête est hors du média
+    // par construction, et ce n'est pas elle qui avance.
+    if (this.pendingStart !== null || this.video.seeking || this.isBufferedAt(now)) {
+      this.runawaySeconds = 0;
+      return false;
+    }
+    if (delta <= 0 || delta > 5) return false;
+    const before = this.runawaySeconds;
+    this.runawaySeconds += delta;
+    if (before >= RUNAWAY_REPORT_SECONDS || this.runawaySeconds < RUNAWAY_REPORT_SECONDS) return false;
+    this.headAway(`horloge qui avance sans média : ${this.runawaySeconds.toFixed(1)} s courues jusqu'à ${now.toFixed(2)} s`, now, now, { stalledMs: 0 });
+    return true;
+  }
+
+  /** Écrit, puis renvoie la tête par l'échelle des reprises. */
+  private headAway(what: string, now: number, target: number, facts: { seekTarget?: number; stalledMs: number }): void {
+    trace(`${what} — ${this.elementState()}`);
+    if (Date.now() - this.lastStallReportAt >= STALL_REPORT_COOLDOWN_MS) {
+      this.lastStallReportAt = Date.now();
+      try {
+        // `runaway` en tête : `clean()` borne le nombre de champs, et c'est lui qui distingue la ligne.
+        const { stalledMs, ...rest } = facts;
+        this.callbacks.onStall?.({ runaway: true, ...rest, ...this.stallReport(now, stalledMs) });
+      } catch {
+        /* the log is not worth a player */
+      }
+    }
+    // Vers la cible, là aussi : c'est de là que l'hôte reconstruira, et non de l'endroit où la
+    // tête s'est enfuie (audit du 22/09/2026).
+    if (!this.recover(target)) this.handOver(target);
+  }
+
+  /**
+   * What a stall line carries: one level deep and short, for `clean()` in playerLog.ts, which keeps
+   * 40 fields — and 40 more for `diag.*`, the supply diagnosis (playbackDiagnosis.ts).
+   */
+  private stallReport(now: number, stalledMs: number): Record<string, unknown> {
+    const managed = (this.source as ManagedMediaSource).streaming;
+    const { position, ...state } = this.stateFacts(now);
+    return {
+      position,
+      stalledMs,
+      ...state,
+      filling: this.fillTask !== null,
+      recoveryStreak: this.ladder.recoveryStreak,
+      frozenNudges: this.clock.frozenNudges,
+      recoveries: this.ladder.recoveries,
+      evictions: this.evictions,
+      // Only ManagedMediaSource has the signal; plain MediaSource says so rather than `true`.
+      streaming: typeof managed === "boolean" ? managed : "sans objet",
+      // Le réseau à cet instant, et où en est la relance (15/10/2026, LECTEUR-4) : trois coupures
+      // en pleine lecture n'avaient laissé ni ligne `network` ni rien qui dise si l'appareil se
+      // savait hors ligne, si des tentatives échouaient, ni ce que la source faisait en attendant.
+      ...this.networkFacts(),
+      // Ce qui a retenu la chaîne dans les 30 s d'avant : réseau, calcul ou décodeur — voir
+      // playbackDiagnosis.ts. Aplati en `diag.*`, sous son propre plafond de champs.
+      diag: diagStallFacts(this.lead),
+      steps: traceRecent(STALL_TRACE_MS).join(" | "),
+    };
+  }
+
+  /**
+   * Le réseau vu d'ici, pour la ligne `stall` : ce que dit le navigateur (`onLine`, absent s'il ne
+   * dit rien), des tentatives en échec ou l'appareil hors ligne (`netTrouble`, `networkTrouble.ts`),
+   * et la relance en une chaîne courte (`relaunch`) — la réserve réseau (`keepThroughNetworkFailure` :
+   * essais faits sur le maximum, « en attente » si un nouvel essai est programmé) et les échecs de
+   * suite comptés avant l'écran. Ne lève jamais : c'est le chemin d'un blocage.
+   */
+  private networkFacts(): Record<string, unknown> {
+    try {
+      const onLine = typeof navigator !== "undefined" && typeof navigator.onLine === "boolean" ? navigator.onLine : undefined;
+      return {
+        ...(onLine === undefined ? {} : { onLine }),
+        netTrouble: networkUnstable(),
+        relaunch:
+          `garde ${this.networkRetries}/${NETWORK_RETRY_DELAYS_MS.length}${this.networkHold ? " en attente" : ""}` +
+          ` · échecs ${this.appendFailures}/${MAX_APPEND_FAILURES}` +
+          (this.outageHold ? ` · coupure, silence ${Math.round(this.networkSilentMs() / 1000)} s` : ""),
+      };
+    } catch {
+      return {};
+    }
+  }
+
+  /** L'élément et ses tampons, en peu de champs — commun au blocage et à la perte. */
+  private stateFacts(now: number): Record<string, unknown> {
+    return {
+      position: now,
+      readyState: this.video.readyState,
+      networkState: this.video.networkState,
+      seeking: this.video.seeking,
+      source: this.source.readyState,
+      videoBuffered: spansNear(this.videoBuffer, now),
+      audioBuffered: this.audioBuffer ? spansNear(this.audioBuffer, now) : "aucun",
+      lead: Math.round(this.lead * 100) / 100,
+      sinceAppendMs: Date.now() - this.lastAppendAt,
+    };
+  }
+
+  /** Voir `FrozenClockWatch.armOpeningReassert`. */
+  private armOpeningReassert(at: number): void {
+    this.clock.armOpeningReassert(at);
+  }
+
+  /** Voir `FrozenClockWatch.watchForFrozenClock`. */
+  private watchForFrozenClock(now: number): void {
+    this.clock.watchForFrozenClock(now);
+  }
+
+  /**
+   * Voir `RecoveryLadder.recover`. Tout passe par ici, par `this.` : webcodecs-mseSource.test.ts
+   * remplace cette méthode sur l'instance.
+   */
+  private recover(target: number): boolean {
+    return this.ladder.recover(target);
+  }
+
+  /**
+   * The last rung: this source has nothing left to try, and says so the way a lost source does.
+   *
+   * Through `onError` and `lost`, the host's existing answer to a source it must build again — not
+   * a parallel mechanism: its budget (three in three minutes) and its step past a place that has
+   * already failed twice apply unchanged, and past that budget it hands the film to the stable
+   * player. Once only; the watchdog stands down behind `stuck`.
+   */
+  private handOver(at: number): void {
+    if (this.stuck || this.destroyed) return;
+    this.stuck = true;
+    this.handedOverAt = at;
+    this.ladder.escalation = 2;
+    this.ladder.escalations += 1;
+    trace(`reprise impossible ici à ${at.toFixed(1)} s — reconstruction demandée ${this.elementState()}`);
+    this.callbacks.onError(
+      `lecture bloquée à ${at.toFixed(1)} s après ${this.ladder.recoveries} reprises ${this.elementState()}`,
+      "playback"
+    );
+  }
+
+  /**
+   * Un saut en cours, selon la source : demandé et pas encore servi, ou servi et pas encore arrivé.
+   * L'hôte le lit pour savoir quand oublier la cible qu'il a demandée — la source peut l'avoir
+   * posée ailleurs (premier média, image clé suivante), et c'est elle qui sait si c'est fini.
+   */
+  get seekPending(): boolean {
+    return this.seekState.pending;
+  }
+
+  /** What the `stop` line wants to know of the recoveries over the whole session. */
+  get recoveryFacts(): RecoveryFacts {
+    return {
+      recoveries: this.ladder.recoveries,
+      frozenNudges: this.clock.frozenNudgesTotal,
+      escalations: this.ladder.escalations,
+      evictions: this.evictions,
+      evictionsAhead: this.evictionsAhead,
+    };
+  }
+
+  /**
+   * What the element and the source have to say — the two things that know why an append was
+   * refused, when the event itself carries nothing.
+   */
+  private elementState(): string {
+    const parts = [`MediaSource ${this.source.readyState}`];
+    const failure = this.video.error;
+    if (failure) parts.push(`élément code ${failure.code}${failure.message ? ` « ${failure.message} »` : ""}`);
+    parts.push(`readyState ${this.video.readyState}`, `réseau ${this.video.networkState}`);
+    return `(${parts.join(", ")})`;
+  }
+
+  /**
+   * Whether the platform has taken the source away.
+   *
+   * iOS reclaims media resources when a page goes to the background, and a MediaSource it has
+   * closed cannot be reopened — every buffer on it is gone with it. There is nothing to repair
+   * here; the caller has to build the whole thing again.
+   */
+  get lost(): boolean {
+    // Or this source has handed over (`handOver`): open, but nothing left to try. The same answer
+    // fits — build again at the head — and the host already knows how to give it.
+    return !this.destroyed && (this.stuck || this.source.readyState === "closed");
+  }
+
+  /**
+   * Where the viewer was, for a caller that has to rebuild and wants to come back to it.
+   *
+   * Où le film en est — et, une fois la main passée à l'hôte, où il doit reprendre : la position
+   * donnée à `handOver`, qui peut être la cible d'un saut parti ailleurs plutôt que la tête.
+   */
+  get position(): number {
+    return this.stuck && this.handedOverAt !== null ? this.handedOverAt : this.video.currentTime;
+  }
+
+  /**
+   * L'espace colorimétrique d'une image telle que l'élément la rend, demandé une seule fois.
+   *
+   * Purement informatif : rien ici n'agit dessus. La réponse dit si les vraies valeurs HDR ont
+   * survécu au décodage matériel — `bt2020 · pq` — ou si le navigateur a déjà converti l'image
+   * avant qu'on puisse la voir, auquel cas elle revient en RGB 8 bits. C'est la seule mesure qui
+   * distingue les deux, et un relevé qui la porte évite d'avoir à refaire la démonstration.
+   *
+   * Une seule fois, et le résultat gardé : construire une image 4K à chaque rafraîchissement du
+   * panneau pour lire trois champs coûterait bien plus que ce qu'elle apprend.
+   */
+  private colorProbe: string | null = null;
+
+  private frameColorSpace(): string {
+    if (this.colorProbe) return this.colorProbe;
+    const Frame = (globalThis as { VideoFrame?: new (source: CanvasImageSource) => VideoFrame }).VideoFrame;
+    if (!Frame || this.video.readyState < 2) return "pas encore lisible";
+    let frame: VideoFrame | null = null;
+    try {
+      frame = new Frame(this.video);
+      const space = frame.colorSpace;
+      this.colorProbe = `${space.primaries ?? "?"} · ${space.transfer ?? "?"} · ${space.matrix ?? "?"} · ${frame.format ?? "format non déclaré"}`;
+      return this.colorProbe;
+    } catch (error) {
+      this.colorProbe = `refusé (${error instanceof Error ? error.message : String(error)})`;
+      return this.colorProbe;
+    } finally {
+      frame?.close();
+    }
+  }
+
+  /** What the technical panel shows. Enough to tell a stall apart from a refusal to fetch. */
+  get debug(): Record<string, string> {
+    // Reading a buffer whose source has closed throws, and the whole panel used to come back as
+    // one "invalid state" line — at exactly the moment there was most to learn from it.
+    const spans: string[] = [];
+    try {
+      const ranges = this.videoBuffer?.buffered;
+      for (let i = 0; ranges && i < ranges.length; i++) {
+        spans.push(`${ranges.start(i).toFixed(0)}–${ranges.end(i).toFixed(0)}`);
+      }
+    } catch {
+      spans.push("illisible (source fermée)");
+    }
+    return {
+      "Tampon vidéo": spans.join(" · ") || "vide",
+      "Avance sur la tête": `${this.lead.toFixed(1)} s`,
+      // The two facts that would have named the frozen-clock stall in one glance instead of
+      // three reports: what the *element* can play — the intersection of the buffers, not the
+      // video buffer alone — and whether it is waiting on a seek that never resolved.
+      "Lisible par l'élément": playableSpans(this.video),
+      "En cours de saut": this.video.seeking ? "oui" : "non",
+      // La seule mesure qui sépare « le décodeur n'y arrive pas » de « la cadence du film ne
+      // tombe pas juste sur celle de l'écran ». Sans elle, une lecture qui n'attend jamais et
+      // dont le tampon a trente secondes d'avance ne dit toujours rien sur ce qu'on voit.
+      "Images perdues": frameQuality(this.video),
+      "Couleurs de l'image": this.frameColorSpace(),
+      "MediaSource": `${this.source.readyState}${this.streamingWanted ? "" : " · en pause"}`,
+      "Lecture en cours": this.fillTask ? "oui" : "non",
+      "Sauts servis": `${this.seeksServed}${this.ladder.recoveries > 0 ? ` · ${this.ladder.recoveries} reprises` : ""}`,
+      ...this.guard.debug,
+    };
+  }
+
+  destroy(): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.guard.destroy();
+    // Résolue, pas abandonnée : l'hôte qui l'attend revérifie et ne lance rien.
+    this.startHold?.destroy();
+    this.startHold = null;
+    this.generation += 1;
+
+    this.source.removeEventListener("startstreaming", this.request);
+    this.video.removeEventListener("timeupdate", this.request);
+    this.video.removeEventListener("waiting", this.request);
+    this.video.removeEventListener("seeking", this.onSeeking);
+    this.video.removeEventListener("seeked", this.onSeeked);
+    this.video.removeEventListener("pause", this.guard.paused);
+    this.video.removeEventListener("play", this.onPlay);
+    this.video.removeEventListener("playing", this.request);
+    this.video.removeEventListener("playing", this.onPlaying);
+    if (typeof window !== "undefined" && typeof window.removeEventListener === "function") window.removeEventListener("online", this.onOnline);
+    if (this.watchdogTimer) clearInterval(this.watchdogTimer);
+    this.watchdogTimer = null;
+    if (this.clock.openingReassertTimer) clearTimeout(this.clock.openingReassertTimer);
+    this.clock.openingReassertTimer = null;
+    if (this.clock.openingGraceTimer) clearTimeout(this.clock.openingGraceTimer);
+    this.clock.openingGraceTimer = null;
+    if (this.networkRetryTimer) clearTimeout(this.networkRetryTimer);
+    this.networkRetryTimer = null;
+    this.video.removeEventListener("error", this.onElementError);
+    this.source.removeEventListener("sourceclose", this.onSourceClosed);
+    for (const [buffer, listener] of this.evictionListeners) buffer.removeEventListener("bufferedchange", listener);
+    this.evictionListeners.length = 0;
+    this.videoOps?.close();
+    this.audioOps?.close();
+
+    try {
+      if (this.source.readyState === "open") this.source.endOfStream();
+    } catch {
+      // Already closed by the element being torn down first.
+    }
+    // L'attribut part AVANT la révocation, et hors du `catch`. Ordre **inverse** de celui de la
+    // sonde de `codecSupport.ts:78-80`, qui révoque puis retire — et c'est délibéré des deux
+    // côtés : ce qui compte n'est pas l'ordre en soi, c'est ce qui, entre les deux gestes, peut
+    // relancer la sélection de ressource. La sonde n'écrit jamais `srcObject`, rien ne la relance
+    // donc entre sa révocation et son retrait, et son `load()` final tombe sur un élément déjà
+    // vidé — d'ailleurs jeté juste après. Ici, si. Écrire `srcObject`, *y compris avec `null`*,
+    // relance l'algorithme de chargement de l'élément ; ne trouvant plus de `srcObject`, la
+    // sélection de ressource retombe sur l'attribut `src`. Révoquer d'abord envoyait donc
+    // l'élément chercher l'URL qu'on venait de tuer, et Chrome le disait dans la console à
+    // chaque fermeture : `GET blob:… net::ERR_FILE_NOT_FOUND`. Pire, le retrait vivait dans un
+    // `catch` qui ne s'exécutait jamais là où il servait : Chrome refuse `srcObject = MediaSource`
+    // — c'est pourquoi il prend la branche à URL — mais accepte `srcObject = null` sans broncher.
+    // L'élément restait donc avec un `src` pointant sur un blob mort, et l'échec de chargement
+    // levait un `error` qui pouvait atterrir sur la session suivante, laquelle réutilise le même
+    // élément.
+    this.video.removeAttribute("src");
+    if (this.objectUrl) {
+      URL.revokeObjectURL(this.objectUrl);
+      this.objectUrl = null;
+    }
+    try {
+      // Suffit à remettre l'élément à zéro : le setter relance l'algorithme de chargement, qui ne
+      // trouve alors plus rien à charger. Pas de `load()` derrière, contrairement à la sonde, qui
+      // n'écrit jamais `srcObject` et n'a que lui pour interrompre le chargement en cours.
+      (this.video as unknown as { srcObject: unknown }).srcObject = null;
+    } catch {
+      // Un élément qui refuse jusqu'à `null` n'a rien relancé, mais son `src` est déjà parti
+      // ci-dessus : il ne reste rien à défaire ici.
+    }
+  }
+}
