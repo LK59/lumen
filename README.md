@@ -126,8 +126,10 @@ The browser console also says what Lumen is doing (`[Lumen] ...`), including why
 
 ## Limits and status
 
-- Lumen acts only in the Jellyfin web client. Native apps with their own player are not affected.
-- Tested with Chromium and Firefox on desktop, and used in Safari. The mobile apps have not been tried yet.
+- Lumen acts in the Jellyfin web client: Chrome, Firefox and Safari. In the Jellyfin mobile apps it applies
+  where the app plays through the web player, which on Android means only when the web player is selected in
+  the app's settings. Apps with their own native player (TV apps, Swiftfin and others) are not affected.
+- The mobile apps have not been tested yet.
 - It relies on the internals of the web client's video player, which has no public extension interface. If a
   future version of the web client can no longer be extended this way, Lumen turns itself off and says so in the
   console, and the web client plays as it does without the plugin.
