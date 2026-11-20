@@ -4,9 +4,10 @@
 
 Lumen is the playback engine of [Laterna](https://github.com/LK59/laterna), plugged into the Jellyfin web client.
 
-Most libraries are MKV. Browsers play MP4. So nearly every time the Jellyfin web client plays an MKV, the server
-has to run ffmpeg, even when the browser could decode the video as it is. The file only needed a different
-container, and often a different audio codec: DTS, TrueHD, and AC-3 or E-AC-3 outside Safari.
+Most libraries are MKV, and most browsers do not take Matroska in a `<video>` element. So when the Jellyfin web
+client plays such a file, the server runs ffmpeg to repackage it, even when the browser could decode the video as
+it is. Often the audio has to be transcoded too: no browser decodes DTS or TrueHD, and only some play AC-3 and
+E-AC-3.
 
 Lumen does both in the browser:
 
@@ -19,12 +20,14 @@ For these files the server only serves bytes:
 
 - **Playback starts sooner**, because nothing waits for ffmpeg to start.
 - **Seeking is faster**, because there is no stream to restart on the server.
-- **The server's CPU stays free**: no ffmpeg runs for the video or the audio.
+- **The server's CPU stays free**: no ffmpeg runs for the video or the audio. The saving is largest on files
+  whose audio the server had to transcode; where it only repackaged the file, the gain is in the start and the
+  seeks.
 
 Anything else is played by the regular Jellyfin player, as before. The reason is shown in the browser console
 and in the playback log.
 
-![Lumen settings and playback log](plugin/screenshot.png)
+![Lumen settings](plugin/screenshot.png)
 
 ## A complete engine, light on the client
 
@@ -57,6 +60,19 @@ On the viewer's device it stays light:
 
 If Lumen cannot play the file, or fails while playing it, the web client negotiates with the server as usual and
 its regular player takes over, transcoding included, at the same position.
+
+## Where it applies
+
+- Lumen acts in the Jellyfin web client: Chrome, Edge, Firefox and Safari. In the Jellyfin mobile apps it
+  should apply where the app plays through the web player, which on Android means only when the web player is
+  selected in the app's settings. Apps that play with their own native player are not affected.
+- Reports from the mobile apps are welcome: they have not been tested yet.
+- Lumen plugs into the web client's own video player and checks that it has the methods it relies on. If a
+  future version of the web client changes in a way Lumen does not recognise, it steps aside, says so in the
+  console, and the web client plays as usual.
+- If the server refuses the file during playback, Lumen hands over to the regular player within seconds. During
+  a network outage it waits for the network to come back and resumes by itself; after 48 seconds without it, the
+  web client takes over.
 
 ## What it can play
 
@@ -100,8 +116,8 @@ shows what it does with the file.
 
 On the server, the plugin does no media processing. It serves the player's files, adds its script to the web
 client page and one entry to its `config.json` as they are served, and keeps its settings. It modifies no file
-on disk, needs no other plugin, and works alongside plugins that modify the same page (File Transformation,
-JavaScript Injector, themes). Disabling it gives you back the stock web client.
+on disk, needs no other plugin, and works alongside plugins and themes that modify the same page. Disabling it
+gives you back the stock web client.
 
 ## Install
 
@@ -143,19 +159,6 @@ Dashboard > Lumen:
 
 The browser console also says what Lumen is doing (`[Lumen] ...`), including why it declined a file. These
 messages are in French for now.
-
-## Where it applies
-
-- Lumen acts in the Jellyfin web client: Chrome, Edge, Firefox and Safari. In the Jellyfin mobile apps it
-  should apply where the app plays through the web player, which on Android means only when the web player is
-  selected in the app's settings. Apps that play with their own native player are not affected.
-- Reports from the mobile apps are welcome: they have not been tested yet.
-- Lumen plugs into the web client's own video player and checks that it has the methods it relies on. If a
-  future version of the web client changes in a way Lumen does not recognise, it steps aside, says so in the
-  console, and the web client plays as usual.
-- If the server refuses the file during playback, Lumen hands over to the regular player within seconds. During
-  a network outage it waits for the network to come back and resumes by itself; after 48 seconds without it, the
-  web client takes over.
 
 ## Source
 
