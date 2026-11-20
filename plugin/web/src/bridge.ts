@@ -275,6 +275,7 @@ function lumenPrototype(base: Adopted): object {
     async play(this: LumenPlayer, options: StreamInfo): Promise<void> {
       const state = states.get(this)!;
       const item = options.item;
+      claimPlaybackAudio();
       if (item?.Id && (await settings(state, item)).journal) {
         if (state.recorder?.itemId !== item.Id) {
           flush(state);
@@ -360,17 +361,55 @@ function lumenPrototype(base: Adopted): object {
     },
 
     stop(this: LumenPlayer, destroyPlayer?: boolean): Promise<void> {
+      releasePlaybackAudio();
       flush(states.get(this)!);
       close(states.get(this)!);
       return base.stop.call(this, destroyPlayer);
     },
 
     destroy(this: LumenPlayer): void {
+      releasePlaybackAudio();
       flush(states.get(this)!);
       close(states.get(this)!);
       base.destroy.call(this);
     },
   });
+}
+
+/**
+ * Sur iPhone et iPad : dire au système que ce que la page joue est un film.
+ *
+ * iOS range le son d'une page dans une catégorie. « Lecture » ignore le bouton silencieux, comme toute
+ * application vidéo ; « ambiance » le respecte, comme un jeu. Laissé à lui-même (`auto`), WebKit choisit
+ * d'après ce qu'il trouve dans la page — et dans l'application Jellyfin pour iOS, avec ce script présent,
+ * il choisissait « ambiance » : aucun son en mode silencieux, que Lumen lise ou qu'il laisse lire
+ * (constaté sur iPhone le 20/11/2026 ; le son revenait script retiré). La cause exacte de ce choix n'est
+ * pas établie. La page le déclare donc elle-même le temps d'une lecture, par l'interface prévue pour
+ * cela (`navigator.audioSession`, iOS 16.4 et suivants), et rend la main à l'arrêt.
+ *
+ * Absente ailleurs que sur les systèmes d'Apple : rien ne se passe.
+ */
+let audioSessionBefore: string | null = null;
+
+function claimPlaybackAudio(): void {
+  try {
+    const session = (navigator as unknown as { audioSession?: { type: string } }).audioSession;
+    if (!session || typeof session.type !== "string" || session.type === "playback") return;
+    audioSessionBefore ??= session.type;
+    session.type = "playback";
+  } catch {
+    /* un réglage du son refusé ne doit pas empêcher la lecture */
+  }
+}
+
+function releasePlaybackAudio(): void {
+  try {
+    const session = (navigator as unknown as { audioSession?: { type: string } }).audioSession;
+    if (session && audioSessionBefore !== null) session.type = audioSessionBefore;
+  } catch {
+    /* rien */
+  }
+  audioSessionBefore = null;
 }
 
 /** Ce que le moteur fait du son, dit en anglais comme le reste du panneau de jellyfin-web. */

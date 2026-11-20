@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/LK59/lumen/main/plugin/logo.png",
     "versions": [
       {
+        "version": "0.1.7.0",
+        "changelog": "iPhone and iPad: sound now plays when the device is in silent mode, as in any video app.",
+        "targetAbi": "10.10.0.0",
+        "sourceUrl": "https://raw.githubusercontent.com/LK59/lumen/main/releases/lumen_0.1.7.0.zip",
+        "checksum": "b764d2ecb9ccd970fcf1d7712202f327",
+        "timestamp": "2026-11-20T19:33:15Z"
+      },
+      {
         "version": "0.1.6.0",
         "changelog": "With \"Play with Lumen\" unchecked, files the server direct-plays are no longer played by Lumen. The first logged playback now appears in the log.",
         "targetAbi": "10.10.0.0",
