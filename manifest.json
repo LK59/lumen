@@ -15,14 +15,6 @@
         "sourceUrl": "https://raw.githubusercontent.com/LK59/lumen/main/releases/lumen_0.1.5.0.zip",
         "checksum": "3b90e014ececff715e43637819b2e7c1",
         "timestamp": "2026-11-20T18:09:04Z"
-      },
-      {
-        "version": "0.1.4.0",
-        "changelog": "Maintenance release: code comments cleaned up, no change in behaviour.",
-        "targetAbi": "10.10.0.0",
-        "sourceUrl": "https://raw.githubusercontent.com/LK59/lumen/main/releases/lumen_0.1.4.0.zip",
-        "checksum": "1a3e4aa883d8aa79050702255f87017f",
-        "timestamp": "2026-11-20T17:25:28Z"
       }
     ]
   }
