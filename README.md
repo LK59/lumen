@@ -11,7 +11,7 @@ container, and often a different audio codec: DTS, TrueHD, and AC-3 or E-AC-3 ou
 Lumen does both in the browser:
 
 - **Remuxing.** The server sends the file as it is, by byte ranges, and the browser repackages it on the fly for
-  its own `<video>` element. The video is not touched.
+  its own `<video>` element. The video stays exactly as it is in the file.
 - **Audio transcoding.** Audio the browser cannot play is decoded in the browser and re-encoded with the
   browser's own encoder, to AAC or Opus.
 
@@ -28,21 +28,19 @@ everything Jellyfin already does, and gain on the rest.
 
 ## A complete engine, light on the client
 
-Lumen is not a patch on top of the web client's player. It replaces the whole chain that feeds the `<video>`
-element: where the web client relies on the server's ffmpeg and on hls.js, Lumen brings its own byte-range
-reader, its own Matroska and MP4 demuxers, its own fragmented MP4 muxer, its own Media Source buffer management
-(seeks, buffer limits per browser, recovery after a decode error) and its own audio pipeline. About 20,000 lines
-of TypeScript with a test suite of the same size, in daily use in Laterna before becoming a plugin.
+Lumen handles the whole chain that feeds the `<video>` element. It reads the file by byte ranges, demuxes
+Matroska and MP4, writes fragmented MP4, manages the Media Source buffers (seeks, buffer limits per browser,
+recovery after a decode error) and runs its own audio pipeline. That is about 20,000 lines of TypeScript with a
+test suite of the same size, in daily use in Laterna before becoming a plugin.
 
-It stays light where it matters, on the viewer's device:
+On the viewer's device it stays light:
 
-- **The video is never decoded by Lumen.** Samples are copied byte for byte and the browser's own `<video>`
-  element decodes and displays them, with its hardware decoder, exactly as in a direct play. No rendering
-  engine, no canvas, no WebGPU.
+- **The browser decodes the video.** Lumen copies the video samples byte for byte, and the browser's own
+  `<video>` element decodes and displays them with its hardware decoder, exactly as in a direct play.
 - **The CPU work is the audio, and only when needed.** Copying samples costs next to nothing. Decoding and
-  re-encoding a sound track happens in a worker, off the page's main thread.
-- **The download is small.** The plugin archive weighs 1.3 MB. The engine itself is about 300 KB; the audio
-  decoders are separate files, fetched only when a file needs them.
+  re-encoding a sound track runs in a worker, off the page's main thread.
+- **The download is small.** The plugin archive weighs 1.3 MB. The engine itself is about 300 KB, and the audio
+  decoders are separate files fetched only when a file needs them.
 
 ## How it works
 
