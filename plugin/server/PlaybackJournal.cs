@@ -19,6 +19,13 @@ internal static class PlaybackJournal
     private const long MaxBytes = 2 * 1024 * 1024;
     private static readonly object Lock = new();
 
+    /// <summary>
+    /// UTF-8 sans marque en tête de fichier. Avec elle (ce que fait <see cref="Encoding.UTF8"/> à la
+    /// création), la première ligne ne commençait plus par une accolade : illisible comme JSON, elle
+    /// disparaissait de la page sans un mot — la première lecture journalisée n'y figurait jamais.
+    /// </summary>
+    private static readonly Encoding Utf8 = new UTF8Encoding(false);
+
     private static string? FilePath
     {
         get
@@ -42,12 +49,12 @@ internal static class PlaybackJournal
         lock (Lock)
         {
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            File.AppendAllText(path, line + "\n", Encoding.UTF8);
+            File.AppendAllText(path, line + "\n", Utf8);
             var file = new FileInfo(path);
             if (file.Length > MaxBytes)
             {
                 var lines = File.ReadAllLines(path, Encoding.UTF8);
-                File.WriteAllLines(path, lines.Skip(lines.Length / 2), Encoding.UTF8);
+                File.WriteAllLines(path, lines.Skip(lines.Length / 2), Utf8);
             }
         }
     }
@@ -79,7 +86,8 @@ internal static class PlaybackJournal
         {
             try
             {
-                using var document = JsonDocument.Parse(lines[i]);
+                // Un journal commencé par une version antérieure garde sa marque en tête : on la retire.
+                using var document = JsonDocument.Parse(lines[i].TrimStart('\uFEFF'));
                 entries.Add(document.RootElement.Clone());
             }
             catch (JsonException)

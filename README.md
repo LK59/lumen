@@ -66,7 +66,7 @@ its regular player takes over, transcoding included, at the same position.
 - Lumen acts in the Jellyfin web client: Chrome, Edge, Firefox and Safari. In the Jellyfin mobile apps it
   should apply where the app plays through the web player, which on Android means only when the web player is
   selected in the app's settings. Apps that play with their own native player are not affected.
-- Reports from the mobile apps are welcome: they have not been tested yet.
+- In the Jellyfin iOS app, Lumen has been used on an iPhone. Reports from the Android app are welcome: it has not been tested yet.
 - Lumen plugs into the web client's own video player and checks that it has the methods it relies on. If a
   future version of the web client changes in a way Lumen does not recognise, it steps aside, says so in the
   console, and the web client plays as usual.

@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/LK59/lumen/main/plugin/logo.png",
     "versions": [
       {
+        "version": "0.1.6.0",
+        "changelog": "With \"Play with Lumen\" unchecked, files the server direct-plays are no longer played by Lumen. The first logged playback now appears in the log.",
+        "targetAbi": "10.10.0.0",
+        "sourceUrl": "https://raw.githubusercontent.com/LK59/lumen/main/releases/lumen_0.1.6.0.zip",
+        "checksum": "997a946714b3089e6f87e1e1339a30d4",
+        "timestamp": "2026-11-20T19:20:15Z"
+      },
+      {
         "version": "0.1.5.0",
         "changelog": "Maintenance release: code comments cleaned up, no change in behaviour.",
         "targetAbi": "10.10.0.0",

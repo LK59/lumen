@@ -32,6 +32,9 @@ ARCHIVE_URL="${ARCHIVE_URL:-$REPO_URL}"
 IMAGE_URL="${IMAGE_URL:-$REPO_URL/logo.png}"
 # Ce que cette version change, en une ligne : c'est ce que le catalogue de Jellyfin montre.
 CHANGELOG=$(sed -n 's:.*<PackageReleaseNotes>\(.*\)</PackageReleaseNotes>.*:\1:p' plugin/server/Lumen.csproj)
+# La note entre dans du JSON : une note qui cite un réglage entre guillemets cassait le manifeste, et la
+# publication s'arrêtait après la construction sans que rien ne soit publié.
+CHANGELOG=$(printf '%s' "$CHANGELOG" | sed 's/&quot;/"/g; s/\\/\\\\/g; s/"/\\"/g')
 ME="$(id -u):$(id -g)"
 node() { docker run --rm --user "$ME" -e HOME=/tmp -e npm_config_update_notifier=false -v "$ROOT":/app -w "/app/$1" node:26-alpine sh -c "$2"; }
 

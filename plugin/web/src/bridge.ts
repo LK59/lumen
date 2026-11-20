@@ -78,6 +78,13 @@ interface State {
   /** L'élément de la lecture en cours, et ce qui fait qu'un arrêt de l'image n'est pas une attente. */
   element: HTMLVideoElement | null;
   busy: number;
+  /**
+   * L'élément pour lequel le profil de Lumen vient d'être annoncé au serveur, le temps d'une négociation.
+   * C'est lui, et non un verdict gardé d'une lecture précédente, qui autorise Lumen à prendre la source :
+   * un fichier que Jellyfin lit lui-même en direct (un MP4) revenait avec `DirectPlay` quoi qu'on ait
+   * annoncé, et Lumen le lisait encore sur la foi d'un ancien verdict, « Play with Lumen » décoché.
+   */
+  offered: string | null;
   /** Ce que la lecture en cours fait d'une plage que le serveur refuse — voir `open`. */
   onRangeRefused: ((status: number) => void) | null;
 }
@@ -142,7 +149,7 @@ class LumenPlayer {
   isLocalPlayer = true;
 
   constructor(deps: Deps) {
-    states.set(this, { deps, adopted: null, playback: null, opening: 0, verdicts: new Map(), settings: new Map(), recorder: null, recorderServerId: undefined, askedAt: null, element: null, busy: 0, onRangeRefused: null });
+    states.set(this, { deps, adopted: null, playback: null, opening: 0, verdicts: new Map(), settings: new Map(), recorder: null, recorderServerId: undefined, askedAt: null, element: null, busy: 0, offered: null, onRangeRefused: null });
     instance = this;
   }
 
@@ -240,12 +247,15 @@ function lumenPrototype(base: Adopted): object {
       // Le chronomètre du journal part d'ici : c'est le premier geste de jellyfin-web vers son lecteur, et
       // la vérification du fichier par Lumen, qui suit, fait partie de ce que le spectateur attend.
       state.askedAt = performance.now();
+      state.offered = null;
       if (options?.isRetry) state.recorder?.error();
       const profile = await base.getDeviceProfile.call(this, item, options);
       if (!config.enabled || options?.isRetry || !eligible(item)) return profile;
       if (!(await settings(state, item)).enabled) return profile;
       const verdict = await check(this, item);
-      return verdict?.ok ? lumenProfile(profile) : profile;
+      if (!verdict?.ok) return profile;
+      state.offered = item.Id ?? null;
+      return lumenProfile(profile);
     },
 
     /**
@@ -286,7 +296,7 @@ function lumenPrototype(base: Adopted): object {
       observe(state, element, options);
       alignSubtitles(state, element);
       const verdict = options.item?.Id ? state.verdicts.get(options.item.Id) : undefined;
-      if (!config.enabled || options.playMethod !== "DirectPlay" || !verdict?.ok || !options.mediaSource?.Id || !options.item?.Id) {
+      if (!config.enabled || options.playMethod !== "DirectPlay" || !verdict?.ok || !options.mediaSource?.Id || !options.item?.Id || state.offered !== options.item.Id) {
         return base.setCurrentSrc.call(this, element, options);
       }
       const self = this;
