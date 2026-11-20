@@ -5,7 +5,7 @@
     <RootNamespace>Lumen.Jellyfin</RootNamespace>
     <AssemblyName>Lumen</AssemblyName>
     <!-- Quatre nombres : Jellyfin compare les versions de plugin ainsi, et nomme le dossier d'après elles. -->
-    <Version>0.1.4.0</Version>
+    <Version>0.1.5.0</Version>
     <!-- Ce que cette version change, en une ligne : repris dans le manifeste du dépôt de plugins. -->
     <PackageReleaseNotes>Maintenance release: code comments cleaned up, no change in behaviour.</PackageReleaseNotes>
     <Nullable>enable</Nullable>
