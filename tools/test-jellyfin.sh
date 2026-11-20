@@ -29,8 +29,9 @@ NAME=lumen-test-jellyfin
 # arrière, et une version plus ancienne ne relit pas celle d'une plus récente.
 DATA="${JF_DATA:-test-jellyfin}"
 PORT="${JF_PORT:-18096}"
-# Le dossier des médias, sur l'hôte : obligatoire, il n'y a pas de bonne valeur par défaut.
-MEDIA_ROOT="${MEDIA_ROOT:?MEDIA_ROOT : le dossier des médias sur l'hôte}"
+# Le dossier des médias, sur l'hôte : obligatoire pour créer ou préparer le serveur (il n'y a pas de bonne
+# valeur par défaut), mais pas pour l'arrêter — exigé là aussi, un oubli laissait le serveur tourner.
+[ "${1:-}" = down ] || MEDIA_ROOT="${MEDIA_ROOT:?MEDIA_ROOT : le dossier des médias sur l'hôte}"
 # L'image de Jellyfin à essayer. Pour comparer à un serveur existant, lui donner l'empreinte de son image
 # (`docker inspect <conteneur> --format '{{.Image}}'`) : la même version, quoi que `latest` vaille demain.
 IMAGE="${JF_IMAGE:-lscr.io/linuxserver/jellyfin:latest}"
