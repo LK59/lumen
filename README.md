@@ -2,6 +2,8 @@
 
 # Lumen for Jellyfin
 
+Lumen is the playback engine of [Laterna](https://github.com/LK59/laterna), plugged into the Jellyfin web client.
+
 Most libraries are MKV. Browsers play MP4. So nearly every time the Jellyfin web client plays an MKV, the server
 has to run ffmpeg, even when the browser could decode the video as it is. The file only needed a different
 container, and often a different audio codec: DTS, TrueHD, and AC-3 or E-AC-3 outside Safari.
@@ -24,12 +26,23 @@ everything Jellyfin already does, and gain on the rest.
 
 ![Lumen settings and playback log](plugin/screenshot.png)
 
-## Small on purpose
+## A complete engine, light on the client
 
-Lumen changes the container and nothing else. It has no video decoder, no renderer and no player interface of
-its own, and it does not need WebGPU. The picture is decoded and displayed by the browser's own `<video>`
-element, exactly as in a direct play, so hardware decoding and HDR output remain the browser's business. The
-plugin archive weighs 1.3 MB, most of it audio decoders that are only loaded when a file needs them.
+Lumen is not a patch on top of the web client's player. It replaces the whole chain that feeds the `<video>`
+element: where the web client relies on the server's ffmpeg and on hls.js, Lumen brings its own byte-range
+reader, its own Matroska and MP4 demuxers, its own fragmented MP4 muxer, its own Media Source buffer management
+(seeks, buffer limits per browser, recovery after a decode error) and its own audio pipeline. About 20,000 lines
+of TypeScript with a test suite of the same size, in daily use in Laterna before becoming a plugin.
+
+It stays light where it matters, on the viewer's device:
+
+- **The video is never decoded by Lumen.** Samples are copied byte for byte and the browser's own `<video>`
+  element decodes and displays them, with its hardware decoder, exactly as in a direct play. No rendering
+  engine, no canvas, no WebGPU.
+- **The CPU work is the audio, and only when needed.** Copying samples costs next to nothing. Decoding and
+  re-encoding a sound track happens in a worker, off the page's main thread.
+- **The download is small.** The plugin archive weighs 1.3 MB. The engine itself is about 300 KB; the audio
+  decoders are separate files, fetched only when a file needs them.
 
 ## How it works
 
