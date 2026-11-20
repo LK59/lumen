@@ -3,12 +3,17 @@
 # Lumen for Jellyfin
 
 Most libraries are MKV. Browsers play MP4. So nearly every time the Jellyfin web client plays an MKV, the server
-has to run ffmpeg, even when the browser could decode the video and the audio as they are. The file only needed
-a different container.
+has to run ffmpeg, even when the browser could decode the video as it is. The file only needed a different
+container, and often a different audio codec: DTS, TrueHD, and AC-3 or E-AC-3 outside Safari.
 
-Lumen does that part in the browser. The server sends the file as it is, by byte ranges, and the browser
-repackages it on the fly for its own `<video>` element. Audio the browser cannot play is decoded in the browser
-as well. The server stops working for most of what you play:
+Lumen does both in the browser:
+
+- **Remuxing.** The server sends the file as it is, by byte ranges, and the browser repackages it on the fly for
+  its own `<video>` element. The video is not touched.
+- **Audio transcoding.** Audio the browser cannot play is decoded in the browser and re-encoded with the
+  browser's own encoder, to AAC or Opus.
+
+The server stops working for most of what you play:
 
 - **Playback starts sooner**, because nothing waits for ffmpeg to start.
 - **Seeking is faster**, because there is no stream to restart on the server.
@@ -49,7 +54,7 @@ audio. Lumen never decodes video.
 |---|---|---|
 | Containers | Matroska (MKV), MP4 including fragmented MP4 | everything else (AVI, MPEG-TS, DVD and Blu-ray folders, ISO), live TV |
 | Video, if the browser decodes it | H.264, HEVC 8-bit and 10-bit, AV1 | VP8, VP9, MPEG-2, MPEG-4 ASP, VC-1 |
-| HDR | HDR10, and Dolby Vision with a base layer, passed to the browser and the display unchanged | Dolby Vision profile 5 (no base layer), Dolby Vision over AV1 |
+| HDR | HDR10, and Dolby Vision with a base layer, decoded and displayed by the browser | Dolby Vision profile 5 (no base layer), Dolby Vision over AV1 |
 | Audio copied as it is | AAC, Opus, FLAC, and AC-3 or E-AC-3 where the browser plays them | |
 | Audio decoded in the browser, then re-encoded | TrueHD and MLP, DTS and DTS-HD, AC-3, E-AC-3, multichannel 24-bit FLAC, PCM | MP2 |
 
@@ -59,8 +64,10 @@ HEVC decoder gets the regular player for HEVC files.
 
 Good to know:
 
-- **HDR is not converted.** Lumen does no tone mapping. If you rely on the server to tone map HDR for an SDR
-  screen, those files should keep going through the server.
+- **HDR on an SDR screen** is converted by the browser and the system, as for any HDR video they play. Lumen does
+  no tone mapping of its own. It does adjust one thing: on Chrome and Edge under Windows or Linux with an SDR
+  screen, it lowers the peak brightness the file announces, because those browsers otherwise darken the whole
+  picture of a film mastered very bright.
 - **Multichannel audio** that had to be decoded stays multichannel after re-encoding. On Apple devices, 7.1 is
   folded to 5.1. For Atmos and DTS:X, the channel bed is decoded and the objects are not rendered.
 - **Audio that starts after the picture** is padded with silence, so playback starts on the first frame.
@@ -120,12 +127,12 @@ The browser console also says what Lumen is doing (`[Lumen] ...`), including why
 ## Limits and status
 
 - Lumen acts only in the Jellyfin web client. Native apps with their own player are not affected.
-- Tested with Chromium and Firefox on desktop. Safari and the mobile apps have not been tried yet.
+- Tested with Chromium and Firefox on desktop, and used in Safari. The mobile apps have not been tried yet.
 - It relies on the internals of the web client's video player, which has no public extension interface. If a
   future version of the web client can no longer be extended this way, Lumen turns itself off and says so in the
   console, and the web client plays as it does without the plugin.
-- During a network outage Lumen waits for the network to come back for up to 48 seconds, then reports a playback
-  error to the web client.
+- If the server refuses the file during playback, Lumen hands over to the regular player within seconds. During
+  a real network outage it waits for the network to come back, for up to 48 seconds, and resumes by itself.
 
 ## Source
 
