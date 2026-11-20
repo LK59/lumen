@@ -142,13 +142,13 @@ The browser console also says what Lumen is doing (`[Lumen] ...`), including why
 | [`lumen-core/`](lumen-core/README.md) | The playback engine (TypeScript). It knows nothing about Jellyfin: a URL that honours `Range` in, a playing `<video>` out. Containers, remux, Media Source handling, audio decoding and re-encoding, with its test suite |
 | [`plugin/web/`](plugin/README.md) | The bridge that makes the engine a Jellyfin web player (TypeScript) |
 | [`plugin/server/`](plugin/README.md) | The Jellyfin plugin (C#) |
-| [`docs/`](docs/pont-jellyfin-web.md) | How the bridge fits into the Jellyfin web client |
+| [`docs/`](docs/jellyfin-web-bridge.md) | How the bridge fits into the Jellyfin web client |
 | `tools/test-jellyfin.sh` | A disposable Jellyfin for the browser tests |
 | `manifest.json`, `releases/` | The plugin repository that Jellyfin reads |
 
 Everything builds and runs through Docker; nothing is installed on the host. `plugin/package.sh` builds the
 engine, the bridge and the plugin, and produces the plugin folder and its archive. The code comments and the
-developer documentation are in French.
+build notes in each folder are in French.
 
 ## Licenses
 

@@ -15,7 +15,7 @@
 //      profil ordinaire de jellyfin-web et se comporte exactement comme son lecteur.
 //
 // Rien ici n'est une API publique de jellyfin-web : c'est son fonctionnement interne, lu dans la version
-// visée (voir docs/pont-jellyfin-web.md). Chaque hypothèse est vérifiée à l'exécution, et quand l'une
+// visée (voir docs/jellyfin-web-bridge.md). Chaque hypothèse est vérifiée à l'exécution, et quand l'une
 // tombe le pont se retire en le disant dans la console — jellyfin-web lit alors comme sans lui.
 import type * as LumenCore from "../../../lumen-core/src/index";
 import { PlaybackRecorder, transcodeReasonsOf } from "./journal";

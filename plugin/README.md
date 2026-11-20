@@ -8,7 +8,7 @@ Deux parties :
 
 | Dossier | Langage | Rôle |
 |---|---|---|
-| `web/` | TypeScript | Le pont : un script qui fait de Lumen un lecteur de jellyfin-web. Voir [`docs/pont-jellyfin-web.md`](../docs/pont-jellyfin-web.md) |
+| `web/` | TypeScript | Le pont : un script qui fait de Lumen un lecteur de jellyfin-web. Voir [`docs/jellyfin-web-bridge.md`](../docs/jellyfin-web-bridge.md) |
 | `server/` | C# (.NET 8, pour Jellyfin 10.10 et suivants) | Le plugin Jellyfin. **Aucun calcul côté serveur** : il livre les fichiers du lecteur, les annonce à jellyfin-web, et tient les réglages |
 
 ## Ce que fait le plugin serveur
