@@ -1346,7 +1346,7 @@ describe("MseSource", () => {
     });
 
     it("laisse passer une tête encore en train de sauter", async () => {
-      // Banc iPhone du 22/09/2026, Titanic : cinq sauts en 0,4 s. Le navigateur applique
+      // Banc iPhone du 22/09/2026, un film : cinq sauts en 0,4 s. Le navigateur applique
       // `currentTime` tout de suite et n'émet `seeking` qu'ensuite — dans cet intervalle, la tête
       // est déjà au cinquième saut alors que la cible connue est encore celle du quatrième. Le
       // détecteur y voyait une fuite et ramenait la tête 935 s en arrière, défaisant le dernier
@@ -2300,7 +2300,7 @@ describe("l'échelle des reprises", () => {
   });
 
   it("compte ses propres poussées : une horloge qui n'a bougé que d'elles reste figée", async () => {
-    // 22/09/2026, 1917 sur iPhone : douze poussées en quarante secondes, aucune reprise. Chaque
+    // 22/09/2026, un film sur iPhone : douze poussées en quarante secondes, aucune reprise. Chaque
     // poussée avance l'horloge de 0,08 s — plus que le seuil de mouvement — et remettait donc le
     // compteur à zéro : le troisième barreau n'était jamais atteint.
     const video = fakeVideo();
@@ -2332,10 +2332,10 @@ describe("l'échelle des reprises", () => {
   it("laisse un saut en cours finir de décoder avant de le pousser", async () => {
     // Même soirée : Safari restait `seeking` avec trente secondes en tampon. Un saut au milieu
     // d'un groupe d'images oblige à décoder depuis l'image clé précédente — neuf secondes de 4K
-    // pour 1917 —, et la poussée arrivait au bout d'une seconde et demie : elle relançait le
+    // pour ce film —, et la poussée arrivait au bout d'une seconde et demie : elle relançait le
     // saut, qui repartait de l'image clé, et ainsi de suite. « Une seconde de lecture pour deux
     // de chargement », jusqu'à ce qu'un saut finisse par passer entre deux poussées.
-    // La tête à neuf secondes du début du média, comme la cible de 1917 à neuf secondes de son
+    // La tête à neuf secondes du début du média, comme la cible d'un film à neuf secondes de son
     // image clé : c'est ce que le décodeur doit traverser.
     const video = fakeVideo();
     const remuxer = fakeRemuxer(200);
@@ -2814,7 +2814,7 @@ describe("lossReport", () => {
   });
 });
 
-// 14/10/2026 : un « Media failed to decode » après un saut arrière (iPhone, Lucifer S01E05) n'a
+// 14/10/2026 : un « Media failed to decode » après un saut arrière (iPhone, un épisode de série) n'a
 // laissé que « illisible (source fermée) » — la source était déjà fermée quand l'élément a signalé
 // l'erreur. Les faits d'un échec sont désormais relevés avant, et chacun dans sa garde.
 describe("faits d'un échec de décodage", () => {

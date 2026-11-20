@@ -11,7 +11,7 @@ export const FROZEN_CLOCK_MS = 1500;
  * Et combien de temps quand l'élément est encore en train de sauter.
  *
  * Un saut au milieu d'un groupe d'images se décode depuis l'image clé précédente : neuf secondes
- * de 4K avant d'arriver à la cible dans 1917, soit plus d'une seconde et demie sur un iPhone
+ * de 4K avant d'arriver à la cible dans un film, soit plus d'une seconde et demie sur un iPhone
  * comme sur un PC. Poussé à 1,5 s, le saut repartait de l'image clé, et encore, et encore
  * (22/09/2026, « une seconde de lecture pour deux de chargement »). Un saut qui ne se résout
  * vraiment jamais — celui posé pile sur le bord du média, pour lequel la poussée existe — est

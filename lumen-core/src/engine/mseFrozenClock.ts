@@ -130,11 +130,11 @@ export class FrozenClockWatch {
    *
    * Le média sous la tête commence à l'image clé d'où le décodage repart ; la distance jusqu'à la
    * tête est ce que le décodeur doit traverser avant de montrer quoi que ce soit. `FROZEN_SEEKING_MS`
-   * a été fixé pour le pire cas (neuf secondes de 4K dans 1917) et s'appliquait à tous : un saut
+   * a été fixé pour le pire cas (neuf secondes de 4K dans un film) et s'appliquait à tous : un saut
    * dans une zone relue depuis une image clé à 2,8 s restait figé six secondes sous Safari avant
    * d'être poussé — deux fois dans la même séance sur un Mac, une fois sur un iPhone (journal du
    * 24/09/2026), là où la poussée le débloquait aussitôt. Une demi-seconde par seconde à décoder,
-   * au-dessus du délai ordinaire, plafonnée à l'ancien délai : 1917 retrouve exactement ses six
+   * au-dessus du délai ordinaire, plafonnée à l'ancien délai : ce film retrouve exactement ses six
    * secondes. Une plage qui commence loin derrière (un saut dans un long tampon continu) garde le
    * plafond — la vraie image clé est inconnue, et on reste alors sur la prudence d'avant.
    */
@@ -215,7 +215,7 @@ export class FrozenClockWatch {
     this.host.video.currentTime = now + FROZEN_STEP;
     // Le mouvement se mesure depuis là où la poussée a mis l'horloge. Mesuré depuis `now`, les
     // 0,08 s de la poussée passaient pour de la lecture et remettaient le compteur à zéro : douze
-    // poussées sur 1917, jamais une reprise.
+    // poussées sur un film, jamais une reprise.
     this.lastClockAt = now + FROZEN_STEP;
   }
 }

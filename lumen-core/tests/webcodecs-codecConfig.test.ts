@@ -114,7 +114,7 @@ describe("subtitle text extraction", () => {
     expect(subtitleText("Bonjour\nle monde", "S_TEXT/UTF8")).toBe("Bonjour\nle monde");
   });
 
-  // Le symptôme, trouvé sur Titanic : ses quatre pistes sont du SubRip *interne* au Matroska, et
+  // Le symptôme, trouvé sur un film : ses quatre pistes sont du SubRip *interne* au Matroska, et
   // ce chemin-là ne nettoyait rien — une réplique en italique s'affichait entourée de ses balises.
   // Les fichiers posés à côté du film, eux, étaient nettoyés depuis toujours ; c'est la même
   // fonction qui sert maintenant aux deux.

@@ -182,7 +182,7 @@ describe("une ouverture interrompue par le réseau", () => {
 });
 
 /**
- * Un fichier tout en TrueHD — Top Gun Maverick, Sinners, American Sniper.
+ * Un fichier tout en TrueHD (trois films de la bibliothèque).
  *
  * Jusqu'au 21/09/2026, aucun décodeur n'existait nulle part : un tel fichier était cédé d'office au
  * lecteur serveur. Le décodeur de FFmpeg, compilé en WebAssembly, en fait maintenant un fichier

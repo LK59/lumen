@@ -3,8 +3,7 @@
 //
 // Jusqu'au 21/09/2026, rien ne décodait le TrueHD dans un navigateur : ni le navigateur, ni
 // mediabunny, qui ne publie de décodeurs que pour le Dolby Digital et le DTS. Un film dont la VO
-// n'existait qu'en TrueHD — 35 sur cette bibliothèque, dont Top Gun Maverick, les Hobbit, les
-// Pirates des Caraïbes — passait au lecteur serveur. Le décodeur de FFmpeg, compilé en WebAssembly
+// n'existait qu'en TrueHD — 35 sur cette bibliothèque — passait au lecteur serveur. Le décodeur de FFmpeg, compilé en WebAssembly
 // (tools/truehd-wasm), le rend maintenant, et la suite est le chemin du DTS : ré-encodé en AAC.
 //
 // mediabunny n'est pas en jeu ici : son lecteur Matroska ne connaît pas A_TRUEHD. Les blocs sont

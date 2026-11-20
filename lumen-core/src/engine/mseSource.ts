@@ -1968,7 +1968,7 @@ export class MseSource {
     // `seek` en porte déjà la durée. Compté, il écrivait une ligne `stall` à chaque saut lent
     // depuis un serveur lointain (banc du 22/09/2026 : quatre « blocages », tous des sauts).
     // Un saut resté `seeking` alors que le média est là, lui, reste compté — c'est le WebKit qui
-    // ne résout pas son saut (1917 sur iPhone).
+    // ne résout pas son saut (un film sur iPhone).
     if (this.video.seeking && !this.isBufferedAt(now)) {
       this.stallSince = null;
       return;
@@ -2006,7 +2006,7 @@ export class MseSource {
    *
    * - **Pendant un saut** : elle s'éloigne de sa cible sans y être arrivée. Banc iPhone du
    *   22/09/2026 : trois sauts sur huit films partis de 20 à 650 s au-delà de leur cible, et un
-   *   Titanic ramené par Safari à son ancienne position. L'élément se disait en train de sauter, ce
+   *   Un film ramené par Safari à son ancienne position. L'élément se disait en train de sauter, ce
    *   qui rendait aveugles toutes les autres surveillances. Renvoyée vers sa **cible**.
    * - **Après** : l'horloge avance trois secondes sans rien sous la tête (2012 sur iPhone : 658
    *   images pour 55 s regardées, la tête posée à chaque envoi sur la fin de la vidéo reçue). Aucune
@@ -2023,7 +2023,7 @@ export class MseSource {
       // Encore en train de sauter : la tête n'est pas égarée, elle n'est pas arrivée. Un navigateur
       // applique `currentTime` aussitôt et n'émet `seeking` qu'ensuite ; dans cet intervalle, une
       // rafale a déjà déplacé la tête vers une cible dont on n'a pas encore été averti. Banc iPhone
-      // du 22/09/2026, Titanic : cinq sauts en 0,4 s, et le détecteur ramenait la tête 935 s en
+      // du 22/09/2026, un film : cinq sauts en 0,4 s, et le détecteur ramenait la tête 935 s en
       // arrière — il défaisait le dernier saut demandé. Quand l'élément se posera, `seeked` dira
       // s'il est arrivé, et ce même détecteur tranchera alors avec la bonne cible.
       //

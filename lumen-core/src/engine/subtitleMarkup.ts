@@ -5,7 +5,7 @@
  * `<v Locuteur>` de VTT, et ses repères de karaoké `<00:00:01.000>`. Un lecteur qui dessine ses
  * lignes lui-même dans un paragraphe les afficherait telles quelles — c'était le cas des pistes
  * *internes* au Matroska, tandis que les fichiers posés à côté du film, eux, étaient nettoyés
- * depuis toujours. Deux chemins vers le même écran, un seul qui nettoyait : sur Titanic, dont les
+ * depuis toujours. Deux chemins vers le même écran, un seul qui nettoyait : sur un film, dont les
  * quatre pistes sont du SubRip interne, une réplique en italique s'affichait entourée de ses
  * balises.
  *
@@ -101,7 +101,7 @@ export const TEXT_SUBTITLE_CODECS = new Set(["S_TEXT/UTF8", "S_TEXT/ASCII", "S_T
  *
  * Un bloc SRT est la réplique elle-même, balises comprises : `<i>`, `<b>`, `<font color="…">`.
  * Elles sont retirées, sans quoi le lecteur, qui dessine ses lignes dans un paragraphe, les
- * afficherait — ce que faisaient les quatre pistes SubRip internes de Titanic. Un bloc ASS est la
+ * afficherait — ce que faisaient les quatre pistes SubRip internes d'un film. Un bloc ASS est la
  * fin d'une ligne Dialogue — neuf champs séparés par des virgules avant le texte —, avec des
  * balises en ligne comme {\i1}. Elles partent aussi : la mise en page est hors de portée, mais
  * jeter la piste pour son style laisserait 218 fichiers de cette bibliothèque sans sous-titres

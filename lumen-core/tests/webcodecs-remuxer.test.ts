@@ -242,7 +242,7 @@ describe("Remuxer track selection", () => {
   });
 
   describe("l'Opus copié tel quel là où le navigateur le prend (11/10/2026, DECISIONS §66)", () => {
-    // Les en-têtes réels de la bibliothèque (JoJo, saisons 1 et 5) : stéréo famille 0, et 3.0
+    // Les en-têtes réels de la bibliothèque (deux saisons d'une série) : stéréo famille 0, et 3.0
     // famille 1 avec sa table (deux flux, un couplé, ordre Vorbis L C R).
     const STEREO_HEAD = Uint8Array.from([0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, 0x01, 0x02, 0x38, 0x01, 0x80, 0xbb, 0, 0, 0, 0, 0x00]);
     const THREE_HEAD = Uint8Array.from([0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, 0x01, 0x03, 0x38, 0x01, 0x80, 0xbb, 0, 0, 0, 0, 0x01, 0x02, 0x01, 0x00, 0x02, 0x01]);

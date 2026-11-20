@@ -27,7 +27,7 @@ export class LossRecord {
    * ligne d'une perte (`failureFacts`).
    *
    * Relevées à ce moment-là parce qu'après la fermeture de la source elles ne se lisent plus : le
-   * « Media failed to decode » de Lucifer S01E05 sur un iPhone (14/10/2026) n'a laissé que
+   * « Media failed to decode » d'un épisode de série sur un iPhone (14/10/2026) n'a laissé que
    * « illisible (source fermée) », la source étant déjà fermée quand l'élément a signalé son
    * erreur. Purement informatif : rien ne lit ce relevé hors du journal.
    */

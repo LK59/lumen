@@ -1,8 +1,8 @@
 /**
  * Où commence un fragment fMP4, lu dans ses propres octets — pour le journal seulement.
  *
- * Le 14/10/2026, un « Media failed to decode » après un saut arrière sur un iPhone (Lucifer
- * S01E05) n'a laissé au journal ni où la tête se trouvait dans le fragment, ni lequel venait
+ * Le 14/10/2026, un « Media failed to decode » après un saut arrière sur un iPhone (un épisode
+ * de série) n'a laissé au journal ni où la tête se trouvait dans le fragment, ni lequel venait
  * d'être envoyé : le fichier et nos octets se sont montrés sains après coup, et rien ne permettait
  * de rapprocher l'échec d'un endroit du flux. Le fragment le dit lui-même — `mfhd` (son numéro),
  * `tfdt` (le décodage de sa première image) et la première entrée du `trun` (son décalage de
