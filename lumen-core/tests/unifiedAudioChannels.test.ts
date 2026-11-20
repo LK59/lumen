@@ -13,7 +13,7 @@ function file(tracks: MatroskaTrack[]): MatroskaFile {
 }
 
 describe("unifiedAudioChannels", () => {
-  // Le cas mesuré : « Mourir peut attendre », piste française E-AC3 7.1 et anglaise E-AC3 5.1.
+  // Le cas mesuré : un film, piste française E-AC3 7.1 et anglaise E-AC3 5.1.
   // Les deux sont ré-encodées dans le même codec, donc l'unification de codec ne se déclenchait
   // pas — et le tampon audio passait pourtant de huit canaux à six en changeant de langue.
   // Firefox 154 sous Linux accepte le nouveau segment, continue l'image, et ne sort plus un son.

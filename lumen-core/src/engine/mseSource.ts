@@ -582,7 +582,7 @@ export class MseSource {
    * L'image clé indexée qui suit cet instant (au moins une demi-seconde après), sur l'horloge du lecteur, juste dans
    * son groupe (`NEXT_KEYFRAME_MARGIN`), ou null — sans index, ou trop près de la fin. Où rouvrir après une perte
    * répétée au même endroit (`PlayerLifecycle.sourceLost`) : une image abîmée dans le fichier (enquête du 17/11/2026,
-   * *Game of Thrones* S05E10 et S01E01) se décode mal à chaque passage, et le groupe suivant n'en dépend pas. Le même
+   * Une série et S01E01) se décode mal à chaque passage, et le groupe suivant n'en dépend pas. Le même
    * calcul que l'échelle de reprise (`RecoveryLadder.nextKeyframeAfter`). Ne lève jamais : sur le chemin d'une panne.
    */
   nextKeyframeAfter(playerSeconds: number): number | null {
@@ -639,7 +639,7 @@ export class MseSource {
     // À moins d'une image avant le début de ce qui est chargé : la tête est posée sur ce début plutôt
     // que de tout relire (28/10/2026). Après un saut, la zone chargée commence à l'image clé de son
     // arrivée, et un « −10 s » qui retombe dessus la manquait de quelques millisecondes — l'audio
-    // y commence 30 ms avant l'image (Braveheart sur Firefox, au banc) — : un saut complet, 1,2 à
+    // y commence 30 ms avant l'image (un film sur Firefox, au banc) — : un saut complet, 1,2 à
     // 1,5 s d'attente en 4K, pour une image d'écart. Ce n'est pas un saut calé sur une image clé :
     // la cible ne bouge que d'une image au plus, et seulement vers du média déjà là. Le `seeking`
     // que ce déplacement provoque repasse ici, sur du chargé.
@@ -1019,7 +1019,7 @@ export class MseSource {
         //
         // Ni pendant un saut dont le lecteur approche encore : il repart de l'image clé qui précède
         // la cible, et quand le groupe d'images est plus long que `MISPLACED_SECONDS`, le premier
-        // média arrive loin *derrière* la tête par construction. *WALL·E* (28/09/2026, iPhone) : un
+        // média arrive loin *derrière* la tête par construction. Un film (28/09/2026, iPhone) : un
         // générique en un seul groupe de 35 s, un saut à la dernière seconde ; chaque envoi lisait
         // « média à 32.9 s de la tête », chaque reprise relançait la lecture depuis la même image
         // clé, trois fois, puis l'abandon laissait la tête sur une image jamais envoyée —
@@ -1248,7 +1248,7 @@ export class MseSource {
   //
   // Le son jusqu'à la limite exacte, lui : chacune de ses trames est une image clé, et rien de ce
   // qui précède la tête n'emporte celle qu'on entend. Borné comme l'image à l'image clé de la tête,
-  // il gardait derrière lui tout un groupe — 28 s sur *Ford v Ferrari* — dans un plafond de 5,5 Mo.
+  // il gardait derrière lui tout un groupe — 28 s sur un film — dans un plafond de 5,5 Mo.
   private trimBehind(): void {
     const budget = this.budget;
     if (!budget || this.seekState.pending || this.video.seeking) return;
@@ -1256,7 +1256,7 @@ export class MseSource {
     // n'y est plus lève InvalidStateError, et la levée remontait de `runFill` en rejet non géré —
     // une erreur navigateur au journal pour une panne que la reconstruction réparait déjà.
     if (this.source.readyState === "closed") return;
-    // Et une source encore « open » dont les tampons sont déjà retirés (12/11/2026, iPhone, *The Circle* repris
+    // Et une source encore « open » dont les tampons sont déjà retirés (12/11/2026, iPhone, un film repris
     // après 38 min en arrière-plan) : iOS reprend les tampons avant que la source ne se dise fermée, et la même
     // levée repartait au journal comme erreur navigateur pendant que la reconstruction reprenait le film. Un
     // élagage n'est qu'un ménage : il ne lève jamais.
@@ -1278,8 +1278,8 @@ export class MseSource {
   /**
    * Un saut encore en cours quand la fin du flux est déclarée est relancé, au même endroit.
    *
-   * Les films de Pixar de la bibliothèque finissent par ~30 s de son sans image (*WALL·E* : image
-   * jusqu'à 5904,8 s, son jusqu'à 5934,5 s ; *Là-haut* : 5767,8 / 5798,5). Là, seule la fin du flux
+   * Les films de Pixar de la bibliothèque finissent par ~30 s de son sans image (un film : image
+   * jusqu'à 5904,8 s, son jusqu'à 5934,5 s ; un film : 5767,8 / 5798,5). Là, seule la fin du flux
    * rend la tête lisible : une MediaSource `ended` prolonge la dernière plage de chaque piste
    * jusqu'à la plus tardive, et la queue sans image entre dans les plages de l'élément. Un saut
    * demandé *après* la fin arrive en un instant ; un saut demandé *avant* — la dernière seconde,
@@ -1352,8 +1352,8 @@ export class MseSource {
    * La norme MSE prolonge un `remove(0, until)` jusqu'à l'image clé qui suit `until` : si la tête
    * est dans le même groupe d'images, tout ce groupe part avec, l'image sous la tête comprise —
    * `buffered` passait de 0–30 à 20–30 pour un retrait jusqu'à 11,5 s, tête à 16 s, dans Chromium,
-   * Firefox et WebKit (banc du 25/09/2026). Avec des groupes de 28 s (*Ford v Ferrari*) ou 52 s
-   * (*1917*) et un budget de quelques secondes derrière, chaque envoi recoupait le groupe en cours :
+   * Firefox et WebKit (banc du 25/09/2026). Avec des groupes de 28 s (un film) ou 52 s
+   * (un film) et un budget de quelques secondes derrière, chaque envoi recoupait le groupe en cours :
    * arrêts, relectures, puis saut à l'image clé suivante. Le retrait s'arrête donc un peu avant
    * l'image clé qui ouvre le groupe de la tête ; l'image clé suivante de `until` est alors celle-là.
    * Sans index, on ne sait pas où elle est : `unknown`.
@@ -1527,7 +1527,7 @@ export class MseSource {
     // Après une ouverture ou un saut, le chargé commence à l'image clé d'arrivée, et un « −10 s »
     // la manque d'environ cinq secondes : 79 des 210 sauts hors du chargé relevés du 11 au 18/11,
     // qui vidaient tout — les trente secondes d'avance comprises — pour relire les mêmes octets
-    // (323 ms médians en 1080p sur iPhone, 776 ms en 4K, 1,4 s en 4K sur Mac ; *Drive*, de 1947 à
+    // (323 ms médians en 1080p sur iPhone, 776 ms en 4K, 1,4 s en 4K sur Mac ; un film, de 1947 à
     // 1937 s, 10,2 s). La tête va bien à la cible demandée, pas à une image clé.
     const kept = this.keptAfter(playerSeconds);
     this.lastServed = {
@@ -1975,7 +1975,7 @@ export class MseSource {
     }
     // Même chose pour une ouverture en cours de film qui attend son premier média : la tête est
     // encore à zéro, la cible plus loin, et la ligne écrivait un « blocage » à 0 s pour ce qui
-    // n'était que le réseau (Love Story, 23/09/2026 : 5,8 s d'ouverture, un stall à 0 s).
+    // n'était que le réseau (un film, 23/09/2026 : 5,8 s d'ouverture, un stall à 0 s).
     if (this.pendingStart !== null && !this.isBufferedAt(this.pendingStart)) {
       this.stallSince = null;
       return;

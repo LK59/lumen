@@ -2,7 +2,7 @@
 import { describe, it, expect, afterEach, vi, beforeEach } from "vitest";
 
 // Le décodeur AAC de FFmpeg en WebAssembly (aac/aacWasmAudio.ts) : par où passe un AAC à PCE
-// décodé, et comment ses canaux sont rangés. « Elle s'appelle Ruby » sur un iPhone
+// décodé, et comment ses canaux sont rangés. Un film sur un iPhone
 // (11/10/2026) : copie refusée par MediaSource, AudioDecoder de Safari en échec — le décodeur
 // WebAssembly est la dernière marche avant le lecteur serveur, hors Chromium (DECISIONS.md §62).
 
@@ -54,7 +54,7 @@ describe("quel décodeur pour un AAC à PCE", () => {
 });
 
 describe("rangement du décodé par le décodeur WebAssembly", () => {
-  it("Ruby sur Safari : 5.1 entier, dans l'ordre mesuré — pas L R C", async () => {
+  it("le fichier de référence sur Safari : 5.1 entier, dans l'ordre mesuré — pas L R C", async () => {
     ua(SAFARI_IOS);
     const { PROBE_ASC } = await import("@lumen/engine/aacPceProbe");
     const { aacShaping } = await import("@lumen/engine/softwareAudio");
@@ -99,7 +99,7 @@ describe("SoftwareAudioTrack.open — la route d'un AAC", () => {
 
   it("« Améliorer les dialogues » : sur Chromium aussi, un AAC 5.1 standard passe par le décodeur mesuré", async () => {
     // 11/10/2026 (DECISIONS §68) : le traitement remonte le rang 2 ; seul le décodeur WebAssembly a un
-    // ordre de sortie mesuré (L R C LFE Ls Rs, à 0,06 dB d'ffmpeg sur la VF de « Forrest Gump »).
+    // ordre de sortie mesuré (L R C LFE Ls Rs, à 0,06 dB d'ffmpeg sur la VF d'un film).
     ua(CHROME_MAC);
     wasmOpen.mockResolvedValue(fakeTrack(6));
     const { SoftwareAudioTrack } = await import("@lumen/engine/softwareAudio");

@@ -14,7 +14,7 @@ import {
 } from "@lumen/engine/unreadableZone";
 
 // Une zone illisible dans un fichier (DECISIONS.md §93) : des Matroska fabriqués en mémoire, sains
-// puis abîmés comme « Le Grinch » l'était — des zéros écrits par-dessus un en-tête de grappe, un
+// puis abîmés comme un film l'était — des zéros écrits par-dessus un en-tête de grappe, un
 // en-tête de bloc, le numéro de piste d'un bloc, un bloc sur deux.
 
 import { build, damaged, CLUSTER_MS, concat, el, idBytes, uint, vint } from "./helpers/zoneMatroska";

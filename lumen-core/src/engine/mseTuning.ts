@@ -33,8 +33,8 @@ export const OPENING_EDGE_SECONDS = 0.5;
 
 /**
  * Et plus tôt encore, une fois : la position redemandée 100 ms après l'atterrissage de l'ouverture, si
- * rien n'a bougé. Le gel des départs du début tenait encore en 8.30.9 (10/10/2026, iPhone : WarGames,
- * La Flamme, Drive — ouverts en 14 à 373 ms, puis figés jusqu'à la poussée de 400 ms — que le chien
+ * rien n'a bougé. Le gel des départs du début tenait encore en 8.30.9 (10/10/2026, iPhone : un film,
+ * Deux films — ouverts en 14 à 373 ms, puis figés jusqu'à la poussée de 400 ms — que le chien
  * de garde, qui passe toutes les 250 ms, ne livrait qu'à 500). Une minuterie à part, armée à
  * l'atterrissage ; la poussée de 400 ms reste le filet, l'échelle ordinaire la suite.
  */

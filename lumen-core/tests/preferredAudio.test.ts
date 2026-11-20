@@ -90,7 +90,7 @@ describe("preferredAudio", () => {
 });
 
 /**
- * Le cas « Le Mans 66 », décidé le 20/09/2026 : à langue égale, on prend la meilleure piste qui
+ * Le cas d'un film, décidé le 20/09/2026 : à langue égale, on prend la meilleure piste qui
  * **joue ici**.
  *
  * Le fichier porte trois pistes — DTS 5.1 française par défaut, TrueHD 7.1 anglaise, AC-3 5.1
@@ -149,7 +149,7 @@ describe("à langue égale, la meilleure piste jouable", () => {
  * « La meilleure lisible » veut dire la plus riche — et le drapeau du fichier ne doit pas s'y
  * substituer.
  *
- * Le cas de « 2001 : L'Odyssée de l'espace », relevé dans le journal : quatre pistes E-AC3, dont
+ * Le cas d'un film, relevé dans le journal : quatre pistes E-AC3, dont
  * une française stéréo marquée par défaut et une française 5.1 qui ne l'est pas. Le drapeau
  * valait cinq points dans le score, donc il passait devant le nombre de canaux — on ouvrait sur
  * la stéréo. Le drapeau départage maintenant *après* la richesse.
@@ -203,7 +203,7 @@ describe("isForcedTrack", () => {
 
   it("exige un mot entier, pour qu'un titre qui parle d'autre chose ne s'y glisse pas", () => {
     // « Forces » et « force » sont des mots français ordinaires : les reconnaître ferait passer
-    // « Forces spéciales » pour un sous-titre forcé. Seules les formes sans ambiguïté comptent.
+    // un film pour un sous-titre forcé. Seules les formes sans ambiguïté comptent.
     for (const titre of ["Renforcement", "Forces spéciales : commentaire", "La force tranquille", "SDH", "Complet", null]) {
       expect(isForcedTrack(st(titre)), String(titre)).toBe(false);
     }

@@ -97,7 +97,7 @@ export type DolbyVisionPlan =
  * Le Dolby Vision se porte dans une entrée `dvh1`, qui est de la famille HEVC — et seulement elle.
  *
  * Trouvé en balayant la bibliothèque une heure après avoir livré ce chantier, et jamais en
- * relisant le code : « Marty Supreme » est en **AV1** avec un Dolby Vision profil 10. Le record
+ * relisant le code : un film est en **AV1** avec un Dolby Vision profil 10. Le record
  * est là, lisible, et produit une chaîne parfaitement formée — `dvh1.10.08`. Elle est pourtant
  * fausse : `dvh1` annonce du HEVC, alors que l'entrée écrite pour une piste AV1 est `av01`. Le
  * type déclaré et la boîte écrite se seraient contredits, et le segment d'initialisation aurait

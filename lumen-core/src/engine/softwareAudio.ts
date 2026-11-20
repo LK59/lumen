@@ -77,7 +77,7 @@ export class SoftwareAudioTrack {
     /**
      * Décoder un AAC par le décodeur de FFmpeg en WebAssembly sur tous les navigateurs, Chromium
      * compris : c'est le seul dont l'ordre de sortie d'un 5.1 est mesuré ici (L R C LFE Ls Rs, à
-     * 0,06 dB d'ffmpeg sur la VF de « Forrest Gump », 11/10/2026). Demandé par « Améliorer les
+     * 0,06 dB d'ffmpeg sur la VF d'un film, 11/10/2026). Demandé par « Améliorer les
      * dialogues », qui remonte le rang 2 et ne doit pas parier sur l'ordre d'un autre décodeur.
      */
     options: { measuredAacDecoder?: boolean } = {}
@@ -95,7 +95,7 @@ export class SoftwareAudioTrack {
       return new SoftwareAudioTrack(track.samples, track.format, () => track.close());
     }
     // Un AAC à PCE hors Chromium : le décodeur AAC de FFmpeg en WebAssembly, jamais celui du
-    // navigateur — celui de Safari (CoreAudio) échoue sur le PCE de « Ruby », et un décodeur qu'on
+    // navigateur — celui de Safari (CoreAudio) échoue sur le PCE d'un film, et un décodeur qu'on
     // n'a pas mesuré pourrait ranger les canaux autrement. Sur Chromium, l'AudioDecoder du navigateur
     // (prouvé, mesuré), et le même décodeur WebAssembly s'il refuse la piste (DECISIONS.md §62).
     if (codecId === "A_AAC" && (aacDecoderRouteHere() === "wasm" || options.measuredAacDecoder)) return SoftwareAudioTrack.openWasmAac(source, trackNumber, file);

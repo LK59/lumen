@@ -18,7 +18,7 @@ import { trace } from "./trace";
 /**
  * Les valeurs Matroska (ISO/IEC 23091-2) du HDR, les seules décrites. Un SDR n'en dit rien : BT.709
  * n'est pas « srgb », et la question posée ainsi faisait répondre à Safari « illisible, pas fluide »
- * pour un 1080p qu'il lisait très bien (*Tunnel to Summer*, iPhone, 28/10/2026).
+ * pour un 1080p qu'il lisait très bien (un film, iPhone, 28/10/2026).
  */
 const TRANSFER: Record<number, "pq" | "hlg"> = { 16: "pq", 18: "hlg" };
 const GAMUT: Record<number, "rec2020"> = { 9: "rec2020" };

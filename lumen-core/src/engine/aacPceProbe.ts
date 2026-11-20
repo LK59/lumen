@@ -3,9 +3,9 @@
  * envoi, la réponse gardée — DECISIONS.md §62, couche 4.
  *
  * `isTypeSupported('audio/mp4; codecs="mp4a.40.2"')` ne répond pas à cette question : Chromium dit
- * oui et refuse le segment d'initialisation qui porte un PCE (« Elle s'appelle Ruby » sur une Fire
+ * oui et refuse le segment d'initialisation qui porte un PCE (un film sur une Fire
  * TV, 10/10/2026). La seule réponse vraie est un envoi : un segment d'initialisation audio portant
- * le PCE de Ruby, puis une trame AAC silencieuse au même PCE, et la plage tamponnée qui en résulte.
+ * le PCE du fichier de référence, puis une trame AAC silencieuse au même PCE, et la plage tamponnée qui en résulte.
  * Accepté (Safari, peut-être), la piste se copie avec tous ses canaux, sans perte ; refusé ou
  * inconnu, elle se décode (voir `aacPlan`).
  *
@@ -21,7 +21,7 @@ import { isChromiumEngine } from "./bufferBudget";
 import { hostBuild } from "../host";
 
 /**
- * Le PCE de « Ruby » à 48 kHz, tel que l'encodeur de FFmpeg l'écrit pour un 5.1 (`-aac_pce 1`) :
+ * Le PCE d'un film à 48 kHz, tel que l'encodeur de FFmpeg l'écrit pour un 5.1 (`-aac_pce 1`) :
  * avant [paire, mono], côté [mono], arrière [paire]. Et une trame AAC silencieuse encodée avec ce
  * même PCE (FFmpeg 7, `anullsrc=r=48000:cl=5.1`, 192 kbit/s), sans son en-tête ADTS.
  */
@@ -36,8 +36,8 @@ export const PROBE_FRAME = Uint8Array.from([
 // Les clés portent le nom du moteur (dans Laterna : « cine-aac-pce-… »), versions gardées : ce qu'une
 // page a retenu sous une version ne se relit pas sous une autre.
 // v2 (11/10/2026) : la v1 (« lumen-aac-pce-mse:v1 ») gardait une réponse par NAVIGATEUR, que la
-// sonde de 8.34.0 avait écrite à `false` sur un iPhone — Ruby et la piste anglaise 7.1 de
-// Forrest Gump s'y décodaient depuis (échec CoreAudio pour l'un, L R C seulement pour l'autre), là
+// sonde de 8.34.0 avait écrite à `false` sur un iPhone — le fichier de référence et la piste anglaise 7.1 de
+// un film s'y décodaient depuis (échec CoreAudio pour l'un, L R C seulement pour l'autre), là
 // où tout AAC se copiait avant le 10/10. La v1 n'est plus lue ; la v2 ne sert qu'à Chromium.
 const STORAGE_KEY = "lumen-aac-pce-mse:v2";
 const LEGACY_KEYS = ["lumen-aac-pce-mse:v1"];
@@ -64,7 +64,7 @@ export function pceCopyAccepted(): boolean | null {
  * La réponse à suivre pour cette ouverture : la réponse gardée, sinon celle du moteur.
  *
  * Sans réponse gardée, Chromium (Chrome, Edge, Silk sur Fire TV) décode : son refus du PCE est
- * prouvé (« Elle s'appelle Ruby » sur une Fire TV, 10/10/2026). Tout autre moteur COPIE, comme
+ * prouvé (un film sur une Fire TV, 10/10/2026). Tout autre moteur COPIE, comme
  * avant le 10/10 — c'était le comportement de toujours pour un AAC, validé à l'oreille, et le
  * « chemin sûr » du décodage ne l'est pas sur WebKit : le décodeur de Safari (CoreAudio) échoue sur
  * ce même PCE (« InternalAudioDecoderCocoa decoding failed », un iPhone, 10/10/2026, 21:52),
@@ -78,15 +78,15 @@ export function effectivePceAnswer(asc?: Uint8Array | null): boolean | null {
     // Chromium (Chrome, Edge, Silk) : refus prouvé — la réponse de la sonde, réécriture ou décodage
     // sinon, comme en 8.34.0.
     // Un refus constaté pour CETTE forme prime sur la sonde, ici aussi : une sonde qui a dit
-    // « accepté » pour le PCE de Ruby ne dit rien d'une autre forme, et sans cela un refus réel
+    // « accepté » pour le PCE du fichier de référence ne dit rien d'une autre forme, et sans cela un refus réel
     // recopiait à chaque reconstruction (chasse du 11/10/2026, B2).
     if (isChromiumEngine(navigator.userAgent ?? "")) return asc && shapeRefused(asc) ? false : pceCopyAccepted();
   } catch {
     return null;
   }
   // Tout autre moteur COPIE, comme avant le 10/10 — sans jamais lire la réponse globale de la sonde :
-  // l'acceptation dépend de la FORME du PCE (CoreAudio décode le 7.1 de Forrest Gump, pas le 5.1 de
-  // Ruby), et une sonde à un seul PCE ne dit rien des autres. Seul un refus constaté à l'envoi, pour
+  // l'acceptation dépend de la FORME du PCE (CoreAudio décode le 7.1 d'un film, pas le 5.1 d'un autre
+  // Le fichier de référence), et une sonde à un seul PCE ne dit rien des autres. Seul un refus constaté à l'envoi, pour
   // CETTE forme et ce build, fait décoder (`takePceCopyRefusal`).
   return asc && shapeRefused(asc) ? false : true;
 }

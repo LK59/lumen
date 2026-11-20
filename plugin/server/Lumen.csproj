@@ -5,9 +5,9 @@
     <RootNamespace>Lumen.Jellyfin</RootNamespace>
     <AssemblyName>Lumen</AssemblyName>
     <!-- Quatre nombres : Jellyfin compare les versions de plugin ainsi, et nomme le dossier d'après elles. -->
-    <Version>0.1.3.0</Version>
+    <Version>0.1.4.0</Version>
     <!-- Ce que cette version change, en une ligne : repris dans le manifeste du dépôt de plugins. -->
-    <PackageReleaseNotes>Runs on Jellyfin 10.10 and later. Update from the Lumen page in one click. Text subtitles are aligned with the picture. When the server refuses the file, playback is handed back to the regular player at once.</PackageReleaseNotes>
+    <PackageReleaseNotes>Maintenance release: code comments cleaned up, no change in behaviour.</PackageReleaseNotes>
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>

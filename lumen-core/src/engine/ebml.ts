@@ -94,7 +94,7 @@ export async function readElementAt(source: ByteSource, offset: number): Promise
  * l'identifiant ou de la taille n'a aucun bit de marque (0x00, la seule valeur sans). Ce n'est
  * pas une lecture courte (un réseau coupé, la fin du fichier au milieu d'un en-tête) : ces octets
  * sont là, et ce ne sont pas ceux d'un en-tête EBML. C'est ce que laisse un bloc de zéros écrit
- * par-dessus un fichier (« Le Grinch », 14/10/2026 — DECISIONS.md §93).
+ * par-dessus un fichier (un film, 14/10/2026 — DECISIONS.md §93).
  */
 export const UNREADABLE = "illisible" as const;
 

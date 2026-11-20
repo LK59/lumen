@@ -94,7 +94,7 @@ describe("un moteur qu'on ne connaît pas", () => {
 });
 
 describe("le budget d'un tampon", () => {
-  /** Ted Lasso S04 : 27 Mb/s d'image, 3,4 Mo/s. */
+  /** Une série S04 : 27 Mb/s d'image, 3,4 Mo/s. */
   const TED_LASSO = 27e6 / 8;
 
   it("tient sous le plafond d'un iPad en 4K, avance et arrière réunis", () => {

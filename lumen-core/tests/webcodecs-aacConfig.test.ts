@@ -12,7 +12,7 @@ import {
 } from "@lumen/engine/aacConfig";
 import type { MatroskaFile, MatroskaTrack } from "@lumen/engine/matroska";
 
-// La configuration AAC des deux pistes de « Elle s'appelle Ruby » (2012), relue du fichier
+// La configuration AAC des deux pistes d'un film, relue du fichier
 // (`ffprobe -show_data`) : AAC-LC, 48 kHz, `channelConfiguration` 0 et un PCE — avant [paire, mono],
 // côté [mono], arrière [paire], pas de caisson. Octet pour octet ce que l'encodeur de FFmpeg écrit
 // pour un 5.1 passé par un PCE (`-aac_pce 1`), mesuré le 10/10/2026.
@@ -73,7 +73,7 @@ function ascWithPce(
 }
 
 describe("couche 1 — le PCE relu élément par élément", () => {
-  it("relit la disposition de Ruby, dans l'ordre du flux", () => {
+  it("relit la disposition du fichier de référence, dans l'ordre du flux", () => {
     const config = parseAacConfig(RUBY);
     expect(config).toMatchObject({ objectType: 2, frequencyIndex: 3, channelConfiguration: 0 });
     expect(config?.pce).toMatchObject({ front: [true, false], side: [false], back: [true], lfe: 0, channels: 6 });
@@ -107,7 +107,7 @@ describe("couche 2 — un PCE équivalent à une configuration standard est ré�
     expect(of(ascWithPce([false, true, true], [], [true], 1))).toBe(7);
   });
 
-  it("refuse un ordre différent — celui de Ruby, la paire avant devant le centre", () => {
+  it("refuse un ordre différent — celui du fichier de référence, la paire avant devant le centre", () => {
     expect(standardConfigOf(parseAacConfig(RUBY)!.pce!)).toBeNull();
     expect(standardConfigOf(parseAacConfig(ascWithPce([true, false], [], [true], 1))!.pce!)).toBeNull();
   });
@@ -125,28 +125,28 @@ describe("couche 2 — un PCE équivalent à une configuration standard est ré�
     expect(rewriteToStandard(ascWithPce([false, true], [true], [], 1))).toEqual(STANDARD_51);
   });
 
-  it("ne réécrit ni Ruby, ni une configuration déjà standard", () => {
+  it("ne réécrit ni le fichier de référence, ni une configuration déjà standard", () => {
     expect(rewriteToStandard(RUBY)).toBeNull();
     expect(rewriteToStandard(STANDARD_51)).toBeNull();
   });
 });
 
 describe("couche 3 — décodé, rangé dans une disposition standard", () => {
-  it("Ruby : forme mesurée, livrée en 5.1 entier dans l'ordre du décodeur", () => {
+  it("le fichier de référence : forme mesurée, livrée en 5.1 entier dans l'ordre du décodeur", () => {
     expect(aacPlan(RUBY)).toEqual({ action: "decode", channels: 6, rows: null, keep: null, measured: true });
   });
 
-  it("7.1 anglais de Forrest Gump & co : forme mesurée (11/10/2026), livré en 7.1 entier dans l'ordre du décodeur", () => {
+  it("7.1 anglais d'un film & co : forme mesurée (11/10/2026), livré en 7.1 entier dans l'ordre du décodeur", () => {
     // `ffprobe -show_data` sur la piste : avant [mono, paire], arrière [paire, paire], un caisson.
     const forrest = Uint8Array.from([0x11, 0x80, 0x04, 0xc8, 0x09, 0x00, 0x01, 0x08, 0xc8, 0x00, 0x00, 0x00]);
     expect(pceShape(parseAacConfig(forrest)!.pce!)).toBe("MP/-/PP/1");
     expect(aacPlan(forrest)).toEqual({ action: "decode", channels: 8, rows: null, keep: null, measured: true });
-    // Rien ne change là où le décodé n'est pas mesuré, ni pour Ruby.
+    // Rien ne change là où le décodé n'est pas mesuré, ni pour le fichier de référence.
     expect(aacPlan(forrest, { orderMeasured: false })).toEqual({ action: "decode", channels: 3, rows: null, keep: 3, measured: false });
     expect(aacPlan(RUBY)).toMatchObject({ action: "decode", channels: 6 });
   });
 
-  it("un décodeur jamais mesuré (AudioToolbox, sur Safari) : L R C, même pour Ruby", () => {
+  it("un décodeur jamais mesuré (AudioToolbox, sur Safari) : L R C, même pour le fichier de référence", () => {
     expect(aacPlan(RUBY, { orderMeasured: false })).toEqual({ action: "decode", channels: 3, rows: null, keep: 3, measured: false });
   });
 
@@ -207,7 +207,7 @@ describe("couche 3 — décodé, rangé dans une disposition standard", () => {
 });
 
 describe("couche 4 — un navigateur qui prend le PCE le reçoit copié", () => {
-  it("copie Ruby tel quel quand le navigateur l'a prouvé, décode sinon", () => {
+  it("copie le fichier de référence tel quel quand le navigateur l'a prouvé, décode sinon", () => {
     expect(aacPlan(RUBY, { pceAccepted: true })).toEqual({ action: "copy" });
     expect(aacPlan(RUBY, { pceAccepted: false }).action).toBe("decode");
     expect(aacPlan(RUBY, { pceAccepted: null }).action).toBe("decode");
@@ -253,13 +253,13 @@ describe("livraison — ce que le remultiplexeur fait de chaque piste", () => {
     return import("@lumen/engine/remuxer");
   }
 
-  it("ré-encode Ruby là où le PCE est refusé, en annonçant ses six canaux", async () => {
+  it("ré-encode le fichier de référence là où le PCE est refusé, en annonçant ses six canaux", async () => {
     const remuxer = await navigateur(false);
     expect(remuxer.audioDelivery(piste(RUBY))).toBe("transcode");
     expect(remuxer.deliveredAudio(piste(RUBY))).toEqual({ copied: false, channels: 6 });
   });
 
-  it("copie Ruby là où le navigateur a prouvé prendre le PCE", async () => {
+  it("copie le fichier de référence là où le navigateur a prouvé prendre le PCE", async () => {
     const remuxer = await navigateur(true);
     expect(remuxer.audioDelivery(piste(RUBY))).toBe("copy");
     expect(remuxer.deliveredAudio(piste(RUBY))).toEqual({ copied: true, channels: 6 });
@@ -289,7 +289,7 @@ describe("décodage — ce que le décodeur logiciel garde", () => {
     vi.resetModules();
   });
 
-  it("garde les six canaux de Ruby, rien à changer pour un AAC ordinaire", async () => {
+  it("garde les six canaux du fichier de référence, rien à changer pour un AAC ordinaire", async () => {
     vi.resetModules();
     vi.stubGlobal("localStorage", { getItem: () => null, setItem: () => {} });
     // Un moteur Chromium, où le PCE se décode faute de réponse gardée (DECISIONS.md §62) ; ailleurs

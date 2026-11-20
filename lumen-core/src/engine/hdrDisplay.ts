@@ -2,10 +2,10 @@
  * L'écran affiche-t-il le HDR, et que faut-il en déduire pour Chrome sous Windows ?
  *
  * Chrome sous Windows ramène tout un film HDR sous la lumière maximale que le film annonce : sur un
- * écran qui n'affiche pas le HDR, un film annoncé à 4 000 nits devient très sombre (*2012*,
- * *Apocalypse Now*), quand Firefox le montre juste — il garde les tons moyens et écrête les
+ * écran qui n'affiche pas le HDR, un film annoncé à 4 000 nits devient très sombre (un film,
+ * Un film), quand Firefox le montre juste — il garde les tons moyens et écrête les
  * reflets que l'écran ne sait de toute façon pas rendre. Un film annoncé à 657 nits (*Dirty
- * Dancing*) s'affiche bien dans ce même Chrome (22/09/2026). Plafonner la lumière annoncée à ce
+ * s'affiche bien dans ce même Chrome (22/09/2026). Plafonner la lumière annoncée à ce
  * niveau-là donne à Chrome le rendu de Firefox.
  *
  * Seulement quand l'écran n'affiche pas le HDR : sur un vrai écran HDR, Chrome a la place de

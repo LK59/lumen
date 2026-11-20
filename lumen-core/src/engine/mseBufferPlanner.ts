@@ -66,7 +66,7 @@ export class BufferPlanner {
    *
    * Le budget suppose l'arrière déjà ramené au sien. Ce n'est pas le cas juste après un saut en
    * avant : ce qui était devant passe derrière d'un coup, le retrait attend que le saut soit fini
-   * (`trimBehind`), et l'avance, elle, se refaisait aussitôt en entier. iPad, *Forrest Gump*,
+   * (`trimBehind`), et l'avance, elle, se refaisait aussitôt en entier. iPad, un film,
    * 30/09/2026 : +10 s, 60 s de son tenus pour un plafond qui en tenait à peine autant, et WebKit
    * a retiré lui-même le son de 1559,87 à 1590,37 s, tête à 1563,7 s — l'élément est resté
    * `seeking` cinq secondes sur une image présente. Deux fois dans le film. L'image n'a pas cette

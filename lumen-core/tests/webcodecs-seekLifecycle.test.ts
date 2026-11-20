@@ -3,7 +3,7 @@ import { SeekLifecycle } from "@lumen/engine/seekLifecycle";
 
 // L'état d'un saut, réuni le 22/09/2026 : ses transitions, sans lecteur autour.
 describe("SeekLifecycle", () => {
-  it("garde la dernière demande d'une rafale, et ne l'oublie qu'une fois servie", () => {
+  it("garde la dernière demand'une rafale, et ne l'oublie qu'une fois servie", () => {
     const seek = new SeekLifecycle();
     seek.request(300);
     seek.request(900);

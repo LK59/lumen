@@ -191,7 +191,7 @@ export function preferredAudio(file: MatroskaFile, preferences?: TrackPreference
      *    qui demande la VO obtient la VO, fût-ce par un autre lecteur.
      *
      * Les deux tombent d'accord dans le cas qui nous occupe — deux pistes de la même langue dont
-     * une seule joue, « Le Mans 66 » — et c'est là que le changement de piste disparaît.
+     * une seule joue, un film — et c'est là que le changement de piste disparaît.
      */
     // Et les canaux *livrés*, puis la copie, pour départager (29/09/2026, audit P5) — la même
     // question que l'écran pose par `RemuxPlayback.deliveredAudio`.
@@ -312,7 +312,7 @@ async function probeOpened(source: ByteSource, options: RemuxPlaybackOptions, li
   if (options.dialogue && options.dialogue !== "off") trace(`dialogues améliorés demandés (${options.dialogue === "strong" ? "encore plus fort" : "normal"})`);
 
   // Ce que « Son par Lumen » a noté pour un pipeline précédent (un saut y rouvre le décodeur après sa
-  // ligne `start`) ne doit pas se lire comme celui de cette ouverture : la ligne de *JoJo* annonçait le
+  // ligne `start`) ne doit pas se lire comme celui de cette ouverture : la ligne d'une série annonçait le
   // DTS de l'épisode d'avant (19/11/2026). Oublié ici, juste avant d'ouvrir.
   takeLumenFacts();
   const chosen = await choosePlaybackPath({

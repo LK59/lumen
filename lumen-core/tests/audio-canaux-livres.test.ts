@@ -4,7 +4,7 @@ import type { MatroskaFile, MatroskaTrack } from "@lumen/engine/matroska";
 /**
  * Les canaux qui comptent sont ceux que le spectateur **reçoit**, pas ceux de la source (audit P5).
  *
- * « Le Mans 66 » porte une TrueHD 7.1 et une AC-3 5.1 anglaises. Sur un iPhone, l'AC-3 passe telle
+ * Un film porte une TrueHD 7.1 et une AC-3 5.1 anglaises. Sur un iPhone, l'AC-3 passe telle
  * quelle, alors que la TrueHD est décodée en WebAssembly sur le fil principal puis ré-encodée par
  * l'AAC d'Apple, plafonné à six canaux : elle sort en 5.1 elle aussi. Classées par les canaux de
  * la source, c'est la TrueHD qui gagnait — tout ce travail pour aucun canal de plus. Classées par

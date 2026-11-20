@@ -94,7 +94,7 @@ export interface DolbyVisionInfo {
    * Dolby Vision affiche quelque chose de juste. C'est ce chiffre, et lui seul, qui décide si un
    * refus du navigateur laisse une porte de sortie ou non.
    *
-   * Relevé sur « Retour vers le futur II » : `01 00 10 35 10 …`, l'octet 4 portant `1` dans son
+   * Relevé sur un film : `01 00 10 35 10 …`, l'octet 4 portant `1` dans son
    * quartet haut — ce que ffprobe nomme `dv_bl_signal_compatibility_id=1`.
    */
   compatibilityId: number;
@@ -222,7 +222,7 @@ export function isRandomAccessPoint(data: Uint8Array, codecId: string, lengthSiz
  *
  * Un décodeur qui démarre sur la CRA doit les écarter (HEVC 8.1.3, NoRaslOutputFlag) : leurs
  * références n'existent pas. Safari ne le fait pas pour nous — il répond « Media failed to decode »
- * et ferme la MediaSource. *Ted Lasso* S02E01 (24/09/2026, Mac) : un tampon plein, la lecture
+ * et ferme la MediaSource. Une série (24/09/2026, Mac) : un tampon plein, la lecture
  * reprise depuis la CRA de 1025,3 s, et Safari mort en quelques millisecondes ; deux
  * reconstructions sur les CRA suivantes, mortes pareil, puis le lecteur serveur. Chacune de ces
  * CRA avait deux ou trois RASL derrière elle ; celles de 2:44, où un saut venait de réussir, n'en
@@ -247,7 +247,7 @@ export function isRaslPicture(data: Uint8Array, codecId: string, lengthSize: num
  *
  * An IDR picture is one. So is an intra picture preceded by a recovery point SEI (payload 6)
  * whose `recovery_frame_cnt` is zero — decoding may start there and every picture from it on is
- * exact (D.2.8). Blu-ray and broadcast streams mark their keyframes that way: *Supernatural*
+ * exact (D.2.8). Blu-ray and broadcast streams mark their keyframes that way: a series
  * S15E20 has a single IDR in 43 minutes, and every other keyframe is an I picture behind such a
  * SEI (24/09/2026, 26 episodes across two series). Refused, a seek or a resume read the file to
  * its end looking for an IDR that never came, and playing from the start never closed its first
@@ -316,7 +316,7 @@ function avcIntraSlice(unit: Uint8Array): boolean {
  * those that belong to the one after — or `null` when the block does carry a picture, or cannot
  * be read (the container's word stands when there is nothing to check it against).
  *
- * Matroska means one block per picture, and *Dirty Dancing* (21/09/2026) breaks that: before
+ * Matroska means one block per picture, and a film (21/09/2026) breaks that: before
  * three of its CRA keyframes sits a block holding VPS, SPS, PPS and a Dolby Vision RPU (NAL 62)
  * and no slice, timed as though it were a picture — at the same instant as a real one. The
  * picture just before it is the only one in the stream without an RPU: the muxer cut the access
@@ -369,9 +369,9 @@ export function strayUnits(
  * Le reste de l'image est rendu tel quel ; sans rien à plafonner, l'image elle-même, sans copie.
  *
  * Pourquoi : Chrome sous Windows ramène tout le film sous la lumière maximale qu'il annonce. Un
- * film annoncé à 4 000 nits devient très sombre sur un écran qui n'affiche pas le HDR — *2012*,
- * *Apocalypse Now* —, quand Firefox le montre juste ; un film annoncé à 657 nits (*Dirty
- * Dancing*) s'y affiche bien (22/09/2026). Chrome lit ces valeurs dans le flux, pas seulement
+ * film annoncé à 4 000 nits devient très sombre sur un écran qui n'affiche pas le HDR — un film,
+ * Un film —, quand Firefox le montre juste ; un film annoncé à 657 nits
+ * s'y affiche bien (22/09/2026). Chrome lit ces valeurs dans le flux, pas seulement
  * dans le conteneur : les réécrire ici est le seul moyen qu'il en tienne compte. Voir
  * `hdrLuminanceCap` pour le moment où on le fait.
  *

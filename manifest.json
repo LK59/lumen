@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/LK59/lumen/main/plugin/logo.png",
     "versions": [
       {
+        "version": "0.1.4.0",
+        "changelog": "Maintenance release: code comments cleaned up, no change in behaviour.",
+        "targetAbi": "10.10.0.0",
+        "sourceUrl": "https://raw.githubusercontent.com/LK59/lumen/main/releases/lumen_0.1.4.0.zip",
+        "checksum": "1a3e4aa883d8aa79050702255f87017f",
+        "timestamp": "2026-11-20T17:25:28Z"
+      },
+      {
         "version": "0.1.3.0",
         "changelog": "Runs on Jellyfin 10.10 and later. Update from the Lumen page in one click. Text subtitles are aligned with the picture. When the server refuses the file, playback is handed back to the regular player at once.",
         "targetAbi": "10.10.0.0",

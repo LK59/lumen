@@ -13,7 +13,7 @@ export { geckoVersion, isChromiumEngine };
  * la tête tant que le navigateur ne refusait pas un envoi. Sur un iPad, c'est trop pour la 4K :
  * WebKit plafonne chaque SourceBuffer à **105 Mo** sur iOS et iPadOS, 304 Mo sur macOS
  * (`SettingsBaseCocoa.mm`, `defaultMaximumSourceBufferSize`, lu le 25/09/2026), et un tampon sans
- * image n'en reçoit que 5 % (`SourceBuffer::maximumBufferSize`). *Ted Lasso* S04, 27 Mb/s d'image :
+ * image n'en reçoit que 5 % (`SourceBuffer::maximumBufferSize`). Une série S04, 27 Mb/s d'image :
  * 105 Mo en tiennent 31 s, derrière et devant réunis. L'iPad lisait donc en permanence contre le
  * plafond — son avance plafonnait à 20-22 s —, chaque envoi forçait WebKit à évincer lui-même au
  * milieu de l'ajout, et c'est dans ce régime que du média déjà chargé a disparu sous un saut de
@@ -40,7 +40,7 @@ const AUDIO_ONLY_SHARE = 0.05;
 /**
  * La part du plafond du son qu'on se donne vraiment, avant la marge de `USABLE_SHARE`.
  *
- * 30/09/2026, iPad de Lucas, *Forrest Gump* en 4K : deux arrêts de cinq secondes, tous deux juste
+ * 30/09/2026, un iPad, un film en 4K : deux arrêts de cinq secondes, tous deux juste
  * après un saut de +10 s, tous deux ouverts par « le navigateur a retiré audio 1559.87–1590.37 —
  * tête à 1563.7 s » : WebKit avait vidé le son *sous* la tête, l'image restant là. Le budget comptait
  * 5,5 Mo de son à 0,09 Mo/s ; tenus, 60 s (1530–1590 s) — le plafond, à quelques pour cent près. Le

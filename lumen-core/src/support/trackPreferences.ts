@@ -91,7 +91,7 @@ const NAMED_IN_TITLE: [RegExp, string][] = [
  *  * `\b` ne délimite pas après un `é` — ce n'est pas un caractère de mot pour l'expression
  *    régulière —, donc « Forcé » n'était pas reconnu. D'où des frontières écrites à la main sur
  *    `\p{L}`, qui couvre les lettres accentuées ;
- *  * « Forces spéciales » était pris pour une piste forcée. On ne reconnaît donc que les formes
+ *  * Un film était pris pour une piste forcée. On ne reconnaît donc que les formes
  *    sans ambiguïté — `forcé`, `forcée`, `forcés`, `forcées`, `forced` — et surtout **pas**
  *    `force` ni `forces`, qui sont des mots français ordinaires.
  */
@@ -105,7 +105,7 @@ export function isForcedTrack(track: NamedTrack): boolean {
  * Ce que le *titre* d'une piste dit d'elle — pour qui n'a que le texte, faute de drapeau.
  *
  * Exportés parce que l'écran de gestion (`fileTracks.ts`) avait ses propres motifs, faux des deux
- * façons décrites plus haut : « Forces spéciales » y était une piste forcée, « Forcé » ne l'était
+ * façons décrites plus haut : un film y était une piste forcée, « Forcé » ne l'était
  * pas. Un même fichier se lisait donc autrement selon l'écran.
  */
 export function titleSaysForced(text: string | null | undefined): boolean {
@@ -224,14 +224,14 @@ function rank<T extends NamedTrack>(
       /**
        * Ce qui joue ici passe devant, à langue égale — décidé le 20/09/2026.
        *
-       * « Le Mans 66 » porte deux pistes anglaises : une TrueHD 7.1 et une AC-3 5.1. La première
+       * Un film porte deux pistes anglaises : une TrueHD 7.1 et une AC-3 5.1. La première
        * gagnait, parce qu'elle vient en premier dans le fichier ; or rien ne la décode, et le
        * lecteur cédait donc la place au lecteur serveur — six fois pour le même spectateur, qui
        * ne demandait que la VO. Il l'obtient maintenant sans quitter le lecteur natif, en 5.1 au
        * lieu de 7.1.
        *
        * Depuis le 21/09/2026, le TrueHD joue aussi dans le lecteur natif : les deux pistes du
-       * « Mans 66 » sont portables, et c'est la plus riche — la 7.1 — qui gagne de nouveau. La
+       * un film sont portables, et c'est la plus riche — la 7.1 — qui gagne de nouveau. La
        * règle n'a pas changé ; c'est ce qu'elle voit qui a changé.
        *
        * Vingt points : assez pour départager deux pistes de la même langue, jamais assez pour
@@ -248,7 +248,7 @@ function rank<T extends NamedTrack>(
      * L'ordre des départages, et `isDefault` **après** la richesse — corrigé le 20/09/2026.
      *
      * Il valait cinq points dans le score, donc il passait devant le nombre de canaux, qui n'est
-     * qu'un départage. Conséquence visible dans le journal sur « 2001 » : la piste française
+     * qu'un départage. Conséquence visible dans le journal sur un film : la piste française
      * stéréo, marquée par défaut dans le fichier, battait la française 5.1 — on ouvrait sur la
      * stéréo alors que la 5.1 était là. Ce n'est pas ce qu'on veut dire par « la meilleure ».
      *
@@ -260,7 +260,7 @@ function rank<T extends NamedTrack>(
      * toujours nulle et `isDefault` tranche exactement comme avant.
      *
      * **Les canaux livrés, puis la copie** — depuis le 29/09/2026 (audit P5). « La plus riche »
-     * comptait les canaux de la source. Sur un iPhone, la TrueHD 7.1 du « Mans 66 » passait donc
+     * comptait les canaux de la source. Sur un iPhone, la TrueHD 7.1 d'un film passait donc
      * devant l'AC-3 5.1 d'à côté, pour sortir en 5.1 elle aussi : l'AAC d'Apple ne produit pas
      * plus de six canaux. Un décodage WebAssembly sur le fil principal et un ré-encodage, pour
      * aucun canal de plus. On compte désormais ce que le spectateur reçoit — le moindre de la

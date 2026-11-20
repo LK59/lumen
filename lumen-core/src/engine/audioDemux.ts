@@ -51,7 +51,7 @@ const MARGIN_US = 1_000_000;
 /**
  * Pendant la recherche du point de départ seulement : au-delà, la piste est finie pour cette lecture.
  * Large exprès — un départ avant le premier paquet prend le premier, quelle que soit la distance
- * (le silence de tête de *The Circle*, 30 s) : cette borne ne vise que la fin d'un doublage.
+ * (le silence de tête d'un film, 30 s) : cette borne ne vise que la fin d'un doublage.
  */
 export const GIVE_UP_S = 45;
 

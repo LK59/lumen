@@ -10,7 +10,7 @@
 #
 # The encoder's version decides the PCE, and the two are kept on purpose:
 # - FFmpeg 8.0 (libavcodec 62) writes front [pair, mono], side [mono], back [pair], no LFE element —
-#   byte for byte the PCE of « Elle s'appelle Ruby », the shape whose decoded order was measured
+#   byte for byte the PCE of a film, the shape whose decoded order was measured
 #   (`MEASURED_DECODED_ORDERS`, "PM/M/P/0"), delivered as a whole 5.1;
 # - FFmpeg 8.1 (libavcodec 63) writes another PCE for the same 5.1, a shape never measured, which
 #   the player keeps to L R C (the rule for any unmeasured layout).

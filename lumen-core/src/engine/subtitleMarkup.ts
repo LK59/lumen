@@ -28,7 +28,7 @@ export function stripSubtitleMarkup(text: string, options: { allBraces?: boolean
   const clean = text
     .replace(/<[^>]*>/g, "")
     // Les blocs d'override ASS, `{\an8}`, `{\i1}` : ils apparaissaient à l'écran, glissés dans
-    // des pistes SubRip (sous-titres forcés de *Ted Lasso*, 22/09/2026). Seuls ceux qui commencent
+    // des pistes SubRip (sous-titres forcés d'une série, 22/09/2026). Seuls ceux qui commencent
     // par une barre oblique, dans du SubRip — une accolade peut y être du texte. Dans l'ASS, toute
     // accolade est un bloc (les commentaires aussi).
     .replace(options.allBraces ? /\{[^}]*\}/g : /\{\\[^}]*\}/g, "");

@@ -1,14 +1,14 @@
 // Le son qui commence après l'image — et le silence qui comble l'écart (DECISIONS.md §148).
 //
-// The Circle, iPhone, 12/11/2026 : l'image tamponnée dès 1,4 s, le son seulement dès 30,2 s. La
+// Un film, iPhone, 12/11/2026 : l'image tamponnée dès 1,4 s, le son seulement dès 30,2 s. La
 // piste AC-3 du fichier n'a aucun bloc avant 30 s (ffprobe : premier paquet à 30,000 s, alors que
 // le conteneur annonce un début à 0). Or une MediaSource ne joue un instant que si *tous* ses
 // tampons l'ont — l'élément ne voit que l'intersection — : rien de lisible sous la tête, une reprise
 // au même endroit, le tampon audio de WebKit qui déborde à force d'avance, le lecteur serveur, qui
 // échoue à son tour. Sous quinze secondes d'écart, l'atterrissage (`landingFor`) posait la tête au
 // début du son : le film démarrait, mais sautait ses premières secondes d'image. 44 films ici au
-// recensement du 12/11/2026, presque toujours une VF plus courte en tête que la VO (« Green Book » :
-// VF à 24 s, VO à 0,02 s ; « WALL·E » : VF à 11,8 s, VO à −0,005 s).
+// recensement du 12/11/2026, presque toujours une VF plus courte en tête que la VO (un film :
+// VF à 24 s, VO à 0,02 s ; un film : VF à 11,8 s, VO à −0,005 s).
 //
 // La réponse est celle d'un lecteur de fichier : jouer l'image, muette, jusqu'au premier son. Le
 // silence passe par le ré-encodage existant (`audioTranscode.ts`), parce que c'est le seul endroit
@@ -25,16 +25,16 @@ import type { DecodedAudio } from "./softwareAudio";
  *
  * En dessous, rien ne change : l'atterrissage pose la tête sur le premier instant commun, ce qui
  * saute au pire une demi-seconde d'image — d'ordinaire du noir —, et les écarts ordinaires vivent
- * là : une VO à 20 ms de l'image (« Green Book »), une trame audio de 21 ou 32 ms, les 200 ms de
+ * là : une VO à 20 ms de l'image (un film), une trame audio de 21 ou 32 ms, les 200 ms de
  * présentation d'une image réordonnée. Au-dessus, le recensement du 12/11/2026 (931 films) trouve 63
- * pistes de 0,59 à 30 s, dont une quinzaine à 1,00 s tout rond (« 1917 ») : la moitié de ces pistes
+ * pistes de 0,59 à 30 s, dont une quinzaine à 1,00 s tout rond (un film) : la moitié de ces pistes
  * ne perdaient qu'une ou deux secondes d'ouverture, et paient désormais un ré-encodage pour les
  * rendre — DECISIONS.md §148 dit le compte, et que ce nombre est le seul réglage à toucher.
  *
  * **Deux secondes** (choix du 12/11/2026, à la relecture) : sous ce seuil, l'atterrissage n'enjambe qu'une ou
  * deux secondes d'ouverture — presque toujours du noir —, et ré-encoder tout le film pour les rendre coûtait
  * plus (une génération de perte, le décodeur sur l'appareil) que ce qu'il rendait. Au-dessus, le film ne
- * démarrait plus du tout (*The Circle*, 30 s) ou sautait ses premières secondes d'image (*WALL·E*, 11,8 s).
+ * démarrait plus du tout (un film, 30 s) ou sautait ses premières secondes d'image (un film, 11,8 s).
  */
 export const AUDIO_LEAD_GAP_SECONDS = 2;
 
@@ -99,7 +99,7 @@ const SILENCE_BLOCK_FRAMES = 4096;
  * ce premier bloc — ce que le décodeur rend vraiment, pas ce que l'en-tête annonçait. Produit au
  * fil de la demande : trente secondes de 5.1 d'un coup, ce seraient 35 Mo de zéros.
  *
- * Le premier bloc réel se fait attendre le temps de lire le trou (8 Mo pour « The Circle ») : c'est
+ * Le premier bloc réel se fait attendre le temps de lire le trou (8 Mo pour un film) : c'est
  * la seule façon de savoir où finir le silence, et ces octets sont ceux que l'image lira juste après
  * (cache de `HttpByteSource`).
  */

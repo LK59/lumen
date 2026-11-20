@@ -324,8 +324,8 @@ export class PlaybackGuard {
    * Ce pas-là n'est pas de la lecture, et il passait pour elle : `clockTicked` comme la première
    * image lisaient « la tête a dépassé le départ » et levaient l'attente sur une image figée. Sur
    * iPhone, un tiers des ouvertures depuis le début restaient ainsi arrêtées 1,5 s sans rien dire,
-   * puis repartaient après la poussée — le « second petit chargement » vu sur *Her*
-   * (10/10/2026 ; trace de *Forrest Gump* du 06/10 : atterrissage à 0,27 s, « attente levée », puis
+   * puis repartaient après la poussée — le « second petit chargement » vu sur un film
+   * (10/10/2026 ; trace d'un film du 06/10 : atterrissage à 0,27 s, « attente levée », puis
    * « horloge figée à 0,27 s » 1,5 s plus tard). Le départ se compte donc depuis là où la tête a été
    * posée.
    */

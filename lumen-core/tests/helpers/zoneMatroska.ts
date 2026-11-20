@@ -1,5 +1,5 @@
 // Des Matroska fabriqués en mémoire pour la zone illisible (DECISIONS.md §93) : six grappes de 2 s,
-// un index par grappe, et de quoi les abîmer comme « Le Grinch » l'était. Partagé par les tests du
+// un index par grappe, et de quoi les abîmer comme un film l'était. Partagé par les tests du
 // lecteur (`unreadable-zone.test.ts`) et ceux de la vérification d'intégrité.
 
 export function vint(value: number, width = 0): Uint8Array {

@@ -136,7 +136,7 @@ describe("DialogueEnhancer", () => {
     }
   });
 
-  // Le défaut entendu (Interstellar, l'explosion du vaisseau) : la voix baissait avec le fond.
+  // Le défaut entendu (un film, l'explosion du vaisseau) : la voix baissait avec le fond.
   it("une explosion sur les faces et le caisson ne baisse pas la voix (centre indépendant du fond)", () => {
     for (const mode of ["on", "strong"] as const) {
       const voice = speech(4, 0.08);

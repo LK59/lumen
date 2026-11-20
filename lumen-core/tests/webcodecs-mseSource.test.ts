@@ -787,7 +787,7 @@ describe("MseSource", () => {
     });
 
     it("ne lève rien non plus quand la source se dit encore ouverte mais que ses tampons sont retirés", async () => {
-      // iPhone, 12/11/2026 : *The Circle* repris après 38 min en arrière-plan — iOS avait retiré les tampons,
+      // iPhone, 12/11/2026 : un film repris après 38 min en arrière-plan — iOS avait retiré les tampons,
       // la source n'était pas encore `closed`, et l'élagage levait InvalidStateError en rejet non géré.
       vi.spyOn(navigator, "userAgent", "get").mockReturnValue(IPAD);
       Object.defineProperty(navigator, "maxTouchPoints", { value: 5, configurable: true });
@@ -831,7 +831,7 @@ describe("MseSource", () => {
       for (const end of ends) expect(end).toBeLessThanOrEqual(10.2);
     });
 
-    /** *Forrest Gump* sur l'iPad de Lucas : 4K légère, son à 0,09 Mo/s — 180 ko par segment de 2 s. */
+    /** Un film sur un iPad : 4K légère, son à 0,09 Mo/s — 180 ko par segment de 2 s. */
     function forrestGumpRemuxer(segments: number, keyframeAtOrBefore?: (s: number) => number) {
       const remuxer = fakeRemuxer(segments);
       const next = remuxer.nextSegment.bind(remuxer);
@@ -986,7 +986,7 @@ describe("MseSource", () => {
     expect(buffer.removed).toEqual([]);
   });
 
-  // 28/10/2026, Braveheart sur Firefox au banc : un « −10 s » juste après un saut retombe sur le
+  // 28/10/2026, un film sur Firefox au banc : un « −10 s » juste après un saut retombe sur le
   // début de la zone chargée — l'image clé de ce saut — à 30 ms près, et toute la zone était relue.
   it("pose la tête sur le début du chargé quand le saut tombe à moins d'une image avant", async () => {
     const video = fakeVideo();
@@ -1535,7 +1535,7 @@ describe("MseSource", () => {
   });
 
   it("un saut loin dans un long groupe d'images n'est pas un lecteur égaré : il lit jusqu'à la cible", async () => {
-    // WALL·E, 28/09/2026 : générique en un seul groupe de 35 s, saut à la dernière seconde. Le
+    // Un film, 28/09/2026 : générique en un seul groupe de 35 s, saut à la dernière seconde. Le
     // premier média arrivait 33 s derrière la tête, trois reprises relançaient la même lecture, puis
     // l'abandon laissait la tête sans image — chargement sans fin au lieu de l'écran de fin.
     const video = fakeVideo();
@@ -1581,7 +1581,7 @@ describe("MseSource", () => {
   });
 
   it("relance sur place un saut encore en cours quand la fin du flux est déclarée", async () => {
-    // WALL·E et Là-haut, 28/09/2026, iPhone : 30 s de son sans image à la fin. Un saut à la
+    // Deux films, 28/09/2026, iPhone : 30 s de son sans image à la fin. Un saut à la
     // dernière seconde demandé avant la fin du flux restait `seeking` pour toujours : seule la fin
     // du flux rend cette queue lisible, et WebKit ne réexamine pas un saut déjà en cours.
     traceReset();
@@ -2434,7 +2434,7 @@ describe("l'échelle des reprises", () => {
   });
 
   describe("la position redemandée 100 ms après l'atterrissage de l'ouverture", () => {
-    // 8.30.9, un iPhone (10/10/2026) : WarGames, La Flamme, Drive ouverts en 14 à 373 ms, puis
+    // 8.30.9, un iPhone (10/10/2026) : trois films ouverts en 14 à 373 ms, puis
     // figés sur l'atterrissage jusqu'à la poussée de 400 ms — que le chien de garde ne livrait qu'à 500.
     type Opening = Internals & {
       armOpeningReassert: (at: number) => void;
@@ -2986,7 +2986,7 @@ describe("relu le 24/09/2026", () => {
   };
 
   // Une ouverture en cours de film attend son premier média la tête à zéro : ce n'est pas un
-  // blocage, c'est le réseau (Love Story, 23/09 : un « stall » à 0 s pour une ouverture lente).
+  // blocage, c'est le réseau (un film, 23/09 : un « stall » à 0 s pour une ouverture lente).
   it("n'écrit pas de blocage pendant qu'une ouverture attend son média", async () => {
     const video = fakeVideo();
     Object.assign(video, { readyState: 0, networkState: 2, seeking: false });

@@ -28,7 +28,7 @@ const packet = (data: Uint8Array, timestamp: number) => ({ data, timestamp, dura
 
 describe("décodeur FLAC (libFLAC)", () => {
   it("decodes a real frame to the exact samples, each channel in its place", async () => {
-    // On 21/09/2026 Safari turned *Stand by Me*'s FLAC track away and the film went to the
+    // On 21/09/2026 Safari turned a film's FLAC track away and the film went to the
     // server player. Before this decoder, nothing here could read FLAC at all.
     const { instance, samples } = await decoder(STREAMINFO);
     await instance.decode(packet(FRAME, 12.5));
@@ -63,7 +63,7 @@ describe("décodeur FLAC (libFLAC)", () => {
   });
 
   it("is given STREAMINFO and nothing else of the header, and still decodes", async () => {
-    // *Le Retour de Martin Guerre* (21/09/2026): 8 KiB of PADDING after STREAMINFO in its
+    // A film (21/09/2026): 8 KiB of PADDING after STREAMINFO in its
     // CodecPrivate made libFLAC corrupt its heap 25 s in. A header carrying padding and tags must
     // reach it as STREAMINFO alone — and the frame must still come out exact.
     const tags = hex("0400000800000000" + "00000000"); // VORBIS_COMMENT, empty vendor, no field

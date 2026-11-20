@@ -201,7 +201,7 @@ describe("ouvrir une piste sans relire le fichier", () => {
   });
 
   it("ouvrir une piste ne relit ni l'en-tête ni l'index : ceux du lecteur suffisent (§197)", async () => {
-    // 1,6 s pour ouvrir l'E-AC3 de Braveheart, à chaque changement de langue, du temps où chaque piste
+    // 1,6 s pour ouvrir l'E-AC3 d'un film, à chaque changement de langue, du temps où chaque piste
     // avait son propre lecteur de conteneur (21/09/2026) ; puis un par fichier (mediabunny, jusqu'au
     // 19/11/2026). Aujourd'hui, la piste lit les paquets avec le lecteur et l'index du film.
     const { readFileSync } = await import("node:fs");

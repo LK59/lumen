@@ -18,7 +18,7 @@
  * le chemin est celui d'avant, à l'octet près (banc `aac-regress-bench`).
  *
  * v2 (12/10/2026). La v1 avait UN compresseur lié sur la puissance de tous les canaux et un rattrapage
- * de +3/+9 dB : en « Améliorer davantage », sur l'explosion du vaisseau d'« Interstellar », la voix
+ * de +3/+9 dB : en « Améliorer davantage », sur l'explosion du vaisseau d'un film, la voix
  * baissait avec le reste (−11 dB mesurés), et dans les passages calmes le rattrapage remontait
  * musique et ambiances — « ça boost pas que les voix » (au casque). La v2 sépare la voix du
  * fond et ne fait plus jamais dépendre la voix du fond :
@@ -31,7 +31,7 @@
  *   relatif à la voix pendant la parole, et un compresseur du fond seul — le « mode nuit » s'applique
  *   aux explosions, jamais aux voix, et rien n'est jamais remonté ;
  * - deux limiteurs sous −1 dBFS, la voix et le fond, en dernier recours.
- * Validée à l'oreille sur trois scènes (Interstellar 2:08:50, Tenet 0:10:00 et 2:00:20) en
+ * Validée à l'oreille sur trois scènes (deux films) en
  * comparaison directe avec la v1 ; mesures dans DECISIONS §68.
  */
 
@@ -60,7 +60,7 @@ export interface DialogueTuning {
   /**
    * Fond relatif à la voix, pendant la parole : le fond n'a pas le droit de dépasser la voix de plus
    * de `margin` dB ; au-delà, il est comprimé au rapport `relRatio`. Relatif, parce que les mixages
-   * n'ont pas le même niveau (Interstellar VF ~10 dB plus fort que Tenet au même endroit) : un seuil
+   * n'ont pas le même niveau (une VF ~10 dB plus forte qu'une autre au même endroit) : un seuil
    * absolu écrasait l'un et ignorait l'autre.
    */
   margin: number;
@@ -373,7 +373,7 @@ export class DialogueEnhancer {
         for (let c = 0; c < n; c++) frame[c] = planes[c][i] * g;
       }
       // Limiteurs sous −1 dBFS, en dernier recours — deux : la voix seule, et le fond (lié). Un
-      // limiteur commun faisait baisser la voix à chaque coup de feu des faces (Tenet, la bataille :
+      // limiteur commun faisait baisser la voix à chaque coup de feu des faces (un film, une bataille :
       // 44 % du temps sous −1 dB en « davantage »), et le fond à chaque crête du centre.
       const v = this.voiceIndex;
       const hasVoice = this.layout === "centre" || this.layout === "mono";

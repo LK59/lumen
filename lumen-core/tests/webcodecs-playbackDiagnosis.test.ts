@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 // Les chiffres qui disent ce qui a retenu la chaîne : le réseau, le calcul ou le décodeur. Écrit
-// pour les coupures du S23 de Lucas (28/09/2026), que rien dans le journal ne permettait
+// pour les coupures d'un S23 (28/09/2026), que rien dans le journal ne permettait
 // d'attribuer — le Wi-Fi du téléphone, le son ré-encodé qu'Android seul paie, ou son décodeur.
 
 let clock = 0;

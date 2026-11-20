@@ -2,7 +2,7 @@
  * Ce que dit la configuration d'une piste AAC (AudioSpecificConfig, ISO 14496-3 §1.6.2.1), et ce
  * qu'il faut en faire pour qu'un navigateur la joue avec tous ses canaux — DECISIONS.md §62.
  *
- * Né de « Elle s'appelle Ruby » sur une Fire TV (10/10/2026) : ses deux pistes AAC-LC 6 canaux
+ * Né d'un film sur une Fire TV (10/10/2026) : ses deux pistes AAC-LC 6 canaux
  * portent une `channelConfiguration` à 0, la disposition étant décrite par un élément PCE (Program
  * Config Element). Chromium répond oui à `isTypeSupported('audio/mp4; codecs="mp4a.40.2"')`, puis
  * refuse le segment d'initialisation : la MediaSource passe à `ended`, sans un son.
@@ -18,15 +18,15 @@
  * 4. un navigateur qui accepte un PCE tel quel dans MediaSource — demandé une fois, par un vrai
  *    envoi (`aacPceProbe.ts`) — reçoit la piste copiée, tous canaux, sans rien toucher.
  *
- * Ce que la mesure a appris (10/10/2026), et qui décide de « Ruby » : son PCE — avant [paire,
+ * Ce que la mesure a appris (10/10/2026), et qui décide d'un film : son PCE — avant [paire,
  * mono], côté [mono], arrière [paire], aucun caisson — est **octet pour octet** celui que l'encodeur
  * AAC de FFmpeg écrit pour un 5.1 ordinaire quand il passe par un PCE (`-aac_pce 1`, comparé
  * à 48 kHz : `11 80 04 c8 44 00 20 00 c4 0d "Lavc62…" 56 e5 00`). Le « mono de côté » y porte le
- * caisson : sur tout le film, le canal 4 de Ruby est entièrement sous 200 Hz (−77,5 dB brut,
+ * caisson : sur tout le film, le canal 4 du fichier de référence est entièrement sous 200 Hz (−77,5 dB brut,
  * −110 dB passé un passe-haut à 200 Hz, 20:00–30:00), les canaux 5 et 6 couvrent toute la bande. Et
  * les décodeurs le rendent bien comme un 5.1 : FFmpeg, l'AudioDecoder de Chromium, de Firefox et de
- * WebKitGTK sortent L R C LFE Ls Rs — mêmes niveaux par canal sur les vraies trames de Ruby, et des
- * tonalités marquées par canal ressortent au même rang qu'un 5.1 standard. Ruby se livre donc en
+ * WebKitGTK sortent L R C LFE Ls Rs — mêmes niveaux par canal sur les vraies trames du fichier de référence, et des
+ * tonalités marquées par canal ressortent au même rang qu'un 5.1 standard. Le fichier de référence se livre donc en
  * 5.1 entier, pas en 3.0.
  */
 
@@ -299,8 +299,8 @@ export function pceShape(pce: AacPce): string {
  * déduit. Une forme absente d'ici n'est pas devinée : elle sort en L R C (voir `aacPlan`).
  *
  * « PM/M/P/0 » : avant [paire, mono], côté [mono], arrière [paire], sans caisson — la forme que
- * l'encodeur AAC de FFmpeg écrit pour un 5.1 passé par un PCE, celle de « Ruby ». Mesurée le
- * 10/10/2026 sur les vraies trames de Ruby (20 s à 20:00) par l'AudioDecoder de Chromium, de
+ * l'encodeur AAC de FFmpeg écrit pour un 5.1 passé par un PCE, celle d'un film. Mesurée le
+ * 10/10/2026 sur les vraies trames du fichier de référence (20 s à 20:00) par l'AudioDecoder de Chromium, de
  * Firefox et de WebKitGTK : −68,0 / −56,7 / −38,6 / −128,4 / −63,2 / −65,4 dB, le dialogue au
  * troisième rang, le caisson au quatrième ; et par des tonalités marquées par canal (FFmpeg,
  * `-aac_pce 1` contre un 5.1 standard) : rangs identiques. Les navigateurs d'Apple n'ont pas été
@@ -308,7 +308,7 @@ export function pceShape(pce: AacPce): string {
  * question posée à part (`aacPceProbe.ts`), qui le fait copier plutôt que décoder s'il l'accepte.
  *
  * « MP/-/PP/1 » : avant [mono, paire], arrière [paire, paire], un caisson — les pistes anglaises 7.1
- * de six films ici (Forrest Gump, Deadpool, Walter Mitty, Once Upon a Time in Hollywood, Rocketman,
+ * de six films ici (dont
  * Toy Story), qui sortaient en L R C sur Chromium. Mesurée le 11/10/2026 : notre FFmpeg wasm rend
  * le 7.1 de FFmpeg (masque `0x63f`, L R C LFE BL BR SL SR — l'ordre qu'il donne déjà au TrueHD et
  * au DTS 7.1), à 0,05 dB près de `ffmpeg astats` canal par canal sur les six films (20 s à 20:00) ;
@@ -428,7 +428,7 @@ export type AacPlan =
 // Oui partout depuis le 11/10/2026 : un AAC à PCE n'est plus jamais décodé par AudioToolbox. Hors
 // Chromium, il passe par le décodeur AAC de FFmpeg compilé en WebAssembly (aac/aacWasmAudio.ts) —
 // celui dont l'ordre a été mesuré — parce que l'AudioDecoder de Safari échouait sur le PCE de
-// « Ruby » (« InternalAudioDecoderCocoa decoding failed »). Chromium décode par FFmpeg, mesuré.
+// un film (« InternalAudioDecoderCocoa decoding failed »). Chromium décode par FFmpeg, mesuré.
 export function decodedOrderMeasuredHere(): boolean {
   return aacDecoderRouteHere() === "wasm" || !appleWebKit();
 }

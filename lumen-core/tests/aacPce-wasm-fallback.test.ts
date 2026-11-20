@@ -12,7 +12,7 @@ import type { MatroskaFile, MatroskaTrack } from "@lumen/engine/matroska";
 // en bout, sur un vrai flux AAC décodé ici même — pas un module simulé. aacWasm-route.test.ts
 // prouve la route hors Chromium avec le module remplacé ; il manquait :
 // - Chromium : l'AudioDecoder du navigateur d'abord, le WebAssembly seulement s'il refuse la piste
-//   (« Elle s'appelle Ruby » sur une Fire TV, 10/10/2026), et jamais une copie tentée sans réponse ;
+//   (un film sur une Fire TV, 10/10/2026), et jamais une copie tentée sans réponse ;
 // - WebKit : la copie d'abord, puis — refusée et retenue pour cette forme — le décodage par le
 //   WebAssembly, canaux au bon rang ;
 // - un AAC ordinaire, copié tel quel partout, comme il l'a toujours été.
@@ -139,12 +139,12 @@ afterEach(() => {
 });
 
 describe("les fixtures sont bien les formes en jeu", () => {
-  it("FFmpeg 8.0 : le PCE de Ruby (« PM/M/P/0 ») ; FFmpeg 8.1 : un PCE équivalent au 5.1 standard", async () => {
+  it("FFmpeg 8.0 : le PCE du fichier de référence (« PM/M/P/0 ») ; FFmpeg 8.1 : un PCE équivalent au 5.1 standard", async () => {
     const ruby = await fixture("pce-51-lavc62.mkv");
     const config = parseAacConfig(ruby.track.codecPrivate)!;
     expect(config.channelConfiguration).toBe(0);
     expect(pceShape(config.pce!)).toBe("PM/M/P/0");
-    // Les dix premiers octets — tout ce qui précède le commentaire « Lavc… » — sont ceux de Ruby.
+    // Les dix premiers octets — tout ce qui précède le commentaire « Lavc… » — sont ceux du fichier de référence.
     expect(Array.from(ruby.track.codecPrivate!.subarray(0, 10))).toEqual(Array.from(PROBE_ASC.subarray(0, 10)));
 
     const lfe = await fixture("pce-51-lavc63.mkv");

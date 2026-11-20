@@ -158,7 +158,7 @@ describe("isRaslPicture", () => {
   };
   const hevcNal = (type: number, ...rest: number[]) => [(type << 1) & 0xfe, 1, ...rest];
 
-  it("reconnaît une RASL derrière son délimiteur et ses SEI, comme dans Ted Lasso", () => {
+  it("reconnaît une RASL derrière son délimiteur et ses SEI, comme dans un épisode de série", () => {
     expect(isRaslPicture(sample(hevcNal(35), hevcNal(39, 0), hevcNal(39, 0), hevcNal(8, 0)), "V_MPEGH/ISO/HEVC", 4)).toBe(true);
     expect(isRaslPicture(sample(hevcNal(35), hevcNal(9, 0)), "V_MPEGH/ISO/HEVC", 4)).toBe(true);
   });
@@ -207,7 +207,7 @@ describe("isRandomAccessPoint", () => {
   });
 
   // Blu-ray et télévision : l'image clé est une image I derrière un SEI « recovery point », pas une
-  // IDR. Supernatural S15E20 n'a qu'une IDR en 43 minutes (24/09/2026).
+  // IDR. Une série n'a qu'une IDR en 43 minutes (24/09/2026).
   describe("AVC, point de reprise", () => {
     // SEI : type 6, taille 1, recovery_frame_cnt ue(0) = « 1 », exact_match 1, broken_link 0,
     // changing_slice_group_idc 00, puis l'alignement « 100 » ; enfin le bit d'arrêt du RBSP.
@@ -287,7 +287,7 @@ describe("strayUnits", () => {
   const hevcNal = (type: number, ...rest: number[]) => [(type << 1) & 0xfe, 1, ...rest];
   const HEVC = "V_MPEGH/ISO/HEVC";
 
-  it("returns Dirty Dancing's picture-less block to the pictures it was cut from", () => {
+  it("returns a picture-less block to the pictures it was cut from", () => {
     // Block 60 of the real file, NAL types [32, 33, 34, 62], timed as a picture; block 59, the
     // picture before it, is the only one with no RPU. As a sample of its own it closed Safari's
     // MediaSource at every CRA it preceded.

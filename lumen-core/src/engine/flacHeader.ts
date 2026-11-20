@@ -6,7 +6,7 @@
  * else of Matroska's CodecPrivate.
  *
  * The rest is padding, tags, a seek table: nothing a decoder needs, and one of them broke it.
- * *Le Retour de Martin Guerre* (21/09/2026) carries 8 KiB of PADDING after STREAMINFO; handed
+ * A film (21/09/2026) carries 8 KiB of PADDING after STREAMINFO; handed
  * the whole header, libFLAC corrupted its own heap and died at the 260th packet — 25 s in —
  * with "Out of bounds memory access" in `malloc`, and the film went to the server player. The
  * same file decodes to its last packet (70 389) on STREAMINFO alone; the tags alone are

@@ -47,7 +47,7 @@ export class LossRecord {
    *
    * Pris ici et pas au moment d'écrire la ligne : l'hôte ne l'apprend qu'au prochain envoi refusé,
    * quand les tampons sont déjà détachés et illisibles. Le 23/09/2026, trois « Media failed to
-   * decode » sur un iPhone 12 (Love Story, 4K) n'ont laissé que leur motif — ni les tampons, ni ce
+   * decode » sur un iPhone 12 (un film, 4K) n'ont laissé que leur motif — ni les tampons, ni ce
    * qui venait d'être envoyé —, et rien ne permettait de dire si nos données y étaient pour
    * quelque chose. Le premier des deux événements l'emporte : c'est lui qui a vu les tampons.
    */

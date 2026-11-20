@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 
 /**
  * Un navigateur qui encode l'AAC en 2 et 6 canaux, mais pas en 8 — c'est-à-dire un Chrome
- * Windows, mesuré. La piste française de « Mourir peut attendre » est en E-AC3 7.1 Atmos.
+ * Windows, mesuré. La piste française d'un film est en E-AC3 7.1 Atmos.
  */
 function browserThatStopsAt(maxChannels: number) {
   return {

@@ -2,7 +2,7 @@
 // forme de sortie que le décodeur logiciel (SoftwareAudioTrack), pour que la suite ne sache pas
 // d'où vient le son (DECISIONS.md §62).
 //
-// Pourquoi (11/10/2026) : sur un iPhone, « Elle s'appelle Ruby » n'avait aucun chemin natif.
+// Pourquoi (11/10/2026) : sur un iPhone, un film n'avait aucun chemin natif.
 // Safari refuse de prendre son AAC à PCE tel quel dans MediaSource (« Le navigateur a refusé une
 // opération sur le tampon… »), et son AudioDecoder — CoreAudio — échoue à le décoder
 // (« InternalAudioDecoderCocoa decoding failed ») : le film partait au lecteur serveur. Le décodeur

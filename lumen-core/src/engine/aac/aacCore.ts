@@ -2,7 +2,7 @@
 //
 // Le jumeau de truehd/truehdCore.ts : rien de ce qui entoure le décodage, ni lecture du fichier, ni
 // temps. Tourne tel quel dans le navigateur et dans Node, où le banc (aac-wasm-bench.spec.ts) le
-// fait décoder « Elle s'appelle Ruby » et le compare canal par canal à ffmpeg.
+// fait décoder un film et le compare canal par canal à ffmpeg.
 import type { AacModule } from "./aac-wasm.mjs";
 import type { DecodedBatch } from "../truehd/truehdCore";
 

@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { simultaneousText, stripSubtitleMarkup, subtitlePlacement } from "@lumen/engine/subtitleMarkup";
 
 /**
- * 22/09/2026 : un sous-titre forcé de *Ted Lasso*, piste SubRip, s'affichait « {\an8}Madeleine
+ * 22/09/2026 : un sous-titre forcé d'une série, piste SubRip, s'affichait « {\an8}Madeleine
  * L'Engle » — une balise de position ASS glissée dans du SubRip, montrée telle quelle.
  */
 describe("stripSubtitleMarkup et subtitlePlacement", () => {

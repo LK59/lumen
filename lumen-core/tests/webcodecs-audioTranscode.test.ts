@@ -209,7 +209,7 @@ describe("canEncodeAac", () => {
 describe("chooseTranscodePlan chez Apple", () => {
   it("ne demande jamais plus de six canaux à l'encodeur AAC d'Apple : un 7.1 y est replié en 5.1", async () => {
     // L'AAC n'a pas de vrai 7.1 à enceintes arrière, et l'encodeur d'Apple ne dit pas où il range
-    // huit plans. Braveheart en VO 7.1 sur iPhone, 21/09/2026 : les voix plus fortes à droite.
+    // huit plans. Un film en VO 7.1 sur iPhone, 21/09/2026 : les voix plus fortes à droite.
     vi.stubGlobal("navigator", {
       userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Mobile/15E148 Safari/604.1",
     });
@@ -507,7 +507,7 @@ describe("AudioTranscoder", () => {
   });
 
   it("un vidage de fin refusé n'est pas une panne : ce qui est encodé est rendu, la piste se dit vidée", async () => {
-    // Anacondas, Chrome Android, 08/11/2026 : « Flushing error » à 29 s de la fin.
+    // Un film, Chrome Android, 08/11/2026 : « Flushing error » à 29 s de la fin.
     const Encoder = fakeEncoderClass({ failFlushWith: "Flushing error." });
     vi.stubGlobal("AudioEncoder", Encoder);
     samples.mockImplementation(() => decoded(41));
@@ -717,7 +717,7 @@ describe("« Améliorer les dialogues » — le décodeur d'un AAC multicanal", 
 });
 
 /**
- * Le son qui commence après l'image (DECISIONS.md §148) : « The Circle », iPhone, 12/11/2026 — la
+ * Le son qui commence après l'image (DECISIONS.md §148) : un film, iPhone, 12/11/2026 — la
  * piste n'a aucun bloc avant 30 s. Le transcodeur comble l'écart par du silence à chaque saut, et le
  * dit à l'amorçage pour le journal ; sans trou, rien ne change.
  */

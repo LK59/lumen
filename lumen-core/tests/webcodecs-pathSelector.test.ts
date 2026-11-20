@@ -207,7 +207,7 @@ describe("un fichier tout en TrueHD", () => {
 });
 
 /**
- * Une piste que rien ne décode : le MP2 de « Des gens bien » (balayage du 24/09/2026). Le refus le
+ * Une piste que rien ne décode : le MP2 d'une série (balayage du 24/09/2026). Le refus le
  * dit exactement, distinct d'une piste lisible qui ne traverse pas MediaSource ici.
  */
 describe("un son que rien ne décode", () => {

@@ -1,6 +1,6 @@
 // Une zone illisible dans un fichier : le refus nommé du lecteur natif (DECISIONS.md §93).
 //
-// « Le Grinch » (14/10/2026) portait des blocs de zéros de 16 Kio au milieu de ses grappes — une
+// Un film (14/10/2026) portait des blocs de zéros de 16 Kio au milieu de ses grappes — une
 // release abîmée. Le lecteur Matroska s'y arrêtait sans rien dire : un en-tête illisible au
 // milieu d'une grappe faisait sauter au suivant (l'image à moitié nulle partait quand même au
 // navigateur : « Media failed to decode »), et un en-tête de grappe écrasé finissait la lecture —

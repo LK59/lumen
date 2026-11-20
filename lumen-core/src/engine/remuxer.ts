@@ -273,7 +273,7 @@ function rewrittenAsc(track: MatroskaTrack): Uint8Array | null {
 function naturalDelivery(track: MatroskaTrack): AudioDelivery {
   const natural = audioCodecString(track);
   // Un AAC dont la disposition est un PCE passe `isTypeSupported` et se fait refuser à l'envoi
-  // (« Elle s'appelle Ruby » sur une Fire TV, 10/10/2026) : copié tel quel, réécrit sans perte, ou
+  // (un film sur une Fire TV, 10/10/2026) : copié tel quel, réécrit sans perte, ou
   // décodé, selon `aacPlan` (DECISIONS.md §62).
   const copyable = track.codecId !== "A_AAC" || trackAacPlan(track).action !== "decode";
   if (natural && copyable && containerAccepts(`audio/mp4; codecs="${natural}"`)) return "copy";
@@ -297,7 +297,7 @@ function naturalDelivery(track: MatroskaTrack): AudioDelivery {
  * et Dolby voyaient leur VF Dolby ré-encodée — une seconde génération avec perte, du travail pour
  * le téléphone, pour une piste qui passait intacte la veille. Et un changement de piste ré-encodé
  * coûtait 2 à 15 s sur iPhone, quand une reconstruction du lecteur en prenait 0,3 à 0,5
- * (« Dirty Dancing », trois reconstructions ce jour-là).
+ * (un film, trois reconstructions ce jour-là).
  *
  * Les trois échecs du 03/09/2026 restent vrais et ne sont pas contournés : aucune de ces voies ne
  * change le codec d'un tampon vivant, ni ne remplace une MediaSource saine en cours de lecture
@@ -406,7 +406,7 @@ export function unifiedAudioCodec(file: MatroskaFile, options?: AudioDeliveryOpt
  * canaux à six.
  *
  * Mesuré : Firefox 154 sous Linux accepte ce nouveau segment d'initialisation, continue de lire
- * l'image, et ne sort plus aucun son. « Mourir peut attendre » — piste française en 7.1 Atmos,
+ * l'image, et ne sort plus aucun son. Un film — piste française en 7.1 Atmos,
  * anglaise en 5.1 — se lit en français et devient muet en anglais. Le même fichier fonctionne
  * dans les deux langues sur iPhone, qui, lui, encaisse le changement.
  *
@@ -515,7 +515,7 @@ export function playableAudio(track: MatroskaTrack): boolean {
  * Ce que le spectateur reçoit de cette piste : copiée telle quelle ou non, et en combien de canaux.
  *
  * Posé pour le classement des pistes (`rank`, DECISIONS §3), le 29/09/2026. Il départageait par les
- * canaux de la *source* : sur un iPhone, la TrueHD 7.1 du « Mans 66 » passait devant l'AC-3 5.1
+ * canaux de la *source* : sur un iPhone, la TrueHD 7.1 d'un film passait devant l'AC-3 5.1
  * d'à côté — décodée en WebAssembly sur le fil principal, ré-encodée par l'AAC d'Apple plafonné à
  * six canaux, pour sortir en 5.1 comme l'AC-3 qui, elle, aurait été copiée (audit P5).
  *
@@ -587,7 +587,7 @@ const PROBE_SAMPLES = 20_000;
  *
  * C'était la boucle de `describeAudio`, pour l'AC-3 et l'E-AC-3 : leur description est dans une
  * trame. Elle dit aussi, sans un octet de plus, si le son commence après l'image (DECISIONS.md §148)
- * — « The Circle » : 8 Mo d'image avant le premier bloc AC-3, à 30 s. Pour les autres pistes copiées
+ * — un film : 8 Mo d'image avant le premier bloc AC-3, à 30 s. Pour les autres pistes copiées
  * que la chaîne sait décoder, c'est une lecture de plus, mais des mêmes octets : ceux de la grappe
  * où la lecture commence, que le lecteur principal demande juste après (cache de `HttpByteSource`),
  * et dans un fichier ordinaire le son y est dès les premiers blocs.
@@ -903,9 +903,9 @@ export class Remuxer {
     // Une piste déjà ré-encodée (le DTS partout, le Dolby sur Chrome) : le transcodeur comble le trou
     // de lui-même à chaque saut ; ce qu'il a vu à l'amorçage n'est que pour le journal. Décidé depuis
     // la position demandée, là où l'amorçage a commencé : depuis l'image clé, un film ordinaire repris
-    // à 10 s sur une clé à 0 se disait en retard de 10 s (banc du 12/11/2026, « Wall Street » sur
+    // à 10 s sur une clé à 0 se disait en retard de 10 s (banc du 12/11/2026, un film sur
     // Chrome). Mais mesuré depuis cette image clé (l'index, rien de lu) : c'est de là que le silence
-    // part, et « WALL·E » repris à 10 s disait sinon 1,8 s pour 11,8 s comblées.
+    // part, et un film repris à 10 s disait sinon 1,8 s pour 11,8 s comblées.
     const primedFirst = transcoder?.firstPrimedSeconds;
     let leadGap: AudioLeadGap | null = null;
     if (typeof primedFirst === "number" && audioLeadGapSeconds(Math.max(0, startSeconds), primedFirst) !== null) {
@@ -1671,7 +1671,7 @@ export class Remuxer {
       let frameDuration = next
         ? (next.timestamp - run.timestamp) / run.frames.length
         : (this.audioFrameUs ?? FALLBACK_AUDIO_FRAME_US);
-      // Un bloc suivant qui *recule* ne mesure rien. « The Proposal » (balayage du 24/09/2026) :
+      // Un bloc suivant qui *recule* ne mesure rien. Un film (balayage du 24/09/2026) :
       // des blocs AC-3 aux horodatages arrondis et bousculés, 1 625 reculs sur 202 000 trames.
       // L'écart négatif devenait une durée ramenée à 1 µs, gardée comme durée de trame pour la
       // suite. La durée du bloc est alors celle mesurée avant lui.

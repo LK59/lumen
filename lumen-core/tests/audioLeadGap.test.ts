@@ -10,7 +10,7 @@ import {
 import type { DecodedAudio } from "@lumen/engine/softwareAudio";
 import type { MatroskaFile } from "@lumen/engine/matroska";
 
-// Le son qui commence après l'image (DECISIONS.md §148) : « The Circle », iPhone, 12/11/2026 — la
+// Le son qui commence après l'image (DECISIONS.md §148) : un film, iPhone, 12/11/2026 — la
 // piste AC-3 n'a aucun bloc avant 30 s, et une MediaSource ne joue que l'intersection de ses tampons.
 
 /** Des blocs décodés de 1536 images (une trame AC-3), à partir de `fromSeconds`. */
@@ -39,7 +39,7 @@ async function all(generator: AsyncGenerator<DecodedAudio>): Promise<DecodedAudi
 describe("la décision : le son commence-t-il après l'image ?", () => {
   it("non sous le seuil, ni au seuil — un fichier ordinaire ne change pas", () => {
     expect(audioLeadGapSeconds(0, 0)).toBeNull();
-    // La VO de « Green Book » : 20 ms après l'image.
+    // La VO d'un film : 20 ms après l'image.
     expect(audioLeadGapSeconds(0, 0.02)).toBeNull();
     // Un décalage de réordonnancement, une trame : très en dessous.
     expect(audioLeadGapSeconds(10, 10.25)).toBeNull();
@@ -69,7 +69,7 @@ describe("le silence devant le premier son", () => {
   });
 
   it("comble exactement l'écart : durée au nombre d'images près, canaux et fréquence du premier bloc, zéros", async () => {
-    // Un saut à 10 s dans « The Circle » : le premier son est à 30 s.
+    // Un saut à 10 s dans un film : le premier son est à 30 s.
     const source = blocks(3, 30, 6, 48000);
     const onGap = vi.fn();
     const out = await all(withLeadSilence(stream(source), 10, onGap));

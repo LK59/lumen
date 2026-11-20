@@ -12,7 +12,7 @@ describe("fold — compléter vers le haut", () => {
    *
    * Complété comme les autres, l'unique plan devient l'avant gauche et rien d'autre. Le navigateur
    * replie ce 5.1 en stéréo — droite = R + 0,707·C + 0,707·Rs — et les trois termes sont nuls : le
-   * film entier dans une seule oreille. C'est la piste française par défaut de « L'Exorciste ».
+   * film entier dans une seule oreille. C'est la piste française par défaut d'un film.
    */
   it("copie un mono dans les deux canaux avant, pas seulement à gauche", () => {
     expect(channels(fold([plane(1)], 6))).toEqual([1, 1, 0, 0, 0, 0]);
@@ -62,7 +62,7 @@ describe("fold — replier vers le bas", () => {
  * Relevé sur cette bibliothèque le 19/09/2026, 1 462 pistes : 1 ch × 15, 2 ch × 208, 3 ch × 2,
  * **5 ch × 2**, 6 ch × 1 113, **7 ch × 2**, 8 ch × 120. Les six pistes à 5 et 7 canaux n'entrent
  * dans aucun modèle, et pour une raison de fond : cinq canaux, c'est un 5.0 — L R C Ls Rs, sans
- * caisson — chez « Mamma Mia! », et un 4.1 — L R C LFE Cs — chez « Point Break ». Le décodeur ne
+ * caisson — chez un film, et un 4.1 — L R C LFE Cs — chez un film. Le décodeur ne
  * rend que le compte, jamais la disposition.
  *
  * Lus aux rangs du 5.1, ces plans envoyaient l'ambiance *droite* dans l'ambiance gauche et
@@ -120,8 +120,8 @@ describe("fold — une disposition qu'on ne sait pas nommer", () => {
  * d'un même film.
  *
  * La mesure qui tranche, plan par plan sur vingt secondes de dialogue : notre décodeur rend
- * exactement les mêmes niveaux que ffmpeg en ordre WAVE, à deux décimales, sur « Twilight » en
- * E-AC3 comme sur « Titanic » en AC-3. Le centre est au rang 2 de part et d'autre.
+ * exactement les mêmes niveaux que ffmpeg en ordre WAVE, à deux décimales, sur un film en
+ * E-AC3 comme sur un film en AC-3. Le centre est au rang 2 de part et d'autre.
  */
 const IPHONE =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Mobile/15E148 Safari/604.1";
@@ -149,7 +149,7 @@ describe("toCodecChannelOrder", () => {
   });
 
   it("mais range le 5.1 dans l'ordre AAC pour l'encodeur d'Apple, qui ne convertit pas", () => {
-    // « Titanic » sur iPhone le 07/09, Braveheart en VO 7.1 sur iPhone le 21/09 : les voix à
+    // Un film sur iPhone le 07/09, un film en VO 7.1 sur iPhone le 21/09 : les voix à
     // droite. WebKit ne transmet à l'encodeur d'Apple que le nombre de canaux ; celui-ci lit les
     // plans dans l'ordre du format, centre d'abord. Chrome, lui, convertit — le test d'au-dessus.
     vi.stubGlobal("navigator", { userAgent: IPHONE });

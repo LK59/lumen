@@ -1,6 +1,6 @@
 // Ce qui retient l'approvisionnement du lecteur : le réseau, le calcul, ou le décodeur.
 //
-// 28/09/2026 : le S23 de Lucas bloquait cinquante fois par épisode sur Ted Lasso (4K Dolby Vision,
+// 28/09/2026 : un S23 bloquait cinquante fois par épisode sur une série (4K Dolby Vision,
 // 27,5 Mb/s), quand son Mac, derrière la même box, le même soir, sur les mêmes épisodes, n'en
 // avait aucune. Le journal ne permettait pas de trancher. Le proxy inverse disait que la connexion
 // livrait le débit du fichier en moyenne horaire ; la ligne `stall` disait un tampon presque vide,

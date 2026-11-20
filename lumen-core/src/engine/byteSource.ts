@@ -268,7 +268,7 @@ export interface NetworkWindow {
   elapsedMs: number;
   /**
    * Ce que chaque lecteur du fichier a demandé depuis le saut (18/11/2026) : `{ lecteur: { reads, bytes }, son: … }`.
-   * L'enquête sur les sauts lents trouvait sur *Drive* 4K 12 à 24 Mo reçus pour 1 à 4 Mo utiles, et soupçonnait le
+   * L'enquête sur les sauts lents trouvait sur un film 4K 12 à 24 Mo reçus pour 1 à 4 Mo utiles, et soupçonnait le
    * décodeur du son ré-encodé (mediabunny), qui lit le fichier de son côté — ceci le dit.
    */
   demand?: Record<string, { reads: number; bytes: number }>;

@@ -5,9 +5,9 @@ import { aacPlan } from "@lumen/engine/aacConfig";
 import { trackAacPlan } from "@lumen/engine/remuxer";
 import type { MatroskaTrack } from "@lumen/engine/matroska";
 
-// « Elle s'appelle Ruby » et la piste anglaise 7.1 de « Forrest Gump » sur un iPhone
+// Un film et la piste anglaise 7.1 d'un film sur un iPhone
 // (10/10/2026, 22:22–22:24, 8.34.1) : la sonde de 8.34.0 avait gardé `ok:false` pour tout le
-// navigateur — Ruby se décodait (échec CoreAudio, lecteur serveur), Forrest Gump sortait en L R C
+// navigateur — l'un se décodait (échec CoreAudio, lecteur serveur), un film sortait en L R C
 // au lieu d'être copié avec tous ses canaux comme avant le 10/10. Hors Chromium, la réponse globale
 // de la sonde n'est plus jamais lue : copie d'abord, et seul un refus constaté pour CETTE forme de
 // PCE, à ce build, fait décoder (DECISIONS.md §62).
@@ -16,7 +16,7 @@ const SAFARI_IOS = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) Apple
 const SILK = "Mozilla/5.0 (Linux; Android 11; AFTT) AppleWebKit/537.36 (KHTML, like Gecko) Silk/152.4.7 like Chrome/152.0.7977.140 Safari/537.36";
 const FIREFOX = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0";
 
-/** L'AudioSpecificConfig 7.1 à PCE de FFmpeg (pistes anglaises de Forrest Gump, Deadpool…), tête. */
+/** L'AudioSpecificConfig 7.1 à PCE de FFmpeg (pistes anglaises d'un film…), tête. */
 const SEVEN_ONE = Uint8Array.from([0x11, 0x80, 0x04, 0xc8, 0x09, 0x00, 0x20, 0x00, 0xc4, 0x0d, 0x4c, 0x61, 0x76, 0x63]);
 
 function ua(agent: string) {
@@ -88,7 +88,7 @@ describe("AAC à PCE — un refus à l'envoi vaut pour cette forme seulement", (
     expect(takePceCopyRefusal()).toBe(true);
     expect(takePceCopyRefusal()).toBe(false);
     expect(trackAacPlan(ruby).action).toBe("decode");
-    // Le 7.1 de Forrest Gump n'est pas concerné par le refus du 5.1 de Ruby.
+    // Le 7.1 d'un film n'est pas concerné par le refus du 5.1 d'un autre.
     expect(effectivePceAnswer(SEVEN_ONE)).toBe(true);
     // Et rien n'est écrit dans la réponse globale.
     expect(pceCopyAccepted()).toBeNull();

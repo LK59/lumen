@@ -79,8 +79,8 @@ const NAMED_ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quo
 /**
  * Les échappements du WebVTT, rendus en caractères. Jellyfin convertit chaque fichier à côté du film
  * en WebVTT et y échappe `&`, `<` et `>` comme la norme le demande ; le lecteur, qui dessine ses lignes
- * lui-même, les affichait tels quels — « Town &amp; Country » (*Midnight in the Garden of Good and
- * Evil*), et sur *Demon Slayer* des « &lt;couleur de police=" » (chasse du 18/11/2026). Un `<track>`
+ * lui-même, les affichait tels quels — un film
+ * et sur une série des « &lt;couleur de police=" » (chasse du 18/11/2026). Un `<track>`
  * du navigateur les décode de lui-même ; ici, c'est à nous. Une entité inconnue reste telle quelle.
  */
 export function decodeCueEntities(text: string): string {

@@ -130,7 +130,7 @@ const DECODABLE_HERE = new Set([
 /**
  * Si cette piste a un décodeur quelque part — le navigateur, ou l'un des nôtres.
  *
- * Faux, rien ici ne peut en tirer un son. C'est le cas du MP2 (« Des gens bien », 6 épisodes,
+ * Faux, rien ici ne peut en tirer un son. C'est le cas du MP2 (une série, 6 épisodes,
  * balayage du 24/09/2026) : mediabunny ne le reconnaît pas (codec nul), aucun navigateur ne
  * l'annonce à WebCodecs. Le lecteur serveur est alors la seule issue, comme pour toute piste que
  * le remultiplexage ne porte pas ; cette réponse ne sert plus qu'à nommer le refus exactement dans
@@ -384,7 +384,7 @@ export interface TranscodePlan {
  * Le même nombre de canaux si le navigateur sait l'encoder, sinon le plus proche qu'il sait.
  *
  * Mesuré sur un Chrome Windows : il encode l'AAC en 2 et en 6 canaux, pas en 8. Une piste
- * E-AC3 7.1 — le cas de « Mourir peut attendre », dont la piste française est en 7.1 Atmos —
+ * E-AC3 7.1 — le cas d'un film, dont la piste française est en 7.1 Atmos —
  * n'avait donc aucun remplaçant, le remultiplexage était refusé, et la lecture tombait sur le
  * chemin canevas d'alors : décodage logiciel d'un 4K HDR, et pour une source Dolby Vision une image
  * que ce navigateur ne savait pas convertir. Le même fichier se lit nativement sur iPhone, qui
@@ -857,7 +857,7 @@ export class AudioTranscoder {
    *
    * Il ne rend que le reste d'une image : moins de 1024 échantillons, ~20 ms de son au tout dernier
    * instant du film. Le 08/11/2026, l'encodeur AAC de Chrome Android a refusé ce vidage
-   * (« Flushing error ») à 29 s de la fin d'*Anacondas*, après 1 h 36 sans accroc : le lecteur l'a
+   * (« Flushing error ») à 29 s de la fin d'un film, après 1 h 36 sans accroc : le lecteur l'a
    * pris pour une panne et a passé la main au serveur pour la fin du générique. Ce qui est déjà
    * encodé est gardé, le reste est perdu, et c'est tracé. Une seule fois par flux : rien n'est plus
    * donné à l'encodeur après la fin, et un encodeur qui a échoué est fermé.
@@ -994,7 +994,7 @@ function toFrame(chunk: EncodedAudioChunk): TranscodedFrame {
  *
  * Les six pistes à 5 et 7 canaux sont celles qui n'entrent dans aucun modèle, et pour une raison
  * de fond : le nombre ne dit pas la disposition. Cinq canaux, c'est un 5.0 — L R C Ls Rs, sans
- * caisson — chez « Mamma Mia! », et un 4.1 — L R C LFE Cs — chez « Point Break ». Sept, c'est un
+ * caisson — chez un film, et un 4.1 — L R C LFE Cs — chez un film. Sept, c'est un
  * 6.1 dont le rang 4 est un arrière central là où le modèle attend une ambiance gauche. Le
  * décodeur ne rend que le compte, jamais la disposition : mediabunny n'expose que
  * `numberOfChannels`, vérifié dans son interface.
@@ -1065,7 +1065,7 @@ export function fold(planes: Float32Array[], to: number): Float32Array[] {
      *
      * Un mono se copie dans les deux canaux avant, ce que fait tout décodeur : c'est un centre
      * fantôme, à niveau égal des deux côtés, et le repli du navigateur le rend au centre. Le cas
-     * n'a rien de théorique — la piste française par défaut de « L'Exorciste » est un mix mono,
+     * n'a rien de théorique — la piste française par défaut d'un film est un mix mono,
      * et l'unification de ce fichier porte toutes ses pistes à six canaux.
      */
     if (from === 1) return [planes[0], planes[0], ...silence(to - 2)];
@@ -1115,7 +1115,7 @@ export function fold(planes: Float32Array[], to: number): Float32Array[] {
  * Entrelacés sans permutation, les plans gardaient leur rang et changeaient de sens : le centre,
  * c'est-à-dire les dialogues, arrivait au rang du canal droit. Au casque, sur un 5.1 replié en
  * stéréo par le navigateur, ça donnait les voix uniquement à droite et la musique à gauche.
- * Rapporté sur « Titanic », vérifié à l'oreille, et absent du lecteur Jellyfin — qui transcode
+ * Rapporté sur un film, vérifié à l'oreille, et absent du lecteur Jellyfin — qui transcode
  * côté serveur avec ffmpeg, lequel fait cette correspondance depuis toujours.
  *
  * La stéréo n'a rien à permuter : L et R sont au même rang dans les deux conventions. C'est
@@ -1142,7 +1142,7 @@ export function fold(planes: Float32Array[], to: number): Float32Array[] {
  * | 4    | −33,90 dB      | −33,89 dB (Ls)      |
  * | 5    | −34,05 dB      | −34,05 dB (Rs)      |
  *
- * Identique à deux décimales, sur « Twilight » en E-AC3 comme sur « Titanic » en AC-3. Le
+ * Identique à deux décimales, sur un film en E-AC3 comme sur un film en AC-3. Le
  * décodeur rend donc exactement ce que l'encodeur attend, et la permutation déplaçait le centre
  * au rang que l'encodeur lit comme le canal gauche : replié en stéréo, tout le dialogue partait
  * dans l'oreille gauche. C'est le défaut rapporté au casque sur Chrome, sur les deux pistes d'un
@@ -1157,11 +1157,11 @@ const AAC_ORDER: Record<number, readonly number[]> = {};
  * **Mais l'encodeur d'Apple, lui, ne convertit pas** — et les deux mesures étaient vraies, chacune
  * sur son navigateur. Réconcilié le 21/09/2026.
  *
- * Le 07/09, « Titanic » sur **iPhone** (AC-3 et E-AC3 mêlés, donc ré-encodés) : les voix à droite,
+ * Le 07/09, un film sur **iPhone** (AC-3 et E-AC3 mêlés, donc ré-encodés) : les voix à droite,
  * corrigé par la permutation vers l'ordre AAC. Le 19/09, un spectateur sur **Chrome/Windows** : le
  * son d'un seul côté, corrigé en la retirant — le commit disait « un iPhone ne passe jamais par
  * ici », ce qui est faux pour le DTS, le TrueHD, le FLAC et tout fichier mixte. Et la mesure qui
- * le justifiait portait sur notre *décodeur*, pas sur les encodeurs. Le 21/09, Braveheart en VO
+ * le justifiait portait sur notre *décodeur*, pas sur les encodeurs. Le 21/09, un film en VO
  * TrueHD 7.1 sur iPhone : les voix plus fortes à droite.
  *
  * La raison : l'encodeur AAC d'Apple (AudioToolbox) lit les plans dans l'ordre du format —
@@ -1190,7 +1190,7 @@ const APPLE_AAC_ORDER: Record<number, readonly number[]> = {
  * L'AAC n'a pas de vrai 7.1 à enceintes arrière — sa configuration 7, celle que l'iPhone produit,
  * est un « 7.1 larges avant » —, l'encodeur d'Apple ne dit pas où il range huit plans, et aucune
  * mesure n'existe ici pour le savoir. Un 7.1 est donc replié en 5.1 avant lui (`fold`, les arrières
- * mêlés aux ambiances), dans l'ordre qui, lui, a été entendu juste sur « Titanic ». Sur un iPhone —
+ * mêlés aux ambiances), dans l'ordre qui, lui, a été entendu juste sur un film. Sur un iPhone —
  * haut-parleurs, casque, audio spatial —, rien n'est perdu que deux canaux qu'aucune sortie n'a.
  */
 function appleAacCap(codec: string): number {

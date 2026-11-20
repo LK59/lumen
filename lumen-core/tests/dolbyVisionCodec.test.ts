@@ -17,7 +17,7 @@ const REEL = new Uint8Array([
 ]);
 
 describe("dolbyVisionCodecString", () => {
-  it("lit le profil et le niveau de « Retour vers le futur II »", () => {
+  it("lit le profil et le niveau d'un film", () => {
     // ffprobe dit de ce fichier : dv_profile=8, dv_level=6. La chaîne doit dire la même chose.
     expect(dolbyVisionCodecString(REEL)).toBe("dvh1.08.06");
   });
@@ -73,7 +73,7 @@ describe("planDolbyVision", () => {
     expect(planDolbyVision(piste(record), "DOVIWithHDR10", non).kind).toBe("hdr10");
   });
 
-  // Le cas de « Disclosure Day » : profil 5, aucune couche de base. Un refus n'a nulle part où
+  // Le cas d'un film : profil 5, aucune couche de base. Un refus n'a nulle part où
   // atterrir, et c'est exactement ce qui donnait des couleurs fausses avant qu'on le sache.
   it("demande le lecteur serveur quand il n'y a pas de couche de base", () => {
     const plan = planDolbyVision(piste(profil5), "DOVI", non);
@@ -116,7 +116,7 @@ describe("planDolbyVision", () => {
 /**
  * Ce que le balayage de la bibliothèque a trouvé, une heure après la livraison.
  *
- * « Marty Supreme » est en AV1 avec un Dolby Vision profil 10. Son enregistrement est lisible et
+ * Un film est en AV1 avec un Dolby Vision profil 10. Son enregistrement est lisible et
  * produit une chaîne parfaitement formée — `dvh1.10.08` — qui est pourtant fausse : `dvh1` annonce
  * du HEVC quand l'entrée écrite pour de l'AV1 est `av01`. Le type déclaré et la boîte écrite se
  * seraient contredits, et le segment d'initialisation rejeté en bloc. Un film qui marchait serait
@@ -145,7 +145,7 @@ describe("planDolbyVision — le Dolby Vision n'est pas qu'une affaire de profil
 /**
  * Ce que le journal a montré le 20/09/2026, et que rien ne disait avant lui.
  *
- * « Disclosure Day » sur Chrome/Windows : le remultiplexage refuse en annonçant « passage au
+ * Un film sur Chrome/Windows : le remultiplexage refuse en annonçant « passage au
  * lecteur serveur », puis le chemin canevas est essayé quand même — il décode un 4K, échoue à
  * convertir l'image (`allocationSize` sur une image opaque) et retombe enfin sur le repli qu'on
  * avait déjà choisi deux étapes plus tôt.

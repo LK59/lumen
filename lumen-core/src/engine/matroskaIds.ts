@@ -35,7 +35,7 @@ export const ID = {
    * par `BlockAddIDExtraData` et nommé par `BlockAddIDType` — « dvcC » ou « dvvC », selon la
    * version du format. C'est exactement l'enregistrement que le MP4 attend dans sa propre boîte.
    *
-   * Relevé sur « Retour vers le futur II » : présent à l'octet 4612, donc dans l'en-tête que cet
+   * Relevé sur un film : présent à l'octet 4612, donc dans l'en-tête que cet
    * analyseur lit déjà, et nommé `dvvC`.
    */
   BlockAdditionMapping: 0x41e4,

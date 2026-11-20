@@ -229,7 +229,7 @@ describe("Remuxer track selection", () => {
   });
 
   it("carries FLAC untouched where the player takes it, and re-encodes it on Safari", () => {
-    // *Stand by Me*, 21/09/2026: its FLAC track, chosen on an iPhone, sent the film to the server
+    // A film, 21/09/2026: its FLAC track, chosen on an iPhone, sent the film to the server
     // player — "la piste A_FLAC ne peut pas être portée ici". Chrome and Firefox take FLAC in a
     // MediaSource and must go on doing so.
     const flac = track({ number: 3, type: "audio", codecId: "A_FLAC", audio: { sampleRate: 48000, channels: 2 } });
@@ -677,7 +677,7 @@ describe("la fin du fichier, son ré-encodé", () => {
 });
 
 /**
- * Une reprise sur une image clé CRA (24/09/2026, *Ted Lasso* S02E01 sur Mac) : les images RASL qui
+ * Une reprise sur une image clé CRA (24/09/2026, une série sur Mac) : les images RASL qui
  * la suivent se réfèrent à des images d'avant la clé, absentes d'un tampon qui repart de là, et
  * Safari fermait la MediaSource sur « Media failed to decode ». Écartées à la reprise seulement.
  */
@@ -853,7 +853,7 @@ describe("une lecture bornée", () => {
   });
 });
 /**
- * Des blocs audio aux horodatages bousculés : « The Proposal » (balayage du 24/09/2026), AC-3 de
+ * Des blocs audio aux horodatages bousculés : un film (balayage du 24/09/2026), AC-3 de
  * 32 ms arrondis à la milliseconde, parfois un peu en arrière du précédent, une fois 22 ms en
  * arrière (968,639 s puis 968,617 s). L'écart négatif devenait une durée de 1 µs : les temps
  * implicites du fragment glissaient d'autant, et le fragment suivant commençait avant la fin du
@@ -982,7 +982,7 @@ describe("« Améliorer les dialogues » — la décision de livraison", () => {
 });
 
 /**
- * Le son copié qui commence après l'image (DECISIONS.md §148) — « The Circle », iPhone, 12/11/2026 :
+ * Le son copié qui commence après l'image (DECISIONS.md §148) — un film, iPhone, 12/11/2026 :
  * l'image tamponnée dès 1,4 s, le son seulement dès 30,2 s, et rien de lisible sous la tête.
  */
 describe("le son qui commence après l'image", () => {
@@ -1077,7 +1077,7 @@ describe("le son qui commence après l'image", () => {
 
   it("une piste déjà ré-encodée : le transcodeur comble de lui-même, le journal le dit depuis l'image clé de reprise", async () => {
     const dts = track({ number: 7, type: "audio", codecId: "A_DTS", audio: { sampleRate: 48000, channels: 6 } });
-    // Image clé à 0 s seulement — un générique en un seul groupe, comme « WALL·E ».
+    // Image clé à 0 s seulement — un générique en un seul groupe, comme un film.
     const file: MatroskaFile = { ...fresh(), tracks: [...FILE.tracks, dts], cues: [{ timeUs: 0, track: 1, clusterOffset: 0 }] as never };
     primedFirst = 12.5;
     try {

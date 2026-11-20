@@ -4,8 +4,8 @@ import { cappedColour } from "@lumen/engine/remuxer";
 import { hdrCapRelevant, hdrLightCap, isChromiumOnWindows, readHdrCapChoice, resolveHdrCap, writeHdrCapChoice } from "@lumen/engine/hdrDisplay";
 
 /**
- * 22/09/2026 : Chrome sous Windows ramène un film HDR sous la lumière maximale annoncée — *2012*
- * (MaxCLL 4451) très sombre sur un écran SDR, *Dirty Dancing* (657) juste, Firefox juste partout.
+ * 22/09/2026 : Chrome sous Windows ramène un film HDR sous la lumière maximale annoncée — un film
+ * (MaxCLL 4451) très sombre sur un écran SDR, un film (657) juste, Firefox juste partout.
  */
 const nal = (bytes: number[]) => [(bytes.length >> 24) & 255, (bytes.length >> 16) & 255, (bytes.length >> 8) & 255, bytes.length & 255, ...bytes];
 const SLICE = nal([19 << 1, 1, 0xaf, 0x11]);

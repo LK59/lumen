@@ -379,7 +379,7 @@ export function meterXhr(meter: LinkMeter, xhr: XMLHttpRequest): void {
  * quand le chiffre de l'adresse n'est que notre plafond recopié (15/10/2026, LECTEUR-9).
  *
  * Jellyfin écrit dans `VideoBitrate` le plafond qu'on lui envoie (`MaxStreamingBitrate`) moins le son,
- * pas un débit qu'il vise : sans plafond (`UNCONSTRAINED`, 100 Mbit/s), « Le Grinch » à 2,5 Mbit/s
+ * pas un débit qu'il vise : sans plafond (`UNCONSTRAINED`, 100 Mbit/s), un film à 2,5 Mbit/s
  * était « diffusé » à `VideoBitrate=99763149`, le panneau disait « Débit 100.0 Mb/s », et le besoin
  * lu par §77/§78 valait 100 (`diag.needMbps: 100`) — tout lien y paraissait « trop lent ».
  *

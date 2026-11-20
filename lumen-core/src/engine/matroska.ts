@@ -158,7 +158,7 @@ export async function readSeekHead(source: ByteSource, offset: number, end: numb
  * Un SeekHead qui renvoie à un second SeekHead : celui du début ne liste que l'autre, rangé en fin de
  * fichier, qui dit où sont les pistes et l'index. C'est ce que laissent les outils Matroska quand un
  * en-tête modifié ne tient plus à sa place — les pistes réécrites à la fin, l'ancienne place vidée
- * (`Void`) —, et la spécification le permet. Sans ce renvoi suivi, trois épisodes de *Barry* (S03E02,
+ * (`Void`) —, et la spécification le permet. Sans ce renvoi suivi, trois épisodes d'une série (S03E02,
  * E06, E08) ne livraient « aucune piste lisible » au lecteur comme au contrôle d'intégrité, alors que
  * ffprobe et Jellyfin les lisent (25/10/2026).
  *
@@ -195,7 +195,7 @@ async function parseTrackEntry(source: ByteSource, start: number, end: number): 
    * La langue absente n'est pas une langue inconnue : Matroska dit qu'elle vaut « eng ».
    *
    * L'élément `Language` a une valeur par défaut dans la spécification, et beaucoup de
-   * multiplexeurs s'y fient en ne l'écrivant pas sur la piste anglaise. « 1917 » en est un : sa
+   * multiplexeurs s'y fient en ne l'écrivant pas sur la piste anglaise. Un film en est un : sa
    * piste française déclare `fre`, sa piste anglaise ne déclare rien. Nous rendions `null`, donc
    * la préférence de langue d'un compte réglé sur l'anglais ne pouvait jamais être honorée — la
    * piste ne se nommait pas — et le lecteur retombait sur le défaut du fichier, en français.

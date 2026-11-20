@@ -84,7 +84,7 @@ export function codecNamesFor(codecId: string, codecPrivate: Uint8Array | null):
   if (codecId === "A_DTS" || codecId.startsWith("A_DTS/")) return { name: "dts", webCodecs: "dtsc" };
   if (codecId === "A_FLAC") return { name: "flac", webCodecs: "flac" };
   if (codecId === "A_OPUS") return { name: "opus", webCodecs: "opus" };
-  // MP3 : l'AudioDecoder du navigateur, comme mediabunny (*The Leftovers* VF, 19/11/2026).
+  // MP3 : l'AudioDecoder du navigateur, comme mediabunny (une série VF, 19/11/2026).
   if (codecId === "A_MPEG/L3") return { name: "mp3", webCodecs: "mp3" };
   // PCM : une simple conversion d'octets, ici (`pcmOpener`), comme mediabunny la faisait en JavaScript.
   if (codecId.startsWith("A_PCM/")) return { name: "pcm", webCodecs: "pcm" };
@@ -157,7 +157,7 @@ function webCodecsOpener(config: AudioDecoderConfig) {
 
 /**
  * Le FLAC par libFLAC (@wasm-audio-decoders/flac) — ce que faisait le décodeur enregistré auprès de
- * mediabunny jusqu'au 19/11/2026 : STREAMINFO seul en en-tête (`streamInfoHeader`, le PADDING de *Martin Guerre*
+ * mediabunny jusqu'au 19/11/2026 : STREAMINFO seul en en-tête (`streamInfoHeader`, le PADDING d'un film
  * faisait planter libFLAC), un paquet à la fois, l'instant du paquet sur la trame rendue.
  */
 function flacOpener(config: AudioDecoderConfig) {
