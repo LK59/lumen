@@ -15,14 +15,14 @@ Lumen does both in the browser:
 - **Audio transcoding.** Audio the browser cannot play is decoded in the browser and re-encoded with the
   browser's own encoder, to AAC or Opus.
 
-The server stops working for most of what you play:
+For these files the server only serves bytes:
 
 - **Playback starts sooner**, because nothing waits for ffmpeg to start.
 - **Seeking is faster**, because there is no stream to restart on the server.
-- **The server's CPU stays idle**, since it only serves bytes.
+- **The server's CPU stays free**: no ffmpeg runs for the video or the audio.
 
-Anything else is played by the regular Jellyfin player, exactly as before, with the reason logged. You keep
-everything Jellyfin already does, and gain on the rest.
+Anything else is played by the regular Jellyfin player, as before. The reason is shown in the browser console
+and in the playback log.
 
 ![Lumen settings and playback log](plugin/screenshot.png)
 
@@ -37,16 +37,18 @@ On the viewer's device it stays light:
 
 - **The browser decodes the video.** Lumen copies the video samples byte for byte, and the browser's own
   `<video>` element decodes and displays them with its hardware decoder, exactly as in a direct play.
-- **The CPU work is the audio, and only when needed.** Copying samples costs next to nothing. Decoding and
-  re-encoding a sound track runs in a worker, off the page's main thread.
-- **The download is small.** The plugin archive weighs 1.3 MB. The engine itself is about 300 KB, and the audio
-  decoders are separate files fetched only when a file needs them.
+- **The CPU work is the audio, and only when needed.** Copying samples costs next to nothing. When an audio
+  track has to be transcoded, the FFmpeg decoders run in a worker, off the page's main thread, and the encoding
+  is done by the browser's own encoder.
+- **The download is small.** The browser loads about 450 KB of script before the first playback. The audio
+  decoders are separate files of 0.5 to 1 MB each, fetched only when a file needs them. The whole plugin archive
+  is 1.3 MB.
 
 ## How it works
 
 1. The web client asks Lumen whether it can play the file. Lumen opens it over HTTP range requests, reads the
    container header and index, and checks each track against what this browser can decode.
-2. If it can, the server is asked for the raw file and never starts ffmpeg.
+2. If it can, the server is asked for the raw file, and starts no ffmpeg for the video or the audio.
 3. Lumen reads the Matroska or MP4 container and rewrites the samples into fragmented MP4, fed to the
    `<video>` element through Media Source Extensions. Video samples are copied byte for byte.
 4. Audio the browser can play is copied too. Audio it cannot play is decoded by FFmpeg decoders compiled to
@@ -65,37 +67,38 @@ audio. The video is always decoded by the browser.
 |---|---|---|
 | Containers | Matroska (MKV), MP4 including fragmented MP4 | everything else (AVI, MPEG-TS, DVD and Blu-ray folders, ISO), live TV |
 | Video, if the browser decodes it | H.264, HEVC 8-bit and 10-bit, AV1 | VP8, VP9, MPEG-2, MPEG-4 ASP, VC-1 |
-| HDR | HDR10, and Dolby Vision with a base layer, decoded and displayed by the browser | Dolby Vision profile 5 (no base layer), Dolby Vision over AV1 |
-| Audio copied as it is | AAC, Opus, FLAC, and AC-3 or E-AC-3 where the browser plays them | |
-| Audio decoded in the browser, then re-encoded | TrueHD and MLP, DTS and DTS-HD, AC-3, E-AC-3, multichannel 24-bit FLAC, PCM | MP2 |
+| HDR | HDR10. Dolby Vision over HEVC: as Dolby Vision where the browser accepts it, otherwise on its HDR10 base layer | Dolby Vision without a base layer (profile 5), where the browser does not accept Dolby Vision |
+| Audio copied as it is | AAC, Opus, FLAC, AC-3 and E-AC-3, each where the browser accepts it | |
+| Audio decoded in the browser, then re-encoded | TrueHD and MLP, DTS and DTS-HD, and AC-3, E-AC-3 or FLAC where the browser does not accept them | MP2, MP3, Vorbis, PCM |
 
-What happens to a given file depends on the browser. Safari plays AC-3, E-AC-3 and HEVC natively, so Lumen
-copies everything. Chrome plays none of the Dolby audio formats, so Lumen decodes them. A browser without an
-HEVC decoder gets the regular player for HEVC files.
+What happens to a given file depends on the browser, and Lumen asks the browser rather than assuming. Safari
+plays AC-3, E-AC-3 and HEVC natively, so Lumen copies those as they are. Chrome does not play the Dolby audio
+formats, so Lumen decodes them. A browser without an HEVC decoder gets the regular player for HEVC files.
 
-Good to know:
+Details:
 
 - **HDR on an SDR screen** is converted by the browser and the system, as for any HDR video they play. Lumen
   helps them on one point: on Chrome and Edge under Windows or Linux with an SDR screen, it lowers the peak
-  brightness the file announces, so that a film mastered very bright is not shown too dark.
-- **Multichannel audio** that had to be decoded stays multichannel after re-encoding. On Apple devices, 7.1 is
-  folded to 5.1. For Atmos and DTS:X, you get the 5.1 or 7.1 channel bed.
-- **Audio that starts after the picture** is padded with silence, so playback starts on the first frame.
+  brightness the file announces, so that a title announcing a very high peak is not shown too dark.
+- **Multichannel audio** that had to be decoded stays multichannel after re-encoding: 5.1 stays 5.1, and 7.1 is
+  kept where the browser's encoder produces eight channels and folded to 5.1 elsewhere (always on Apple
+  systems). For Atmos and DTS:X, you get the channel bed. Re-encoding is lossy, as a server transcode is.
+- **Audio that starts well after the picture** is padded with silence, so playback starts on the first frame.
 - **Changing the audio track** reopens the stream on the new track at the current position.
-- **Subtitles** are the web client's own, fetched from the server as usual. Text subtitles are aligned with the
-  picture; ASS and image subtitles (PGS) are drawn by the web client's own renderers and can lead the picture by
-  about 0.2 s.
+- **Subtitles** are the web client's own. As usual, the server extracts an embedded track when you select one.
+  Text subtitles are aligned with the picture; ASS and image subtitles (PGS) are drawn by the web client's own
+  renderers and can lead the picture by about 0.2 s.
 - **Quality settings** are respected. Lumen always reads the file at its original bitrate, so if you cap the
   bitrate below the file's, the regular player takes over.
 
 ## What stays Jellyfin
 
-Lumen is a regular player of the Jellyfin web client. It extends the built-in video player and replaces only its
+Lumen registers as a player in the Jellyfin web client. It extends the built-in video player and replaces only its
 source. The player interface, subtitles, track menus, resume position, playback reporting and the Playback Info
 panel are the web client's own. Playback Info names the player that is actually playing and, when it is Lumen,
 shows what it does with the file.
 
-On the server, the plugin does no media processing. It serves the player's files, adds one script tag to the web
+On the server, the plugin does no media processing. It serves the player's files, adds its script to the web
 client page and one entry to its `config.json` as they are served, and keeps its settings. It modifies no file
 on disk, needs no other plugin, and works alongside plugins that modify the same page (File Transformation,
 JavaScript Injector, themes). Disabling it gives you back the stock web client.
@@ -110,41 +113,49 @@ https://raw.githubusercontent.com/LK59/lumen/main/manifest.json
 
 Then install **Lumen** from the catalog, restart Jellyfin, and reload the web client.
 
-- **Jellyfin 10.10 or later.**
-- The web client must be opened over **HTTPS** or on `localhost`: browsers only expose the audio encoder in a
-  secure context.
+- **Jellyfin 10.10 or later.** Checked on 10.10.7, 10.11.11, 12.0, 12.2 and 12.4.
+- Open the web client over **HTTPS** or on `localhost`. Browsers only expose the audio encoder in a secure
+  context: over plain HTTP, files whose audio must be transcoded go to the regular player.
+- Transcoding audio needs a browser with an audio encoder, which in Safari means version 26 or later.
 - If your reverse proxy sets a Content Security Policy, decoding audio needs `worker-src blob:` and
   `script-src 'wasm-unsafe-eval'`. Without them Lumen still plays the files whose audio it can copy and hands
   the others back.
 
+To check that it works, play a file and open Playback Info in the player's settings menu: it names the player,
+"Lumen" or the regular one, and what Lumen does with the file.
+
 To update, open the Lumen page: it shows the running version and the latest one, with a button that installs it
-and restarts Jellyfin.
+and restarts Jellyfin. To remove it, uninstall it from Dashboard > Plugins and restart; the playback log, if you
+used it, stays in the server's data folder under `lumen/`.
 
 ## Settings
 
 Dashboard > Lumen:
 
 - **Enable the plugin**: when off, the web client is served untouched.
-- **Play with Lumen**: when off, the regular player does the playing while playbacks can still be logged. Flip it
-  to compare playback with and without Lumen.
+- **Play with Lumen**: when off, the regular player plays while playbacks can still be logged. Turn it off to
+  compare playback with and without Lumen.
 - **For all users**, or only the users you select.
-- **Log playbacks** (off by default): records each playback on your server, with what the viewer waited for
-  (first frame, each seek, stalls) and the CPU time ffmpeg spent on the server for that file. On files played both
-  ways, the page shows how many times faster one player is than the other. The log stays on your server.
+- **Log playbacks** (off by default): records each playback on your server, with the user, the title, what the
+  viewer waited for (first frame, each seek, stalls) and, on Linux servers, the CPU time ffmpeg spent for that
+  file. On files played both ways, the page shows how many times faster one player is than the other. The log
+  stays on your server and is visible to administrators only.
 
-The browser console also says what Lumen is doing (`[Lumen] ...`), including why it declined a file.
+The browser console also says what Lumen is doing (`[Lumen] ...`), including why it declined a file. These
+messages are in French for now.
 
 ## Where it applies
 
-- Lumen acts in the Jellyfin web client: Chrome, Firefox and Safari. In the Jellyfin mobile apps it applies
-  where the app plays through the web player, which on Android means only when the web player is selected in
-  the app's settings. Apps with their own native player (TV apps, Swiftfin and others) are not affected.
+- Lumen acts in the Jellyfin web client: Chrome, Edge, Firefox and Safari. In the Jellyfin mobile apps it
+  should apply where the app plays through the web player, which on Android means only when the web player is
+  selected in the app's settings. Apps that play with their own native player are not affected.
 - Reports from the mobile apps are welcome: they have not been tested yet.
-- Lumen plugs into the web client's own video player and checks at startup that it is the one it knows. If a
+- Lumen plugs into the web client's own video player and checks that it has the methods it relies on. If a
   future version of the web client changes in a way Lumen does not recognise, it steps aside, says so in the
   console, and the web client plays as usual.
 - If the server refuses the file during playback, Lumen hands over to the regular player within seconds. During
-  a real network outage it waits for the network to come back, for up to 48 seconds, and resumes by itself.
+  a network outage it waits for the network to come back and resumes by itself; after 48 seconds without it, the
+  web client takes over.
 
 ## Source
 
@@ -163,7 +174,7 @@ French.
 
 ## Licenses
 
-Lumen is the playback engine of [Laterna](https://github.com/LK59/laterna), released under AGPL-3.0.
+Lumen is released under AGPL-3.0, like [Laterna](https://github.com/LK59/laterna), which it comes from.
 
 The plugin archive includes audio decoders built from FFmpeg 7.1.5 (LGPL) compiled to WebAssembly, and libFLAC
 (BSD) through `@wasm-audio-decoders/flac` (MIT). The scripts that build the FFmpeg decoders are in the Laterna
