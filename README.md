@@ -147,8 +147,8 @@ The browser console also says what Lumen is doing (`[Lumen] ...`), including why
 | `manifest.json`, `releases/` | The plugin repository that Jellyfin reads |
 
 Everything builds and runs through Docker; nothing is installed on the host. `plugin/package.sh` builds the
-engine, the bridge and the plugin, and produces the plugin folder and its archive. The code comments and the
-build notes in each folder are in French.
+engine, the bridge and the plugin, and produces the plugin folder and its archive. The code comments are in
+French.
 
 ## Licenses
 

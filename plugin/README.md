@@ -1,81 +1,82 @@
-# Le plugin Jellyfin « Lumen »
+# The Jellyfin plugin
 
-Il fait lire à jellyfin-web les fichiers **tels qu'ils sont** : le navigateur remuxe et décode le son lui-même
-(`lumen-core`), et le serveur n'envoie que des octets. Un fichier que Lumen ne sait pas lire est lu comme avant,
-par le lecteur ordinaire de jellyfin-web.
+It lets the Jellyfin web client play files **as they are**: the browser remuxes them and decodes the audio
+itself (`lumen-core`), and the server only sends bytes. A file Lumen cannot play is played as before, by the web
+client's regular player.
 
-Deux parties :
+Two parts:
 
-| Dossier | Langage | Rôle |
+| Folder | Language | Role |
 |---|---|---|
-| `web/` | TypeScript | Le pont : un script qui fait de Lumen un lecteur de jellyfin-web. Voir [`docs/jellyfin-web-bridge.md`](../docs/jellyfin-web-bridge.md) |
-| `server/` | C# (.NET 8, pour Jellyfin 10.10 et suivants) | Le plugin Jellyfin. **Aucun calcul côté serveur** : il livre les fichiers du lecteur, les annonce à jellyfin-web, et tient les réglages |
+| `web/` | TypeScript | The bridge: a script that makes Lumen a player of the Jellyfin web client. See [`docs/jellyfin-web-bridge.md`](../docs/jellyfin-web-bridge.md) |
+| `server/` | C# (.NET 8, for Jellyfin 10.10 and later) | The Jellyfin plugin. **No media processing on the server**: it delivers the player's files, announces them to the web client, and keeps the settings |
 
-## Ce que fait le plugin serveur
+## What the server plugin does
 
-- Il sert les fichiers du lecteur (`/Lumen/web/…`) depuis le dossier `web/` livré à côté de son assemblage.
-- Il sert deux fichiers du client web avec ce qu'il faut pour que Lumen y soit un lecteur : la page d'entrée
-  (`/web/`, `/web/index.html`) avec une balise `<script>` en tête, et `/web/config.json` avec le nom du lecteur
-  dans sa liste `plugins`. Les fichiers du client web ne sont **jamais modifiés sur le disque** : désactiver ou
-  retirer le plugin les rend tels quels.
-- Il répond à `/Lumen/Settings` (authentifié) : Lumen lit-il pour le compte qui demande, et ses lectures
-  sont-elles journalisées ?
-- Sa page de réglages (Tableau de bord → Plugins → Lumen, en anglais) : le plugin activé ou non, Lumen qui lit
-  ou qui laisse lire, pour tous les comptes ou seulement certains, et le journal des lectures.
-- Il tient ce journal quand on l'allume : chaque lecture du client web, avec ce que le spectateur a attendu et
-  le processeur que ffmpeg a consommé sur le serveur. Décocher « Play with Lumen » laisse jellyfin-web lire seul
-  tout en journalisant : c'est ainsi qu'on compare « avec » et « sans », sur les lectures réelles.
+- It serves the player's files (`/Lumen/web/...`) from the `web/` folder shipped next to its assembly.
+- It completes two responses of the web client as they are served: the entry page (`/web/`,
+  `/web/index.html`) gets a `<script>` tag at the top, and `/web/config.json` gets the player's name in its
+  `plugins` list. These responses are produced by the rest of the server and completed on the way out, so what
+  other plugins did to the same page is preserved. **No file is modified on disk**: disabling or removing the
+  plugin gives them back unchanged.
+- It answers `/Lumen/Settings` (authenticated): does Lumen play for the user who asks, and are their playbacks
+  logged?
+- Its settings page (Dashboard > Lumen): the plugin on or off, Lumen playing or stepping aside, for all users or
+  only some, the playback log, and a one-click update.
+- It keeps the playback log when it is turned on: each playback of the web client, with what the viewer waited
+  for and the CPU time ffmpeg spent on the server. Unchecking "Play with Lumen" lets the regular player play
+  while still logging, which is how "with" and "without" are compared on real playbacks.
 
-Il n'utilise aucun autre plugin (ni *File Transformation*, ni *JavaScript Injector*) et ne modifie pas le code
-du serveur en mémoire : il inscrit un `IStartupFilter`, la porte qu'ASP.NET laisse à tout service inscrit au
-démarrage.
+It needs no other plugin and does not patch the server in memory: it registers an `IStartupFilter`, the door
+ASP.NET leaves open to any service registered at startup.
 
-## Construire
+## Building
 
-Tout passe par Docker.
+Everything runs through Docker.
 
 ```sh
-plugin/package.sh                                    # → plugin/dist/
-REPO_URL=https://exemple.test/lumen plugin/package.sh   # pour un dépôt de plugins publié
+plugin/package.sh                                      # -> plugin/dist/
+REPO_URL=https://example.test/lumen plugin/package.sh  # for a published plugin repository
 ```
 
-`plugin/dist/` contient le dossier du plugin (`Lumen_<version>/`), son archive, et un `manifest.json` de dépôt de
-plugins. La version de Jellyfin visée est dans `server/Directory.Build.props` : c'est celle des paquets NuGet
-`Jellyfin.Controller` et `Jellyfin.Model`, et du `targetAbi` annoncé.
+`plugin/dist/` holds the plugin folder (`Lumen_<version>/`), its archive, and a plugin repository
+`manifest.json`. The oldest Jellyfin version served is set in `server/Directory.Build.props`: it is the version
+of the `Jellyfin.Controller` and `Jellyfin.Model` NuGet packages, and the announced `targetAbi`. A single
+assembly built for 10.10 runs on the later versions.
 
-## Installer
+## Installing
 
-- **À la main** : copier `Lumen_<version>/` dans le dossier des plugins du serveur (`<données>/plugins/`), puis
-  redémarrer Jellyfin.
-- **Par le dépôt de plugins** : dans Tableau de bord → Plugins → Dépôts, ajouter
-  `https://raw.githubusercontent.com/LK59/lumen/main/manifest.json`, puis installer Lumen depuis le catalogue et
-  redémarrer. `plugin/publish.sh --push` y publie une nouvelle version (le manifeste et l'archive seulement).
+- **From the plugin repository:** in Dashboard > Plugins > Repositories, add
+  `https://raw.githubusercontent.com/LK59/lumen/main/manifest.json`, install Lumen from the catalog, restart.
+- **By hand:** copy `Lumen_<version>/` into the server's plugin folder (`<data>/plugins/`), then restart
+  Jellyfin.
 
-Après l'installation, recharger la page du client web. La console du navigateur dit ce que fait Lumen
-(`[Lumen] prêt`, `[Lumen] lecture — …`, `[Lumen] refus, lecture par jellyfin-web — <motif>`), et
-`window.Lumen.status()` rend son état.
+After installing, reload the web client page. The browser console says what Lumen is doing (`[Lumen] ...`), and
+`window.Lumen.status()` returns its state.
 
-## Vérifier
+## Checking
 
 ```sh
-tools/test-jellyfin.sh plugin            # un Jellyfin jetable avec le plugin installé
-plugin/web/navigateur/pont.sh plugin     # le parcours d'un spectateur, dans le vrai jellyfin-web
+MEDIA_ROOT=/path/to/media tools/test-jellyfin.sh plugin   # a disposable Jellyfin with the plugin installed
+plugin/web/navigateur/pont.sh plugin                      # a viewer's scenario, in the real web client
 tools/test-jellyfin.sh down
 ```
 
-Le parcours ouvre chaque titre, saute par la barre de jellyfin-web, change de piste son et de sous-titres par ses
-menus, arrête, et relève ce que le serveur en a vu : méthode de lecture, position de reprise, lancements de
-ffmpeg. `pont.sh main` joue le même parcours sans plugin, le script injecté à la main ; `LUMEN_OFF=1` le joue
-quand « Play with Lumen » est décoché. `navigateur/reglages.mjs` ouvre la page de réglages et rend ce qu'elle
-montre.
+The scenario opens each title, seeks with the web client's position bar, changes the audio track and the
+subtitles through its menus, stops, and records what the server saw: play method, resume position, ffmpeg
+launches. `pont.sh main` runs it without the plugin, with the script injected by hand; `LUMEN_OFF=1` runs it
+with "Play with Lumen" unchecked. In the same folder: `reglages.mjs` (the settings page), `sous-titres.mjs`
+(when a subtitle cue appears on screen), `repli.mjs` (handover when the server refuses the file, or under a
+strict Content Security Policy), `panneau.mjs` (the Playback Info panel).
 
-## Limites connues
+`tools/test-jellyfin.sh` takes `JF_IMAGE` (the Jellyfin image) and `JF_DATA` (one data folder per version
+tried), and `setup` prepares a fresh server: this is how each Jellyfin version is checked before a release.
 
-- Vérifié sur Jellyfin **10.10.7, 10.11.11, 12.0, 12.2 et 12.4** (`lumen-core/benches/` et
-  `plugin/web/navigateur/`). Le pont s'appuie sur le fonctionnement interne du lecteur
-  vidéo de jellyfin-web ; avec une version où il ne se laisse plus étendre, Lumen se désactive en le disant dans
-  la console, et jellyfin-web lit seul.
-- Les sous-titres restent ceux de jellyfin-web : pour une piste du fichier, le serveur l'extrait à la demande.
-  Les sous-titres texte sont calés sur l'image ; ASS et PGS la devancent d'environ 0,2 s.
-- Les applications qui affichent jellyfin-web dans une vue web reçoivent le même script ; elles n'ont pas été
-  essayées.
+## Known limits
+
+- Checked on Jellyfin **10.10.7, 10.11.11, 12.0, 12.2 and 12.4**. The bridge relies on the internals of the web
+  client's video player; with a version where that player can no longer be extended, Lumen turns itself off,
+  says so in the console, and the web client plays alone.
+- Subtitles are the web client's own: for a track of the file, the server extracts it on demand. Text subtitles
+  are aligned with the picture; ASS and PGS lead it by about 0.2 s.
+- Apps that display the web client in a web view receive the same script; they have not been tried.
