@@ -6,7 +6,16 @@
     "overview": "Playback without server-side transcoding for the web client.",
     "owner": "lumen",
     "category": "General",
+    "imageUrl": "https://raw.githubusercontent.com/LK59/lumen/main/logo.png",
     "versions": [
+      {
+        "version": "0.1.1.0",
+        "changelog": "Lumen now has its own entry in the dashboard side menu. Playback Info now names the player that is actually playing, and shows what Lumen does with the file. Settings changes apply to the next playback without reloading the page.",
+        "targetAbi": "12.4.0.0",
+        "sourceUrl": "https://raw.githubusercontent.com/LK59/lumen/main/lumen_0.1.1.0.zip",
+        "checksum": "09934c046d9fb4b92da1308ce31e81b4",
+        "timestamp": "2026-11-20T13:56:54Z"
+      },
       {
         "version": "0.1.0.0",
         "changelog": "First version.",

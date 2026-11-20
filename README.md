@@ -1,3 +1,5 @@
+<img src="logo.png" alt="Lumen" width="96" align="right">
+
 # Lumen for Jellyfin
 
 Lumen makes the Jellyfin web client play files as they are. The browser remuxes the file for MediaSource and
