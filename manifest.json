@@ -15,38 +15,6 @@
         "sourceUrl": "https://raw.githubusercontent.com/LK59/lumen/main/releases/lumen_0.1.4.0.zip",
         "checksum": "1a3e4aa883d8aa79050702255f87017f",
         "timestamp": "2026-11-20T17:25:28Z"
-      },
-      {
-        "version": "0.1.3.0",
-        "changelog": "Runs on Jellyfin 10.10 and later. Update from the Lumen page in one click. Text subtitles are aligned with the picture. When the server refuses the file, playback is handed back to the regular player at once.",
-        "targetAbi": "10.10.0.0",
-        "sourceUrl": "https://raw.githubusercontent.com/LK59/lumen/main/releases/lumen_0.1.3.0.zip",
-        "checksum": "b0d0cf9ccb9d4a38c95b265d37f53f96",
-        "timestamp": "2026-11-20T15:55:29Z"
-      },
-      {
-        "version": "0.1.2.0",
-        "changelog": "Works alongside other plugins that modify the web client page (File Transformation, JavaScript Injector, themes). The playback log now shows how many times faster Lumen is on the files both players have played.",
-        "targetAbi": "12.4.0.0",
-        "sourceUrl": "https://raw.githubusercontent.com/LK59/lumen/main/releases/lumen_0.1.2.0.zip",
-        "checksum": "da0422b198521021f79e83dcd1683ef8",
-        "timestamp": "2026-11-20T14:41:09Z"
-      },
-      {
-        "version": "0.1.1.0",
-        "changelog": "Lumen now has its own entry in the dashboard side menu. Playback Info now names the player that is actually playing, and shows what Lumen does with the file. Settings changes apply to the next playback without reloading the page.",
-        "targetAbi": "12.4.0.0",
-        "sourceUrl": "https://raw.githubusercontent.com/LK59/lumen/main/releases/lumen_0.1.1.0.zip",
-        "checksum": "09934c046d9fb4b92da1308ce31e81b4",
-        "timestamp": "2026-11-20T13:56:54Z"
-      },
-      {
-        "version": "0.1.0.0",
-        "changelog": "First version.",
-        "targetAbi": "12.4.0.0",
-        "sourceUrl": "https://raw.githubusercontent.com/LK59/lumen/main/releases/lumen_0.1.0.0.zip",
-        "checksum": "7c78d99038f77d653ce77bc498c89d04",
-        "timestamp": "2026-11-20T13:30:15Z"
       }
     ]
   }
