@@ -1,0 +1,51 @@
+name: Playback problem
+description: A file that does not play, plays badly, or is declined when you expected Lumen to play it
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Lumen decides per file and per browser, so the same file can behave differently on two devices.
+        The four answers below are what makes a report reproducible.
+  - type: input
+    id: versions
+    attributes:
+      label: Lumen and Jellyfin versions
+      description: Dashboard > Lumen shows the plugin version; Dashboard > General shows the server version.
+      placeholder: Lumen 0.1.13.0, Jellyfin 10.11.11
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: Browser or app, version, and device
+      placeholder: Chrome 143 on Windows 11 / Jellyfin iOS app 1.8.0 on an iPhone 15
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+      description: Say what you did just before (start, seek, audio track change, coming back to the app) and whether it happens every time.
+    validations:
+      required: true
+  - type: textarea
+    id: playback-info
+    attributes:
+      label: Playback Info
+      description: While the file plays, open the player's settings menu > Playback Info, and copy what it shows (player, video, audio handling).
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: console
+    attributes:
+      label: Console lines
+      description: In a desktop browser, press F12, open the Console tab, and copy the lines starting with [Lumen]. On a phone, skip this.
+      render: text
+  - type: textarea
+    id: file
+    attributes:
+      label: The file
+      description: Container, video codec, audio codec and channels, HDR or Dolby Vision if any. The media info shown on the item's page is enough. No title needed.
+      placeholder: MKV, HEVC 10-bit HDR10, DTS-HD MA 5.1
