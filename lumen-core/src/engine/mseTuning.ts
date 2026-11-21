@@ -41,7 +41,7 @@ export const OPENING_EDGE_SECONDS = 0.5;
 export const OPENING_REASSERT_MS = 100;
 
 /**
- * Mais jamais sur un élément qui vient de repartir (10/10/2026, Mathis, iPhone, 8.32.9) : la
+ * Mais jamais sur un élément qui vient de repartir (10/10/2026, un iPhone, 8.32.9) : la
  * minuterie de 100 ms, retardée par le travail du fil principal (segments construits et envoyés),
  * tombait 283 à 348 ms après l'atterrissage — dans le même instant que le `playing` de Safari, qui
  * venait justement d'achever le placement. Le pas redemandé relançait le saut et refigeait l'élément :

@@ -180,7 +180,7 @@ const SEEK_FIRST_BYTE_MS = 5000;
 /**
  * Au retour au premier plan, la même échéance du premier octet, pendant ce temps.
  *
- * 13/10/2026, iPhone d'Augustine : pause, écran verrouillé deux minutes, retour — la lecture repart
+ * 13/10/2026, iPhone d'un spectateur : pause, écran verrouillé deux minutes, retour — la lecture repart
  * sur ses 21 s d'avance, mais aucun octet n'arrive pendant ~13 s (la connexion d'avant le
  * verrouillage est souvent morte, et une requête posée dessus attend l'échéance ordinaire de 25 s) :
  * l'avance s'épuise, 5 s de blocage. Une requête muette 5 s est redemandée — sur une connexion

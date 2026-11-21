@@ -114,7 +114,7 @@ export const HINT_MEASURED_MS = 5_000;
  * « Très en dessous du besoin » : moins du quart du débit moyen du fichier — quatre secondes de réseau
  * pour chaque seconde de film. Avec les preuves du verdict (10 s de réception, 256 Kio), l'ouverture
  * bascule sur la version allégée dès 10 s (`openingAdvice`, slowLinkPolicy.ts, DECISIONS.md §78). Le cas
- * réel du 12/10/2026 (Edge d'Augustine : ≈ 0,3 Mbit/s reçus pour 3,9 demandés) est sous 10 % dès dix
+ * réel du 12/10/2026 (Edge d'un spectateur : ≈ 0,3 Mbit/s reçus pour 3,9 demandés) est sous 10 % dès dix
  * secondes : la marge jusqu'à 25 % est large. Entre 25 % et 50 %, la bascule attend 20 s sans image.
  */
 export const NOTICE_SHARE = 0.25;

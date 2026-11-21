@@ -5,7 +5,7 @@
 // milieu d'une grappe faisait sauter au suivant (l'image à moitié nulle partait quand même au
 // navigateur : « Media failed to decode »), et un en-tête de grappe écrasé finissait la lecture —
 // « le remultiplexeur ne produit plus de segment (fin du fichier) », `endOfStream`, aucune erreur,
-// aucun repli. Mathis est resté 198 s devant une image figée ; le lecteur serveur (ffmpeg) franchit
+// aucun repli. Un spectateur est resté 198 s devant une image figée ; le lecteur serveur (ffmpeg) franchit
 // la même zone sans broncher.
 //
 // La détection est au **parsing** (`SampleReader`, option `unreadable: "throw"`) : un en-tête dont

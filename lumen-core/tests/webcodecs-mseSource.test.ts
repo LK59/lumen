@@ -2478,7 +2478,7 @@ describe("l'échelle des reprises", () => {
     });
 
     it("ne relance pas un placement que Safari vient d'achever (playing avant la minuterie)", async () => {
-      // Mathis, iPhone, 8.32.9 (10/10/2026) : « repart à 0,27 s » et « position redemandée » à la même
+      // Un iPhone, 8.32.9 (10/10/2026) : « repart à 0,27 s » et « position redemandée » à la même
       // milliseconde — le pas relançait le saut et refigeait l'élément jusqu'à la poussée de 400 ms.
       const { video, internals } = await opened();
       const head = video.buffered.start(0) + 0.04;
