@@ -109,8 +109,8 @@ over there.
   console, and the web client plays as usual.
 - If the server refuses the file during playback, Lumen hands over to the regular player within seconds. During
   a network outage it waits for the network to come back and resumes by itself. After 48 seconds without it,
-  Lumen is expected to reopen the file at the same position once the network is back, and to leave it to the
-  regular player if that fails; this longer outage has not been tried on a device yet.
+  Lumen reopens the file at the same position once the network is back, and leaves it to the regular player
+  if that fails.
 
 ## What it can play
 
@@ -195,8 +195,8 @@ Dashboard > Lumen:
   file. On files played both ways, the page shows how many times faster one player is than the other. The log
   stays on your server and is visible to administrators only.
 
-The browser console also says what Lumen is doing (`[Lumen] ...`), including why it declined a file. These
-messages are in French for now.
+The browser console also says what Lumen is doing (`[Lumen] ...`), including why it declined a file. The
+messages are in English; the reason the engine gives for declining a file is in French.
 
 ## Source
 

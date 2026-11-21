@@ -224,7 +224,7 @@ function adopt(self: LumenPlayer): boolean {
     // navigateur est ancien et leur processeur modeste, alors que leur lecteur d'origine lit déjà les
     // fichiers tels quels : Lumen n'y a rien à gagner et n'y a jamais été essayé.
     state.adopted = false;
-    log("téléviseur ou console : lecture laissée à jellyfin-web");
+    log("TV or game console: playback left to the web client");
     return false;
   }
   const html = state.deps.playbackManager.getPlayers().find((player) => player.id === "htmlvideoplayer");
@@ -248,11 +248,11 @@ function adopt(self: LumenPlayer): boolean {
     // jellyfin-web : sous un nom fixe, le panneau annonçait « Lumen » pendant un transcodage.
     Object.defineProperty(self, "name", { configurable: true, enumerable: true, get: () => (state.playback ? "Lumen" : htmlName) });
     state.adopted = true;
-    log("prêt — greffé sur le lecteur vidéo de jellyfin-web");
+    log("ready, plugged into the web client's video player");
   } catch (error) {
     Object.setPrototypeOf(self, before);
     state.adopted = false;
-    console.warn("[Lumen] inactif : le lecteur vidéo de cette version de jellyfin-web ne se laisse pas étendre —", error);
+    console.warn("[Lumen] inactive: the video player of this web client version cannot be extended:", error);
   }
   return state.adopted;
 }
@@ -513,7 +513,7 @@ function close(state: State, rebuilding = false): void {
   try {
     playback?.destroy();
   } catch (error) {
-    console.warn("[Lumen] fermeture :", error);
+    console.warn("[Lumen] closing:", error);
   }
 }
 
@@ -540,7 +540,7 @@ function settings(state: State, item: JellyfinItem): Promise<Settings> {
         if (response.status === 401 || response.status === 403) return { enabled: false, journal: false };
         if (!response.ok) return { enabled: true, journal: false };
         const answered = (await response.json()) as { Enabled?: boolean; Journal?: boolean };
-        if (answered.Enabled === false) log("lecture par jellyfin-web : Lumen ne lit pas pour ce compte (réglages du plugin)");
+        if (answered.Enabled === false) log("regular player: Lumen does not play for this user (plugin settings)");
         return { enabled: answered.Enabled !== false, journal: answered.Journal === true };
       })
       .catch((): Settings => ({ enabled: true, journal: false }));
@@ -750,7 +750,7 @@ async function check(self: LumenPlayer, item: JellyfinItem): Promise<Verdict | n
     engine = await loadCore();
   } catch (error) {
     // Le moteur ne se charge pas : cela ne dit rien du fichier, et rien n'est retenu.
-    log("moteur introuvable, lecture par jellyfin-web —", error instanceof Error ? error.message : error);
+    log("engine not found, regular player:", error instanceof Error ? error.message : error);
     return null;
   }
   try {
@@ -769,7 +769,7 @@ async function check(self: LumenPlayer, item: JellyfinItem): Promise<Verdict | n
     if (probe === "timeout") {
       // Arrivée trop tard, elle sera refermée ; son refus éventuel n'intéresse plus personne.
       void asked.then((late) => late.discard()).catch(() => {});
-      log(`vérification trop longue (${CHECK_TIMEOUT_MS / 1000} s) — lecture par jellyfin-web`);
+      log(`checking the file took too long (${CHECK_TIMEOUT_MS / 1000} s), regular player`);
       return null;
     }
     const verdict: Verdict = { at: Date.now(), ok: true, mediaSourceId, audioTracks: probe.audioTracks.map((track) => track.number) };
@@ -780,12 +780,12 @@ async function check(self: LumenPlayer, item: JellyfinItem): Promise<Verdict | n
     const reason = error instanceof Error ? error.message : String(error);
     // Un réseau absent ou une session finie ne disent rien du fichier : ce n'est pas un refus à retenir.
     if (error instanceof engine.NetworkUnavailable || error instanceof engine.SessionEnded) {
-      log("vérification impossible, lecture par jellyfin-web —", reason);
+      log("could not check the file, regular player:", reason);
       return null;
     }
     const verdict: Verdict = { at: Date.now(), ok: false, reason, mediaSourceId, audioTracks: [] };
     state.verdicts.set(id, verdict);
-    log("refus, lecture par jellyfin-web —", reason);
+    log("declined, regular player:", reason);
     return verdict;
   }
 }
@@ -810,13 +810,13 @@ async function open(self: LumenPlayer, element: HTMLVideoElement, options: Strea
       // Une reconstruction ne relance pas un film que le spectateur avait mis en pause.
       startPaused: resume?.paused ?? false,
       audioTrackNumber,
-      onWarning: (warning) => log("avertissement du moteur —", warning.code, warning.detail ?? ""),
+      onWarning: (warning) => log("engine warning:", warning.code, warning.detail ?? ""),
       // Le moteur a épuisé ses reprises sur cette source. On la rouvre à la même position, quelques
       // fois ; au-delà, c'est une erreur de lecture pour jellyfin-web, qui renégocie et transcode.
       onError: (message, kind) => {
         if (states.get(self)!.opening !== mine) return;
-        log("le moteur renonce —", message);
-        void rebuild(self, kind === "network" ? "réseau" : "source perdue").then((rebuilt) => {
+        log("the engine gave up:", message);
+        void rebuild(self, kind === "network" ? "network" : "source lost").then((rebuilt) => {
           if (!rebuilt) handOver(self, kind === "network" ? "network" : "mediadecodeerror");
         });
       },
@@ -833,7 +833,7 @@ async function open(self: LumenPlayer, element: HTMLVideoElement, options: Strea
     refusals = now - lastRefusal > REFUSAL_WINDOW_MS ? 1 : refusals + 1;
     lastRefusal = now;
     if (refusals !== REFUSALS_BEFORE_HANDOVER) return;
-    log(`le serveur refuse le fichier (statut ${status}) — lecture rendue à jellyfin-web`);
+    log(`the server refuses the file (status ${status}), handing over to the regular player`);
     handOver(self, "network");
   };
   // La piste que le serveur a retenue (préférences du compte, choix au menu), traduite pour le moteur.
@@ -866,7 +866,7 @@ async function open(self: LumenPlayer, element: HTMLVideoElement, options: Strea
   await (playback.openingHold() ?? Promise.resolve());
   step(state, "released");
   if (state.opening !== mine) return;
-  log(`lecture — ${playback.diagnostics["Vidéo"] ?? "?"}, son ${playback.diagnostics["Traitement audio"] ?? "?"}`);
+  log(`playing: ${playback.diagnostics["Vidéo"] ?? "?"}, audio ${englishAudio(playback.diagnostics["Traitement audio"]) ?? "?"}`);
   if (!resume?.paused) await element.play();
 }
 
@@ -901,7 +901,7 @@ async function rebuild(self: LumenPlayer, why: string): Promise<boolean> {
   const now = performance.now();
   state.rebuilds = state.rebuilds.filter((past) => now - past.at < REBUILD_WINDOW_MS);
   if (state.rebuilds.length >= MAX_REBUILDS) {
-    log(`${MAX_REBUILDS} reconstructions en ${REBUILD_WINDOW_MS / 60_000} minutes — lecture rendue à jellyfin-web`);
+    log(`reopened ${MAX_REBUILDS} times in ${REBUILD_WINDOW_MS / 60_000} minutes, handing over to the regular player`);
     return false;
   }
   let seconds = playback.position > 0 ? playback.position : state.lastPosition;
@@ -910,7 +910,7 @@ async function rebuild(self: LumenPlayer, why: string): Promise<boolean> {
   state.rebuilds.push({ at: now, seconds });
   // En pause, il le reste : par le spectateur, ou par le système quand la page est passée en arrière-plan.
   const paused = state.wasPaused;
-  log(`reconstruction (${why}) à ${seconds.toFixed(1)} s${paused ? ", en pause" : ""} — moteur ${playback.position.toFixed(1)} s, dernière position jouée ${state.lastPosition.toFixed(1)} s`);
+  log(`reopening (${why}) at ${seconds.toFixed(1)} s${paused ? ", paused" : ""}; engine at ${playback.position.toFixed(1)} s, last played position ${state.lastPosition.toFixed(1)} s`);
   state.recorder?.rebuilt();
   state.rebuilding = seconds;
   close(state, true);
@@ -933,7 +933,7 @@ async function rebuild(self: LumenPlayer, why: string): Promise<boolean> {
   } catch (error) {
     if (state.current !== current) return true;
     state.rebuilding = null;
-    log("reconstruction impossible —", error instanceof Error ? error.message : error);
+    log("could not reopen:", error instanceof Error ? error.message : error);
     return false;
   }
 }
@@ -950,7 +950,7 @@ function checkAfterReturn(): void {
     const state = instance ? states.get(instance) : null;
     if (!instance || !state?.playback?.lost || state.rebuilding !== null) return;
     const self = instance as LumenPlayer;
-    void rebuild(self, "retour au premier plan").then((rebuilt) => {
+    void rebuild(self, "back to the foreground").then((rebuilt) => {
       if (!rebuilt) handOver(self, "mediadecodeerror");
     });
   };

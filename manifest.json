@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/LK59/lumen/main/plugin/logo.png",
     "versions": [
       {
+        "version": "0.1.12.0",
+        "changelog": "The messages Lumen writes to the browser console are now in English.",
+        "targetAbi": "10.10.0.0",
+        "sourceUrl": "https://raw.githubusercontent.com/LK59/lumen/main/releases/lumen_0.1.12.0.zip",
+        "checksum": "c4292009c337cd2c007eff23d7daf58b",
+        "timestamp": "2026-11-21T12:25:34Z"
+      },
+      {
         "version": "0.1.11.0",
         "changelog": "The playback log tells apart, in the opening of a playback, the time spent negotiating with the server and the time the web client takes to create its video element.",
         "targetAbi": "10.10.0.0",
