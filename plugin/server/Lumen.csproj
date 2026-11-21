@@ -5,9 +5,9 @@
     <RootNamespace>Lumen.Jellyfin</RootNamespace>
     <AssemblyName>Lumen</AssemblyName>
     <!-- Quatre nombres : Jellyfin compare les versions de plugin ainsi, et nomme le dossier d'après elles. -->
-    <Version>0.1.12.0</Version>
+    <Version>0.1.13.0</Version>
     <!-- Ce que cette version change, en une ligne : repris dans le manifeste du dépôt de plugins. -->
-    <PackageReleaseNotes>The messages Lumen writes to the browser console are now in English.</PackageReleaseNotes>
+    <PackageReleaseNotes>The plugin page shows the measured gains: start, seeks and audio track changes.</PackageReleaseNotes>
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>

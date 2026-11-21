@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/LK59/lumen/main/plugin/logo.png",
     "versions": [
       {
+        "version": "0.1.13.0",
+        "changelog": "The plugin page shows the measured gains: start, seeks and audio track changes.",
+        "targetAbi": "10.10.0.0",
+        "sourceUrl": "https://raw.githubusercontent.com/LK59/lumen/main/releases/lumen_0.1.13.0.zip",
+        "checksum": "260f734580f98f651b1f2e6cfee54967",
+        "timestamp": "2026-11-21T14:14:30Z"
+      },
+      {
         "version": "0.1.12.0",
         "changelog": "The messages Lumen writes to the browser console are now in English.",
         "targetAbi": "10.10.0.0",
