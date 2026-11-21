@@ -73,9 +73,10 @@ Matroska and MP4, writes fragmented MP4, manages the Media Source buffers (seeks
 recovery after a decode error) and runs its own audio pipeline. That is about 20,000 lines of TypeScript with a
 test suite of the same size.
 
-The engine is not new. In Laterna it has played more than 3,000 sessions of over 800 titles for 25 viewers
-since September 2026, about 650 hours: on iPhone, iPad, Mac, Windows and Android, in Safari, Chrome, Firefox
-and Edge.
+The engine is not new. It comes from [Laterna](https://github.com/LK59/laterna), a self-hosted cinema front end
+for Jellyfin, where it is the player. There it has played more than 3,000 sessions of over 800 titles for 25
+viewers since September 2026, about 650 hours: on iPhone, iPad, Mac, Windows and Android, in Safari, Chrome,
+Firefox and Edge.
 
 On the viewer's device it stays light:
 
