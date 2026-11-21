@@ -69,8 +69,11 @@ your own library and devices.
 Lumen handles the whole chain that feeds the `<video>` element. It reads the file by byte ranges, demuxes
 Matroska and MP4, writes fragmented MP4, manages the Media Source buffers (seeks, buffer limits per browser,
 recovery after a decode error) and runs its own audio pipeline. That is about 20,000 lines of TypeScript with a
-test suite of the same size. The engine is not new: it has been in daily use in Laterna for months, on phones,
-computers and browsers of several kinds, before becoming a plugin.
+test suite of the same size.
+
+The engine is not new. In Laterna it has played more than 3,000 sessions of over 800 titles for 25 viewers
+since September 2026, about 650 hours: on iPhone, iPad, Mac, Windows and Android, in Safari, Chrome, Firefox
+and Edge. Over those 650 hours, playback stalled 40 times, for about four minutes in all.
 
 On the viewer's device it stays light:
 
