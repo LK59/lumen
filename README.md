@@ -5,6 +5,7 @@
 [![tests](https://github.com/LK59/lumen/actions/workflows/tests.yml/badge.svg)](https://github.com/LK59/lumen/actions/workflows/tests.yml)
 
 Lumen is the playback engine of [Laterna](https://github.com/LK59/laterna), plugged into the Jellyfin web client.
+How the engine is built is told on [laterna.fr](https://laterna.fr/en/lumen/).
 
 Most libraries are MKV, and most browsers do not take Matroska in a `<video>` element. So when the Jellyfin web
 client plays such a file, the server runs ffmpeg to repackage it, even when the browser could decode the video as
