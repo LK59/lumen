@@ -1,0 +1,33 @@
+# Ce que chaque publication doit tenir : les tests du moteur et du pont, leurs types, et le plugin qui se
+# construit. Les mêmes commandes et les mêmes images Docker que sur la machine de développement, pour
+# qu'un résultat vert ici veuille dire la même chose que là-bas.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Engine and bridge tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Engine (lumen-core)
+        run: docker run --rm -e npm_config_update_notifier=false -v "$PWD":/app -w /app/lumen-core node:26-alpine sh -c "npm ci --no-audit --no-fund && npx tsc --noEmit && npx vitest run"
+      # Après le moteur : le pont est typé contre ses sources, dépendances comprises.
+      - name: Bridge (plugin/web)
+        run: docker run --rm -e npm_config_update_notifier=false -v "$PWD":/app -w /app/plugin/web node:26-alpine sh -c "npm ci --no-audit --no-fund && npx tsc --noEmit && npx vitest run"
+
+  package:
+    name: Plugin build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Le cache NuGet est monté dans le conteneur de construction : créé par Docker, il appartiendrait à root.
+      - name: Build the plugin archive
+        run: mkdir -p plugin/.nuget && plugin/package.sh

@@ -2,6 +2,8 @@
 
 # Lumen for Jellyfin
 
+[![tests](https://github.com/LK59/lumen/actions/workflows/tests.yml/badge.svg)](https://github.com/LK59/lumen/actions/workflows/tests.yml)
+
 Lumen is the playback engine of [Laterna](https://github.com/LK59/laterna), plugged into the Jellyfin web client.
 
 Most libraries are MKV, and most browsers do not take Matroska in a `<video>` element. So when the Jellyfin web
@@ -215,9 +217,10 @@ messages are in English; the reason the engine gives for declining a file is in 
 | `tools/test-jellyfin.sh` | A disposable Jellyfin for the browser tests |
 | `manifest.json`, `releases/` | The plugin repository that Jellyfin reads |
 
-Everything builds and runs through Docker; nothing is installed on the host. `plugin/package.sh` builds the
-engine, the bridge and the plugin, and produces the plugin folder and its archive. The code comments are in
-French.
+Everything builds and runs through Docker; nothing is installed on the host. The engine's and the bridge's tests
+run on GitHub at every publication, and the plugin is built there (`.github/workflows/tests.yml`).
+`plugin/package.sh` builds the engine, the bridge and the plugin, and produces the plugin folder and its
+archive. The code comments are in French.
 
 ## Licenses
 
