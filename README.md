@@ -20,6 +20,8 @@ For these files the server only serves bytes:
 
 - **Playback starts sooner**, because nothing waits for ffmpeg to start.
 - **Seeking is faster**, because there is no stream to restart on the server.
+- **Changing the audio track is faster**, for the same reason: Lumen reopens its own stream on the new track,
+  in the browser.
 - **The server's CPU stays free**: no ffmpeg runs for the video or the audio. The saving is largest on files
   whose audio the server had to transcode; where it only repackaged the file, the gain is in the start and the
   seeks.
@@ -38,7 +40,11 @@ played with Lumen and with the regular player, 24 playbacks and 58 seeks in all.
 |---|---|---|---|
 | First frame | 1.0 s | 3.8 s | about 4 times sooner |
 | Seek | 1.0 s | 2.7 s | about 3 times faster |
+| Audio track change | 0.7 s | 6.1 s | about 8 times faster |
 | ffmpeg CPU on the server, per playback | 0.6 s | 7.5 s | |
+
+The audio track changes were timed apart, on three files: 13 changes with Lumen, 4 with the regular player,
+the slowest with Lumen (1.6 s) still well ahead of the fastest without (5.5 s).
 
 What the server was doing for the regular player makes the difference:
 
