@@ -73,7 +73,7 @@ test suite of the same size.
 
 The engine is not new. In Laterna it has played more than 3,000 sessions of over 800 titles for 25 viewers
 since September 2026, about 650 hours: on iPhone, iPad, Mac, Windows and Android, in Safari, Chrome, Firefox
-and Edge. Over those 650 hours, playback stalled 40 times, for about four minutes in all.
+and Edge.
 
 On the viewer's device it stays light:
 
