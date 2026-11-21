@@ -319,6 +319,10 @@ function lumenPrototype(base: Adopted): object {
     async play(this: LumenPlayer, options: StreamInfo): Promise<void> {
       const state = states.get(this)!;
       const item = options.item;
+      // Le serveur a répondu, jellyfin-web appelle son lecteur. Entre « check » et « negotiated » il y a
+      // deux attentes distinctes, la négociation avec le serveur puis la création de l'élément vidéo :
+      // 13 s y sont passées une fois (Chrome, 21/11/2026, 0,4 s d'ordinaire) sans qu'on sache dans laquelle.
+      step(state, "answered");
       claimPlaybackAudio();
       if (item?.Id && (await settings(state, item)).journal) {
         if (state.recorder?.itemId !== item.Id) {

@@ -68,7 +68,7 @@ launches. `pont.sh main` runs it without the plugin, with the script injected by
 with "Play with Lumen" unchecked. In the same folder: `reglages.mjs` (the settings page), `sous-titres.mjs`
 (when a subtitle cue appears on screen), `repli.mjs` (handover when the server refuses the file, or under a
 strict Content Security Policy), `panneau.mjs` (the Playback Info panel), `saut-charge.mjs` (a seek inside what
-is already loaded), `cas-limites.mjs` (resume, seeks in a row, track change while paused, end of file, a source
+is already loaded), `ouverture.mjs` (an opening from the start or resumed, step by step), `cas-limites.mjs` (resume, seeks in a row, track change while paused, end of file, a source
 lost during playback or pause, a TV's user agent).
 
 `tools/test-jellyfin.sh` takes `JF_IMAGE` (the Jellyfin image) and `JF_DATA` (one data folder per version

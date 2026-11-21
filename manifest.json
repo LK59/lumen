@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/LK59/lumen/main/plugin/logo.png",
     "versions": [
       {
+        "version": "0.1.11.0",
+        "changelog": "The playback log tells apart, in the opening of a playback, the time spent negotiating with the server and the time the web client takes to create its video element.",
+        "targetAbi": "10.10.0.0",
+        "sourceUrl": "https://raw.githubusercontent.com/LK59/lumen/main/releases/lumen_0.1.11.0.zip",
+        "checksum": "625ffbd2de4f702dbceb5e6d46422d67",
+        "timestamp": "2026-11-21T11:42:46Z"
+      },
+      {
         "version": "0.1.10.0",
         "changelog": "When its source is lost (a failure during playback, or the page coming back from the background), Lumen reopens the film at the same position before handing over to the regular player.",
         "targetAbi": "10.10.0.0",

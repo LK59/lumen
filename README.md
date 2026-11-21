@@ -33,8 +33,10 @@ and in the playback log.
 
 ## Measured
 
-On an iPhone, in the Jellyfin iOS app, with the plugin's own playback log: eight files of a real library, each
-played with Lumen and with the regular player, 24 playbacks and 58 seeks in all. Medians:
+Taken from the plugin's own playback log, on a real library: each file played with Lumen and with the regular
+player. The figures are medians.
+
+**iPhone, in the Jellyfin iOS app** (eight files, 24 playbacks, 58 seeks):
 
 | | Lumen | Regular player | |
 |---|---|---|---|
@@ -43,18 +45,31 @@ played with Lumen and with the regular player, 24 playbacks and 58 seeks in all.
 | Audio track change | 0.7 s | 6.1 s | about 8 times faster |
 | ffmpeg CPU on the server, per playback | 0.6 s | 7.5 s | |
 
-The audio track changes were timed apart, on three files: 13 changes with Lumen, 4 with the regular player,
-the slowest with Lumen (1.6 s) still well ahead of the fastest without (5.5 s).
+**Chrome on Windows** (eight files, 24 playbacks, 97 seeks):
+
+| | Lumen | Regular player | |
+|---|---|---|---|
+| First frame | 1.7 s | 3.6 s | about 2 times sooner |
+| Seek, on files whose audio the server transcodes | 0.5 s | 2.2 s | about 4 times faster |
+| Audio track change | 0.6 s | 5.0 s | about 8 times faster |
+| ffmpeg CPU on the server, per playback | none | 5.6 s | |
 
 What the server was doing for the regular player makes the difference:
 
-- **Files that only needed a new container** (five of them, HEVC with Dolby audio the iPhone plays natively,
-  some in Dolby Vision): the first frame came 4 times sooner and seeks were twice as fast. The server spent
-  little CPU either way, since it was copying streams.
-- **Files whose audio the server had to transcode** (DTS and TrueHD, one of them 4K): the first frame came 2.5
-  times sooner, seeks were 4.5 times faster, and ffmpeg went from 24 s of CPU per playback to none.
+- **Files that only needed a new container** (five on the iPhone, HEVC with Dolby audio it plays natively, some
+  in Dolby Vision): the first frame came 4 times sooner and seeks were twice as fast. The server spent little
+  CPU either way, since it was copying streams.
+- **Files whose audio the server had to transcode** (DTS and TrueHD on the iPhone; on Chrome, which plays no
+  Dolby or DTS audio, six files out of eight): the first frame came 2 to 2.5 times sooner, seeks were 4 to 4.5
+  times faster, and ffmpeg's CPU time went to none.
+- **Files the regular player already plays as they are** (two on Chrome, with no ffmpeg at all): there is
+  nothing to save, and the two players are close. The regular player started a little sooner there, 1.1 s
+  against 1.5 s.
 
-One device, one server, one or two playbacks per file and per player: enough to show the direction, not to
+Audio track changes were timed on fewer playbacks: 23 changes with Lumen and 10 with the regular player over
+the two devices. Nearly all of those with Lumen took under 1.5 s; none without took under 3.9 s.
+
+Two devices, one server, one or two playbacks per file and per player: enough to show the direction, not to
 promise a figure. The playback log gives you the same comparison on your own library and devices.
 
 ## A complete engine, light on the client
@@ -96,8 +111,8 @@ over there.
 - Lumen acts in the Jellyfin web client: Chrome, Edge, Firefox and Safari. In the Jellyfin mobile apps it
   should apply where the app plays through the web player, which on Android means only when the web player is
   selected in the app's settings. Apps that play with their own native player are not affected.
-- In the Jellyfin iOS app, Lumen has been used on an iPhone. In the Android app, select the web player in the
-  app's settings: Lumen then applies as in a browser.
+- Lumen has been used in Chrome on Windows and, in the Jellyfin iOS app, on an iPhone. In the Android app,
+  select the web player in the app's settings: Lumen then applies as in a browser.
 - On TVs and game consoles, playback stays with the regular player. Their Jellyfin apps show the same web
   client, but these devices already play most files as they are, on browsers Lumen has not been tried on.
 - Lumen plugs into the web client's own video player and checks that it has the methods it relies on. If a

@@ -5,9 +5,9 @@
     <RootNamespace>Lumen.Jellyfin</RootNamespace>
     <AssemblyName>Lumen</AssemblyName>
     <!-- Quatre nombres : Jellyfin compare les versions de plugin ainsi, et nomme le dossier d'après elles. -->
-    <Version>0.1.10.0</Version>
+    <Version>0.1.11.0</Version>
     <!-- Ce que cette version change, en une ligne : repris dans le manifeste du dépôt de plugins. -->
-    <PackageReleaseNotes>When its source is lost (a failure during playback, or the page coming back from the background), Lumen reopens the film at the same position before handing over to the regular player.</PackageReleaseNotes>
+    <PackageReleaseNotes>The playback log tells apart, in the opening of a playback, the time spent negotiating with the server and the time the web client takes to create its video element.</PackageReleaseNotes>
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
