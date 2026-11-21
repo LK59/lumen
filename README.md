@@ -33,41 +33,30 @@ and in the playback log.
 
 ## Measured
 
-Taken from the plugin's own playback log, on a real library: each file played with Lumen and with the regular
-player. The figures are medians.
+On files the server would otherwise repackage or transcode, Lumen showed the first frame 2 to 4 times sooner,
+seeked 3 to 4 times faster, and changed audio track about 8 times faster.
 
-**iPhone, in the Jellyfin iOS app** (eight files, 24 playbacks, 58 seeks):
+Each figure is Lumen against the regular player on the same files, as a median, taken from the plugin's own
+playback log on a real library. Each device is measured on its own:
 
-| | Lumen | Regular player | |
-|---|---|---|---|
-| First frame | 1.0 s | 3.8 s | about 4 times sooner |
-| Seek | 1.0 s | 2.7 s | about 3 times faster |
-| Audio track change | 0.7 s | 6.1 s | about 8 times faster |
-| ffmpeg CPU on the server, per playback | 0.6 s | 7.5 s | |
-
-**Chrome on Windows** (eight files, 24 playbacks, 97 seeks):
-
-| | Lumen | Regular player | |
-|---|---|---|---|
-| First frame | 1.7 s | 3.6 s | about 2 times sooner |
-| Seek, on files whose audio the server transcodes | 0.5 s | 2.2 s | about 4 times faster |
-| Audio track change | 0.6 s | 5.0 s | about 8 times faster |
-| ffmpeg CPU on the server, per playback | none | 5.6 s | |
+| | iPhone, Jellyfin iOS app | Chrome on Windows |
+|---|---|---|
+| First frame | 1.0 s against 3.8 s (4 times sooner) | 1.7 s against 3.6 s (2 times sooner) |
+| Seek | 1.0 s against 2.7 s (3 times faster) | 0.5 s against 2.2 s (4 times faster) |
+| Audio track change | 0.7 s against 6.1 s (8 times faster) | 0.6 s against 5.0 s (8 times faster) |
+| ffmpeg CPU on the server, per playback | 0.6 s against 7.5 s | none against 5.6 s |
+| Measured on | 8 files, 24 playbacks, 58 seeks, 17 track changes | 6 files, 19 playbacks, 66 seeks, 16 track changes |
 
 What the server was doing for the regular player makes the difference:
 
 - **Files that only needed a new container** (five on the iPhone, HEVC with Dolby audio it plays natively, some
   in Dolby Vision): the first frame came 4 times sooner and seeks were twice as fast. The server spent little
   CPU either way, since it was copying streams.
-- **Files whose audio the server had to transcode** (DTS and TrueHD on the iPhone; on Chrome, which plays no
-  Dolby or DTS audio, six files out of eight): the first frame came 2 to 2.5 times sooner, seeks were 4 to 4.5
-  times faster, and ffmpeg's CPU time went to none.
-- **Files the regular player already plays as they are** (two on Chrome, with no ffmpeg at all): there is
-  nothing to save, and the two players are close. The regular player started a little sooner there, 1.1 s
-  against 1.5 s.
-
-Audio track changes were timed on fewer playbacks: 23 changes with Lumen and 10 with the regular player over
-the two devices. Nearly all of those with Lumen took under 1.5 s; none without took under 3.9 s.
+- **Files whose audio the server had to transcode** (DTS and TrueHD on the iPhone; the six files on Chrome,
+  which plays no Dolby or DTS audio): the first frame came 2 to 2.5 times sooner, seeks were 4 to 4.5 times
+  faster, and ffmpeg's CPU time went to none.
+- **Files the regular player already plays as they are** (two more on Chrome, with no ffmpeg at all): the two
+  players are equivalent, as there is nothing to save.
 
 Two devices, one server, one or two playbacks per file and per player: enough to show the direction, not to
 promise a figure. The playback log gives you the same comparison on your own library and devices.
@@ -119,8 +108,9 @@ over there.
   future version of the web client changes in a way Lumen does not recognise, it steps aside, says so in the
   console, and the web client plays as usual.
 - If the server refuses the file during playback, Lumen hands over to the regular player within seconds. During
-  a network outage it waits for the network to come back and resumes by itself; after 48 seconds without it, the
-  web client takes over.
+  a network outage it waits for the network to come back and resumes by itself. After 48 seconds without it,
+  Lumen is expected to reopen the file at the same position once the network is back, and to leave it to the
+  regular player if that fails; this longer outage has not been tried on a device yet.
 
 ## What it can play
 

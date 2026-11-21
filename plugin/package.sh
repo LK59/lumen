@@ -17,6 +17,7 @@
 # pour l'assemblage. Rien ne s'installe sur l'hôte.
 set -eu
 cd "$(dirname "$0")/.."
+. plugin/description.sh
 ROOT=$PWD
 VERSION=$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' plugin/server/Lumen.csproj)
 # La version de Jellyfin contre laquelle l'assemblage est compilé — la plus ancienne qu'il accepte de
@@ -60,10 +61,10 @@ cat > "$OUT/meta.json" <<JSON
 {
   "category": "General",
   "changelog": "$CHANGELOG",
-  "description": "Plays files as they are: the browser remuxes them and decodes the audio, the server only sends bytes.",
+  "description": "$DESCRIPTION",
   "guid": "$GUID",
   "name": "Lumen",
-  "overview": "Playback without server-side transcoding for the web client.",
+  "overview": "$OVERVIEW",
   "owner": "lumen",
   "targetAbi": "$ABI",
   "timestamp": "$STAMP",
@@ -83,8 +84,8 @@ cat > plugin/dist/manifest.json <<JSON
   {
     "guid": "$GUID",
     "name": "Lumen",
-    "description": "Plays files as they are: the browser remuxes them and decodes the audio, the server only sends bytes.",
-    "overview": "Playback without server-side transcoding for the web client.",
+    "description": "$DESCRIPTION",
+    "overview": "$OVERVIEW",
     "owner": "lumen",
     "category": "General",
     "imageUrl": "$IMAGE_URL",
