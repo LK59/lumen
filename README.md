@@ -80,15 +80,18 @@ On the viewer's device it stays light:
    WebAssembly, in a worker, then re-encoded to AAC or Opus with the browser's own `AudioEncoder`.
 5. A seek reads the container index and fetches the bytes at the target.
 
-If Lumen cannot play the file, or fails while playing it, the web client negotiates with the server as usual and
-its regular player takes over, transcoding included, at the same position.
+If Lumen cannot play the file, the web client negotiates with the server as usual and its regular player takes
+over, transcoding included. If playback breaks midway, for instance when a phone closes the page's media source
+in the background, Lumen reopens the file at the same position; if that keeps failing, the regular player takes
+over there.
 
 ## Where it applies
 
 - Lumen acts in the Jellyfin web client: Chrome, Edge, Firefox and Safari. In the Jellyfin mobile apps it
   should apply where the app plays through the web player, which on Android means only when the web player is
   selected in the app's settings. Apps that play with their own native player are not affected.
-- In the Jellyfin iOS app, Lumen has been used on an iPhone. Reports from the Android app are welcome: it has not been tested yet.
+- In the Jellyfin iOS app, Lumen has been used on an iPhone. In the Android app, select the web player in the
+  app's settings: Lumen then applies as in a browser.
 - On TVs and game consoles, playback stays with the regular player. Their Jellyfin apps show the same web
   client, but these devices already play most files as they are, on browsers Lumen has not been tried on.
 - Lumen plugs into the web client's own video player and checks that it has the methods it relies on. If a

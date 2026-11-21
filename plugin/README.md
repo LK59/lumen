@@ -67,7 +67,9 @@ subtitles through its menus, stops, and records what the server saw: play method
 launches. `pont.sh main` runs it without the plugin, with the script injected by hand; `LUMEN_OFF=1` runs it
 with "Play with Lumen" unchecked. In the same folder: `reglages.mjs` (the settings page), `sous-titres.mjs`
 (when a subtitle cue appears on screen), `repli.mjs` (handover when the server refuses the file, or under a
-strict Content Security Policy), `panneau.mjs` (the Playback Info panel).
+strict Content Security Policy), `panneau.mjs` (the Playback Info panel), `saut-charge.mjs` (a seek inside what
+is already loaded), `cas-limites.mjs` (resume, seeks in a row, track change while paused, end of file, a source
+lost during playback or pause, a TV's user agent).
 
 `tools/test-jellyfin.sh` takes `JF_IMAGE` (the Jellyfin image) and `JF_DATA` (one data folder per version
 tried), and `setup` prepares a fresh server: this is how each Jellyfin version is checked before a release.
@@ -79,4 +81,6 @@ tried), and `setup` prepares a fresh server: this is how each Jellyfin version i
   says so in the console, and the web client plays alone.
 - Subtitles are the web client's own: for a track of the file, the server extracts it on demand. Text subtitles
   are aligned with the picture; ASS and PGS lead it by about 0.2 s.
-- Apps that display the web client in a web view receive the same script; they have not been tried.
+- Apps that display the web client in a web view receive the same script. The Jellyfin iOS app has been used on
+  an iPhone; in the Android app, Lumen applies when the web player is selected in the app's settings. On TVs and game consoles, recognised by their browser's user
+  agent, Lumen leaves playback to the regular player.
