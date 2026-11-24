@@ -168,6 +168,40 @@ describe("une ouverture interrompue par le réseau", () => {
     expect(isReadAbandoned(failure)).toBe(true);
   });
 
+  it("annonce que le chemin tient avant d'ouvrir le remultiplexeur — et l'ouverture peut encore refuser (24/11/2026)", async () => {
+    // `onViable` : l'hôte pressé répond à ce moment-là. Ce n'est pas une promesse, et la sonde rejette
+    // toujours avec le motif quand l'ouverture échoue ensuite.
+    const mime = mimeFor(VIDEO, AAC);
+    supported = new Set([mime.video, mime.audio!]);
+    const order: string[] = [];
+    vi.spyOn(Remuxer, "open").mockImplementationOnce(async () => {
+      order.push("ouverture");
+      throw new Error("première trame illisible");
+    });
+    const failure = await choosePlaybackPath({ ...input(), onViable: () => order.push("viable") }).then(
+      () => null,
+      (error: unknown) => error
+    );
+    expect(order).toEqual(["viable", "ouverture"]);
+    expect((failure as Error).message).toBe("Aucun chemin de lecture disponible pour ce fichier. remux : première trame illisible");
+  });
+
+  it("n'annonce rien pour un fichier refusé d'emblée, et un hôte qui lève ne fait pas refuser le fichier", async () => {
+    const viable = vi.fn();
+    supported = new Set();
+    await expect(choosePlaybackPath({ ...input(), onViable: viable })).rejects.toThrow(/non remultiplexable/);
+    expect(viable).not.toHaveBeenCalled();
+    const mime = mimeFor(VIDEO, AAC);
+    supported = new Set([mime.video, mime.audio!]);
+    const chosen = await choosePlaybackPath({
+      ...input(),
+      onViable: () => {
+        throw new Error("l'hôte");
+      },
+    });
+    expect(chosen.path).toBe("remux");
+  });
+
   it("une autre erreur reste un refus de ce chemin, qui nomme sa cause", async () => {
     const mime = mimeFor(VIDEO, AAC);
     supported = new Set([mime.video, mime.audio!]);

@@ -17,6 +17,7 @@ export interface JellyfinItem {
   VideoType?: string;
   IsPlaceHolder?: boolean;
   MediaSources?: JellyfinMediaSource[];
+  UserData?: { PlaybackPositionTicks?: number };
 }
 
 export interface JellyfinMediaStream {

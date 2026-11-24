@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Common.Plugins;
 using MediaBrowser.Model.Plugins;
@@ -35,6 +36,47 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
     /// Le dossier des fichiers du lecteur (le pont, le moteur, ses décodeurs), livrés à côté de l'assemblage.
     /// </summary>
     public string WebDirectory => Path.Combine(Path.GetDirectoryName(AssemblyFilePath) ?? string.Empty, "web");
+
+    private string? _webStamp;
+
+    /// <summary>
+    /// L'empreinte des fichiers du lecteur tels qu'ils sont livrés : la version, et un condensé de leurs
+    /// noms, tailles et dates. Elle entre dans leur adresse (<c>Lumen/web/@empreinte/…</c>), ce qui permet au
+    /// navigateur de les garder sans jamais redemander s'ils ont changé — une adresse, un contenu.
+    ///
+    /// Avant, chaque fichier était revalidé à chaque page : le moteur, ses morceaux, le worker et le décodeur
+    /// se chargent l'un après l'autre, soit cinq allers-retours à la suite avant le premier son d'un film
+    /// à ré-encoder (0,45 s à 40 ms de latence, banc du 24/11/2026).
+    ///
+    /// Calculée une fois : les fichiers ne changent pas sous un serveur qui tourne (une mise à jour du
+    /// plugin le redémarre). La version seule ne suffirait pas à une construction refaite sans la changer.
+    /// </summary>
+    public string WebStamp
+    {
+        get
+        {
+            if (_webStamp is not null)
+            {
+                return _webStamp;
+            }
+
+            var digest = new System.Text.StringBuilder();
+            try
+            {
+                foreach (var file in new DirectoryInfo(WebDirectory).GetFiles().OrderBy(f => f.Name, StringComparer.Ordinal))
+                {
+                    digest.Append(file.Name).Append('|').Append(file.Length).Append('|').Append(file.LastWriteTimeUtc.Ticks).Append('\n');
+                }
+            }
+            catch (IOException)
+            {
+                // Dossier illisible : l'empreinte ne dit que la version, et rien n'est servi de toute façon.
+            }
+
+            var hash = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(digest.ToString()));
+            return _webStamp = Version + "-" + Convert.ToHexString(hash, 0, 4).ToLowerInvariant();
+        }
+    }
 
     /// <summary>
     /// Le dossier du journal des lectures, dans les données du serveur.

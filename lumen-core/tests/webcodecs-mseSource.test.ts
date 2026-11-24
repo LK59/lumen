@@ -1313,6 +1313,22 @@ describe("MseSource", () => {
     mse.destroy();
   });
 
+  it("dit au remultiplexeur que l'ouverture a eu son premier envoi, une seule fois (24/11/2026)", async () => {
+    // Voir `HttpByteSource.focusOpening` : l'avance retenue par une reprise est rendue ici, et un saut
+    // qui suit a son propre signal (`seekSettled`).
+    const video = fakeVideo();
+    const remuxer = fakeRemuxer(500, 0.2);
+    const opened = vi.fn();
+    Object.assign(remuxer, { openingSettled: opened });
+    const mse = await MseSource.attach(video, remuxer, PLAN, { onError: vi.fn() });
+    await flush();
+    expect(opened).toHaveBeenCalledTimes(1);
+    await mse.seek(1200);
+    await flush();
+    expect(opened).toHaveBeenCalledTimes(1);
+    mse.destroy();
+  });
+
   describe("sauts qui partent ailleurs (banc iPhone du 22/09/2026)", () => {
     const CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
     const onBrowser = (ua: string) => vi.spyOn(navigator, "userAgent", "get").mockReturnValue(ua);

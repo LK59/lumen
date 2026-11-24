@@ -515,6 +515,55 @@ function leaveHandover(url: string, size: number, chunks: Map<number, Uint8Array
 export function forgetHandover(): void {
   if (handover) clearTimeout(handover.timer);
   handover = null;
+  for (const entry of prepared.values()) clearTimeout(entry.timer);
+  prepared.clear();
+}
+
+/**
+ * Les morceaux lus en préparant un fichier (`headerWarmup.ts`), gardés pour l'ouverture qui suivra
+ * peut-être : l'en-tête, l'index, et le début ou la zone de reprise.
+ *
+ * La préparation lisait l'en-tête et l'index puis jetait ses octets : seul l'en-tête analysé restait.
+ * Or le premier morceau du fichier porte aussi ses premières images (sur un fichier à 6 Mb/s, tout le
+ * premier segment), et l'ouverture le redemandait au réseau une seconde après l'avoir eu en main. Gardé,
+ * l'ouverture d'un titre préparé ne lit plus rien avant sa première image.
+ *
+ * Ce n'est pas le relais (`handover`) : celui-ci sert une réouverture dans la seconde et ne tient qu'un
+ * fichier, quelques secondes. Ici on attend un spectateur qui lit une fiche — des minutes. D'où un nom
+ * qui porte la **version** du fichier (`mediaHeaderKey`, jamais l'adresse seule) : un fichier remplacé
+ * entre-temps a une autre version et ne retrouve rien. Deux fichiers au plus, quelques mégaoctets chacun.
+ */
+const PREPARED_MS = 3 * 60_000;
+const MAX_PREPARED = 2;
+const prepared = new Map<string, { size: number; chunks: Map<number, Uint8Array>; timer: ReturnType<typeof setTimeout> }>();
+
+function takePrepared(key: string): Handover | null {
+  const entry = prepared.get(key);
+  if (!entry) return null;
+  clearTimeout(entry.timer);
+  prepared.delete(key);
+  return { size: entry.size, chunks: entry.chunks, kept: null, reserve: new Map() };
+}
+
+function leavePrepared(key: string, size: number, chunks: Map<number, Uint8Array>): void {
+  const before = prepared.get(key);
+  if (before) clearTimeout(before.timer);
+  prepared.delete(key);
+  if (chunks.size === 0) return;
+  const timer = setTimeout(() => {
+    if (prepared.get(key)?.chunks === chunks) prepared.delete(key);
+  }, PREPARED_MS);
+  prepared.set(key, { size, chunks, timer });
+  while (prepared.size > MAX_PREPARED) {
+    const oldest = prepared.keys().next().value!;
+    clearTimeout(prepared.get(oldest)!.timer);
+    prepared.delete(oldest);
+  }
+}
+
+/** Des morceaux préparés attendent-ils sous ce nom ? Regardé sans les prendre. */
+export function holdsPrepared(key: string): boolean {
+  return prepared.has(key);
 }
 
 /**
@@ -662,10 +711,11 @@ export class HttpByteSource implements ByteSource {
   // que les deux premières plages puissent même partir : relevé le 22/09/2026 depuis un serveur
   // lointain, ~60 ms d'aller-retour, soit autant de moins à chaque ouverture. Une taille fausse
   // n'est pas crue sur parole : la première réponse la corrige — voir `checkTotal`.
-  static async open(url: string, knownSize?: number | null, disk?: DiskChunks | null): Promise<HttpByteSource> {
+  static async open(url: string, knownSize?: number | null, disk?: DiskChunks | null, preparedKey?: string | null): Promise<HttpByteSource> {
     // Le même fichier que la source qu'on vient de fermer : sa taille et ses morceaux sont déjà
-    // là, sans aller-retour — voir `handover`.
-    const inherited = takeHandover(url);
+    // là, sans aller-retour — voir `handover`. À défaut, ce qu'une préparation a laissé sous le nom
+    // de cette version du fichier — voir `prepared`.
+    const inherited = takeHandover(url) ?? (preparedKey ? takePrepared(preparedKey) : null);
     if (inherited) {
       const source = new HttpByteSource(url, inherited.size);
       source.disk = disk ?? null;
@@ -1294,6 +1344,20 @@ export class HttpByteSource implements ByteSource {
     }
   }
 
+  /**
+   * Une ouverture en cours de film attend sa première image : l'avance réduite d'un saut, jusqu'à ce
+   * qu'elle soit là (`seekSettled`, appelé au premier envoi) ou que `SEEK_FOCUS_MS` passe.
+   *
+   * Une reprise est un saut fait à l'ouverture, et elle souffrait de ce que `SEEK_PREFETCH_CHUNKS` a
+   * corrigé pour les sauts : le morceau où elle tombe arrive seul, puis ceux qu'il faut encore pour la
+   * première image partagent le lien avec la lecture en avance entière. Banc du 24/11/2026, 50 Mb/s et
+   * 40 ms de latence, reprise à dix minutes : voir docs/rd-ouverture.md. Rien n'est coupé ici — il n'y a
+   * pas d'ancienne position à abandonner.
+   */
+  focusOpening(): void {
+    this.focusUntil = performance.now() + SEEK_FOCUS_MS;
+  }
+
   seekSettled(): void {
     if (this.focusUntil === 0) return;
     this.focusUntil = 0;
@@ -1349,6 +1413,18 @@ export class HttpByteSource implements ByteSource {
       if (victim === undefined) break;
       this.chunks.delete(victim);
     }
+  }
+
+  /**
+   * Ferme une source de préparation en laissant ses morceaux à l'ouverture qui suivra — voir `prepared`.
+   * Ses requêtes en cours meurent avec elle, et le relais d'une réouverture n'est pas touché.
+   */
+  closePrepared(key: string): void {
+    if (this.controller.signal.aborted) return;
+    const chunks = this.chunks;
+    const size = this.size;
+    this.close(false);
+    leavePrepared(key, size, chunks);
   }
 
   /**

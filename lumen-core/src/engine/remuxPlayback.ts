@@ -106,6 +106,29 @@ export interface RemuxPlaybackOptions {
    */
   audioTrackNumber?: number | null;
   /**
+   * La piste son sur laquelle ouvrir, choisie par l'hôte une fois les pistes du fichier connues — pour un
+   * hôte qui ne peut pas donner `audioTrackNumber` d'avance parce qu'il ne connaît la piste que par son
+   * rang (Jellyfin : le n-ième flux son). Appelée une fois, après la lecture de l'en-tête, avec les
+   * pistes son dans l'ordre du fichier ; `null` laisse le moteur choisir. `audioTrackNumber` l'emporte.
+   *
+   * Sans elle, une vérification ouvrait sur la piste que le moteur préfère, et l'ouverture qui suivait,
+   * sur celle du serveur : deux amorçages d'encodeur pour un seul film dès que les deux différaient
+   * (une VF par défaut du fichier, un compte réglé sur l'anglais).
+   */
+  pickAudioTrack?: (tracks: PlayerTrack[]) => number | null;
+  /**
+   * Ce chemin portera le fichier, pour autant qu'on puisse le dire sans rien ouvrir : le conteneur est
+   * lu, et le navigateur a accepté l'image et le son tels qu'ils lui seront livrés. Appelée une fois,
+   * avant l'ouverture du remultiplexeur — qui lit les premières trames et amorce un encodeur, soit la
+   * plus grande part du temps d'une sonde (300 ms sur 450 en local, 1,4 s sur 2,0 s à 40 ms de latence,
+   * banc du 24/11/2026). Un hôte qui doit répondre vite à « ce fichier est-il pour vous ? » répond ici
+   * et laisse la sonde finir pendant qu'il prépare la suite.
+   *
+   * Ce n'est pas une promesse : la sonde peut encore rejeter (un décodeur qui ne se charge pas, une
+   * première trame illisible). L'hôte qui a répondu d'avance doit savoir revenir en arrière.
+   */
+  onViable?: () => void;
+  /**
    * Ouvrir sans lancer la lecture : un pipeline reconstruit pour un changement de piste pendant
    * une pause. Sans cela, la garde de démarrage prenait l'élément resté à l'arrêt pour un
    * démarrage raté et le relançait d'elle-même — relevé sur iPhone le 21/09/2026.
@@ -256,7 +279,8 @@ export async function probePlaybackPath(options: RemuxPlaybackOptions): Promise<
   const disk = options.disk
     ? await Promise.race([options.disk.catch(() => null), new Promise<null>((resolve) => setTimeout(() => resolve(null), DISK_WAIT_MS))])
     : null;
-  const source = await HttpByteSource.open(options.streamUrl, options.knownSize, disk);
+  // Sous le nom de la version du fichier, ce qu'une préparation a pu laisser (`headerWarmup.ts`).
+  const source = await HttpByteSource.open(options.streamUrl, options.knownSize, disk, options.fileVersion ? mediaHeaderKey(options.streamUrl, options.fileVersion) : null);
   trace(`flux ouvert — ${source.size} octets`);
   try {
     return await probeOpened(source, options, lightCap);
@@ -295,6 +319,18 @@ async function probeOpened(source: ByteSource, options: RemuxPlaybackOptions, li
   } finally {
     if (resuming) source.holdReadahead?.(false);
   }
+  // En reprise, les octets de la position de départ sont demandés dès que l'index dit où ils sont. Ils
+  // ne l'étaient qu'à la première lecture du remultiplexeur, après le choix de la piste et le chargement
+  // du décodeur du son : à 40 ms de latence, 0,7 s séparaient l'en-tête lu de cette première requête, lien
+  // inoccupé (banc du 24/11/2026). Sans conséquence si la position est fausse : ce sont des morceaux gardés
+  // en mémoire, qu'une lecture aurait demandés.
+  if (resuming && source instanceof HttpByteSource) {
+    const from = keptRangeAt(file, options.startSeconds, file.tracks.find((t) => t.type === "video")?.number)?.from;
+    if (from !== undefined) {
+      source.focusOpening();
+      source.warm(from);
+    }
+  }
   const headerMs = Date.now() - headerAt;
   trace(
     `en-tête ${headerMs < 15 ? "déjà connu" : "lu"} en ${headerMs} ms — ` +
@@ -307,7 +343,9 @@ async function probeOpened(source: ByteSource, options: RemuxPlaybackOptions, li
   // Ce que le navigateur produira de chaque piste à ré-encoder, demandé avant le choix : le
   // classement compte les canaux livrés (audit P5), et l'écran relira les mêmes réponses.
   await primeAudioDelivery(file);
-  const audioTrack = openingAudio(file, options.audioPreferences, options.audioTrackNumber);
+  const picked =
+    options.audioTrackNumber ?? options.pickAudioTrack?.(file.tracks.filter((t) => t.type === "audio").map((t) => ({ ...fromMatroskaTrack(t), delivered: deliveredAudio(t) }))) ?? null;
+  const audioTrack = openingAudio(file, options.audioPreferences, picked);
   trace(`piste audio retenue : ${audioTrack ? `${audioTrack.codecId} ${audioTrack.audio?.channels ?? "?"}ch ${audioTrack.language ?? "?"}` : "aucune"}`);
   if (options.dialogue && options.dialogue !== "off") trace(`dialogues améliorés demandés (${options.dialogue === "strong" ? "encore plus fort" : "normal"})`);
 
@@ -323,6 +361,7 @@ async function probeOpened(source: ByteSource, options: RemuxPlaybackOptions, li
     dimensions: { width: videoTrack.video?.width ?? 1920, height: videoTrack.video?.height ?? 1080 },
     videoRangeType: options.videoRangeType,
     startSeconds: options.startSeconds,
+    onViable: options.onViable,
     remux: {
       lightCapNits: lightCap,
       ...(options.dialogue && options.dialogue !== "off" ? { dialogue: options.dialogue } : {}),

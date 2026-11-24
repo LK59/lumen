@@ -29,3 +29,5 @@ export { subscribeNetworkTrouble, networkUnstable } from "./support/networkTroub
 // --- facultatif ----------------------------------------------------------------------------------
 // Télécharger d'avance, hors de tout film, les décodeurs WebAssembly qu'un premier film attendrait.
 export { warmPlayerDecoders } from "./engine/decoderWarmup";
+// Lire d'avance l'en-tête et l'index d'un fichier que le spectateur regarde sans l'avoir encore lancé.
+export { scheduleHeaderWarmup, type HeaderWarmupFile } from "./support/headerWarmup";

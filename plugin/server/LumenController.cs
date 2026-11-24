@@ -41,6 +41,21 @@ public class LumenController : ControllerBase
             return NotFound();
         }
 
+        // « @empreinte/fichier » : l'adresse que la page reçoit. L'empreinte ne désigne pas un dossier, elle
+        // nomme le contenu ; quand c'est celle des fichiers livrés, le navigateur peut les garder pour de bon.
+        var stamped = false;
+        if (file[0] == '@')
+        {
+            var slash = file.IndexOf('/', StringComparison.Ordinal);
+            if (slash < 0)
+            {
+                return NotFound();
+            }
+
+            stamped = string.Equals(file[1..slash], Plugin.Instance?.WebStamp, StringComparison.Ordinal);
+            file = file[(slash + 1)..];
+        }
+
         // Le chemin résolu doit rester sous le dossier du lecteur : « .. » ne mène nulle part.
         var rootFull = Path.GetFullPath(root) + Path.DirectorySeparatorChar;
         var full = Path.GetFullPath(Path.Combine(rootFull, file));
@@ -57,9 +72,11 @@ public class LumenController : ControllerBase
             _ => MediaTypeNames.Application.Octet
         };
 
-        // Le script d'entrée porte la version dans son adresse, les morceaux une empreinte dans leur nom ;
-        // le worker et les décodeurs gardent leur nom d'une version à l'autre, d'où la revalidation.
-        Response.Headers.CacheControl = "no-cache";
+        // Sous l'empreinte des fichiers livrés, une adresse ne changera jamais de contenu : gardée un an,
+        // sans revalidation. Sous une autre (une page restée ouverte pendant une mise à jour) ou sans
+        // empreinte (un script injecté à la main), le worker et les décodeurs gardent leur nom d'une
+        // version à l'autre : revalidés à chaque fois, comme avant.
+        Response.Headers.CacheControl = stamped ? "public, max-age=31536000, immutable" : "no-cache";
         return PhysicalFile(full, contentType, enableRangeProcessing: false);
     }
 

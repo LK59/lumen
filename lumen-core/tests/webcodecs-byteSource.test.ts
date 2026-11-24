@@ -539,6 +539,51 @@ describe("HttpByteSource — le protocole de chaque requête", () => {
     }
   });
 
+  it("une ouverture en reprise ne lit que deux morceaux en avance jusqu'à son premier envoi, puis l'avance entière (24/11/2026)", async () => {
+    stubFetch();
+    const source = await HttpByteSource.open("/film.mkv", SIZE);
+    // Voir `focusOpening` : le morceau où la reprise tombe, et deux derrière — pas six.
+    source.focusOpening();
+    source.warm(4 * CHUNK);
+    await settle();
+    // (L'ouverture de la source a lu les deux bouts du fichier : on ne regarde que la zone de reprise.)
+    const around = () => chunksAsked().filter((chunk) => chunk >= 4 && chunk <= 8);
+    expect(around()).toEqual([4, 5, 6]);
+    // Le premier envoi a eu lieu (`Remuxer.openingSettled`) : l'avance entière reprend d'où on lisait.
+    await source.read(4 * CHUNK, CHUNK);
+    source.seekSettled();
+    await settle();
+    expect(around()).toEqual([4, 5, 6, 7, 8]);
+    source.close();
+  });
+
+  it("les morceaux d'une préparation attendent l'ouverture sous la version du fichier, et elle seule (24/11/2026)", async () => {
+    stubFetch();
+    const { holdsPrepared } = await import("@lumen/engine/byteSource");
+    const warm = (await HttpByteSource.open("/film.mkv", SIZE)).withoutReadahead();
+    await warm.read(0, 16);
+    await warm.read(4 * CHUNK, 16);
+    await settle();
+    warm.closePrepared("/film.mkv#v1");
+    expect(holdsPrepared("/film.mkv#v1")).toBe(true);
+    // Une autre version du même fichier ne retrouve rien : elle relit le réseau.
+    asked = [];
+    const other = await HttpByteSource.open("/film.mkv", SIZE, null, "/film.mkv#v2");
+    await other.read(4 * CHUNK, 16);
+    expect(chunksAsked()).toContain(4);
+    other.close(false);
+    // La bonne version hérite des morceaux : le début et la zone de reprise sans une requête.
+    asked = [];
+    const opened = (await HttpByteSource.open("/film.mkv", SIZE, null, "/film.mkv#v1")).withoutReadahead();
+    await opened.read(0, 16);
+    await opened.read(4 * CHUNK, 16);
+    await settle();
+    expect(chunksAsked()).toEqual([]);
+    // Pris une fois : ils appartiennent désormais à cette source.
+    expect(holdsPrepared("/film.mkv#v1")).toBe(false);
+    opened.close(false);
+  });
+
   it("dit qui a demandé quoi depuis le saut : le lecteur et le décodeur du son, lu sous son nom (18/11/2026)", async () => {
     stubFetch();
     const { describeNetwork, readingAs } = await import("@lumen/engine/byteSource");

@@ -57,6 +57,8 @@ export interface PathInput {
    * ré-encodage ou non) et le remultiplexeur ouvert lisent les mêmes.
    */
   remux?: RemuxOptions;
+  /** Le chemin a passé toutes les questions posées au navigateur — voir `RemuxPlaybackOptions.onViable`. */
+  onViable?: () => void;
 }
 
 /**
@@ -209,6 +211,14 @@ async function tryRemux(input: PathInput): Promise<{ remuxer: Remuxer; plan: Rem
     trace(`dolby vision : ${videoTrack.dolbyVision.type} présent — ${detail}`);
   }
   if (dv.kind === "server") return dv.reason;
+
+  // Tout ce qui se demande sans rien ouvrir a été demandé. Ce qui suit lit le fichier et peut encore
+  // refuser ; l'hôte pressé a sa réponse ici. Un hôte qui lève ne doit pas faire refuser le fichier.
+  try {
+    input.onViable?.();
+  } catch {
+    /* l'affaire de l'hôte */
+  }
 
   try {
     const remuxer = await Remuxer.open(

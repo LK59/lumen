@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/LK59/lumen/main/plugin/logo.png",
     "versions": [
       {
+        "version": "0.1.14.0",
+        "changelog": "Faster start and resume: the file is checked while the web client negotiates and prepared from its detail page. Audio track changes no longer go back to the server. Fixes the position lost after a network drop when the journal is off.",
+        "targetAbi": "10.10.0.0",
+        "sourceUrl": "https://raw.githubusercontent.com/LK59/lumen/main/releases/lumen_0.1.14.0.zip",
+        "checksum": "b97c5cc8a195a567d04647eff60e9785",
+        "timestamp": "2026-11-24T06:40:47Z"
+      },
+      {
         "version": "0.1.13.0",
         "changelog": "The plugin page shows the measured gains: start, seeks and audio track changes.",
         "targetAbi": "10.10.0.0",

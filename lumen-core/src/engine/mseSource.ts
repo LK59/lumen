@@ -350,6 +350,8 @@ export class MseSource {
   private appendsSinceSeek = 0;
   /** Le premier envoi après un saut écrit ce que le réseau a coûté — voir `NetworkWindow`. */
   private seekNetworkPending = false;
+  /** Le premier envoi de cette source a-t-il eu lieu ? Voir la boucle de remplissage. */
+  private openingSettled = false;
 
   /**
    * Le relevé d'une perte — voir `LossRecord`. Les fragments envoyés restent lisibles ici sous leur
@@ -946,6 +948,12 @@ export class MseSource {
         this.startHold?.check();
         this.lastAppendAt = Date.now();
 
+        // Le premier envoi d'une ouverture en reprise : la source rend son avance entière, comme après
+        // un saut (`HttpByteSource.focusOpening`). Sans effet si rien n'était retenu.
+        if (!this.openingSettled) {
+          this.openingSettled = true;
+          this.remuxer.openingSettled?.();
+        }
         if (this.seekNetworkPending) {
           this.seekNetworkPending = false;
           // La première image du saut est là : la lecture en avance reprend en entier.

@@ -22,7 +22,8 @@ import { PlaybackRecorder, transcodeReasonsOf } from "./journal";
 import { PLUGIN_NAME, audioTrackFor, eligible, lumenProfile, streamAddress, televisionClient, type JellyfinItem, type JellyfinMediaSource } from "./rules";
 
 type Core = typeof LumenCore;
-type Playback = Awaited<ReturnType<Awaited<ReturnType<Core["probePlaybackPath"]>>["start"]>>;
+type Probe = Awaited<ReturnType<Core["probePlaybackPath"]>>;
+type Playback = Awaited<ReturnType<Probe["start"]>>;
 
 interface Config {
   /** Faux : le pont s'inscrit mais ne lit rien — jellyfin-web lit seul. */
@@ -36,8 +37,16 @@ interface Config {
 /** Ce que jellyfin-web donne à un plugin chargé par `window`. Seul ce qui sert ici est décrit. */
 interface Deps {
   events: { trigger(target: object, name: string, args?: unknown[]): void };
-  playbackManager: { getPlayers(): Array<{ id?: string; constructor: Function }> };
-  ServerConnections: { getApiClient(serverId?: string): { accessToken(): string; serverAddress(): string; getCurrentUserId(): string } };
+  playbackManager: {
+    getPlayers(): Array<{ id?: string; constructor: Function }>;
+    play?: (options: { startPositionTicks?: number }) => unknown;
+    getPlaylist?: () => Promise<JellyfinItem[]>;
+    getCurrentPlaylistIndex?: () => number;
+  };
+  ServerConnections: {
+    getApiClient(serverId?: string): { accessToken(): string; serverAddress(): string; getCurrentUserId(): string; getItem?(userId: string, itemId: string): Promise<JellyfinItem> };
+    currentApiClient?(): { accessToken(): string; serverAddress(): string; getCurrentUserId(): string } | null | undefined;
+  };
 }
 
 /** Les options que jellyfin-web passe à `play` puis `setCurrentSrc` (son « streamInfo »). */
@@ -56,11 +65,39 @@ interface Verdict {
   ok: boolean;
   reason?: string;
   mediaSourceId: string;
-  audioTracks: number[];
+}
+
+/**
+ * Une vérification gardée ouverte : la sonde du moteur, lancée quand jellyfin-web demande le profil, et
+ * qui devient l'ouverture si la lecture qui suit est bien celle qu'elle a préparée.
+ *
+ * Le verdict (« Lumen porte ce fichier ») tombe dès l'en-tête lu ; la sonde, elle, continue — premières
+ * trames, amorçage de l'encodeur du son — pendant que jellyfin-web négocie avec le serveur et crée son
+ * élément vidéo. Avant, ces deux attentes se suivaient : la sonde entière, refermée, puis la négociation,
+ * puis une seconde sonde (banc du 24/11/2026 : 340 ms de vérification avant même que la négociation parte,
+ * 1,4 à 2,0 s à 40 ms de latence).
+ */
+interface Standby {
+  itemId: string;
+  mediaSourceId: string;
+  startSeconds: number;
+  probe: Promise<Probe>;
+  /** Le moteur a dit que le chemin tient (`onViable`) : c'est ce qu'attend le verdict, pas la sonde entière. */
+  viable: Promise<void>;
+  /** Ce que la sonde dira en cours de lecture : branché par l'ouverture qui la reprend. */
+  hooks: ProbeHooks;
+  /** La piste son que le serveur désignait à la vérification, traduite pour le moteur ; `undefined` tant que l'en-tête n'est pas lu. */
+  picked: () => number | null | undefined;
+  /** La sonde a-t-elle déjà été rendue ou reprise ? Elle ne se referme qu'une fois. */
+  spent: boolean;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 interface State {
   deps: Deps;
+  standby: Standby | null;
+  /** Le dernier ordre de lecture vu passer : son instant et la position demandée — voir `watchPlayOrders`. */
+  order: { at: number; seconds: number } | null;
   /** Le lecteur de jellyfin-web est-il adopté ? `null` : pas encore essayé ; faux : impossible, dit une fois. */
   adopted: boolean | null;
   playback: Playback | null;
@@ -99,7 +136,7 @@ interface State {
    */
   offered: string | null;
   /** Ce que Lumen lit en ce moment, gardé pour pouvoir le rouvrir — voir `rebuild`. */
-  current: { element: HTMLVideoElement; options: StreamInfo; verdict: Verdict } | null;
+  current: { element: HTMLVideoElement; options: StreamInfo } | null;
   /** Les reconstructions récentes : leur instant et leur position, pour en borner le nombre. */
   rebuilds: { at: number; seconds: number }[];
   /** Une reconstruction est en cours : la position où elle rouvre, que le lecteur rend en attendant. */
@@ -142,6 +179,10 @@ const REFUSALS_BEFORE_HANDOVER = 4;
 const REFUSAL_WINDOW_MS = 10_000;
 /** Le temps pendant lequel une réponse des réglages vaut pour les questions qui suivent : une préparation de flux. */
 const SETTINGS_MS = 5_000;
+/** Une vérification que personne n'a reprise au bout de ce délai est refermée : elle tient un décodeur, un encodeur et une connexion. */
+const STANDBY_MS = 20_000;
+/** Un ordre de lecture plus vieux que cela ne dit plus rien de la préparation de flux en cours. */
+const ORDER_MS = 15_000;
 /** Au-delà, la vérification n'a pas répondu à temps : on lit comme jellyfin-web plutôt que de faire attendre. */
 const CHECK_TIMEOUT_MS = 8_000;
 
@@ -157,6 +198,123 @@ function loadCore(): Promise<Core> {
     throw error;
   });
   return core;
+}
+
+/**
+ * Charge le moteur et ses décodeurs d'avance, quand le navigateur n'a rien d'autre à faire.
+ *
+ * Sans cela la première lecture d'une page les attendait : le moteur (300 Ko), puis, pour un son à
+ * ré-encoder, le worker et le décodeur (1 Mo), chargés l'un après l'autre au moment où le spectateur
+ * attend son film — 100 ms en local, 450 ms à 40 ms de latence. Le moteur ne télécharge pas les décodeurs
+ * en mode économie de données (`warmPlayerDecoders`). Un échec ne coûte rien : la lecture les chargera.
+ */
+let warmed = false;
+
+function warmEngine(): void {
+  if (warmed || !config.enabled) return;
+  warmed = true;
+  const warm = () => void loadCore().then((engine) => engine.warmPlayerDecoders()).catch(() => {});
+  const idle = (window as unknown as { requestIdleCallback?: (run: () => void, options?: { timeout: number }) => void }).requestIdleCallback;
+  // Après les premières requêtes de l'interface, jamais en concurrence avec elles.
+  setTimeout(() => (idle ? idle(warm, { timeout: 5000 }) : warm()), 1500);
+}
+
+/**
+ * La fiche d'un film ou d'un épisode est à l'écran : son en-tête et son index sont lus d'avance, pour
+ * que « Lire » n'ait plus à les attendre (`scheduleHeaderWarmup`, repris de Laterna — une seconde de
+ * fiche d'abord, un fichier à la fois, rien en économie de données).
+ *
+ * jellyfin-web annonce chaque écran par un événement `viewshow` qui remonte jusqu'au document, avec
+ * l'identifiant de l'élément pour une fiche. Sans cet événement (un autre client web), rien n'est préparé
+ * et l'ouverture lit l'en-tête elle-même, comme avant.
+ */
+let stopSheetWarmup: () => void = () => {};
+
+function watchSheets(state: State): void {
+  document.addEventListener("viewshow", (event) => {
+    stopSheetWarmup();
+    stopSheetWarmup = () => {};
+    try {
+      const page = event.target as HTMLElement | null;
+      const params = (event as CustomEvent<{ params?: { id?: string; serverId?: string } }>).detail?.params;
+      if (!config.enabled || !page?.classList?.contains("itemDetailPage") || !params?.id) return;
+      // Pendant un film (la fiche peut s'afficher derrière un lecteur réduit), le lien est à la lecture.
+      if (state.playback || state.rebuilding !== null) return;
+      let stopped = false;
+      stopSheetWarmup = () => (stopped = true);
+      const api = state.deps.ServerConnections.getApiClient(params.serverId);
+      if (typeof api.getItem !== "function") return;
+      const id = params.id;
+      // Les réglages d'abord : rien n'est lu pour un compte que Lumen ne sert pas.
+      void settingsOf(state, api)
+        .then((answer) => {
+          if (stopped || !answer.enabled) return;
+          warmEngine();
+          return api.getItem!(api.getCurrentUserId(), id);
+        })
+        .then(async (item) => {
+          if (!item) return;
+          const source = item.MediaSources?.find((s) => s.Id === item.Id) ?? item.MediaSources?.[0];
+          if (stopped || !eligible(item) || !source?.Id) return;
+          // Un fichier déjà refusé ne sera pas lu par Lumen : rien à préparer.
+          const verdict = state.verdicts.get(item.Id!);
+          if (verdict && !verdict.ok && Date.now() - verdict.at < VERDICT_MS) return;
+          const engine = await loadCore();
+          if (stopped) return;
+          hostFor(state, engine, item);
+          const cancel = engine.scheduleHeaderWarmup({
+            streamUrl: streamAddress(api.serverAddress(), item.Id!, source.Id),
+            knownSize: source.Size ?? null,
+            fileVersion: source.ETag ?? null,
+            // Là où ce compte s'était arrêté : « Reprendre » y trouvera ses premiers octets.
+            resumeSeconds: (item.UserData?.PlaybackPositionTicks ?? 0) / 1e7,
+          });
+          stopSheetWarmup = () => {
+            stopped = true;
+            cancel();
+          };
+        })
+        .catch(() => {});
+    } catch {
+      /* préparer n'est pas lire */
+    }
+  });
+}
+
+/** À moins de tant de secondes de la fin, l'élément suivant de la file est préparé. La minute de Laterna. */
+const NEXT_WARMUP_S = 60;
+/** Les éléments déjà préparés dans cette page : un seul essai chacun. */
+const preparedNext = new Set<string>();
+
+/**
+ * L'épisode suivant, préparé pendant le générique : son en-tête et son index sont lus à une minute de
+ * la fin, pour que l'enchaînement n'ait plus à les attendre (repris de Laterna, `nextEpisodeWarmup.ts`).
+ *
+ * La file de lecture est celle de jellyfin-web. Sans elle, ou sans élément suivant, rien ne se passe.
+ */
+function watchForNext(state: State, element: HTMLVideoElement, current: JellyfinItem): void {
+  let asked = false;
+  const look = () => {
+    if (asked || !state.playback || !(element.duration - element.currentTime < NEXT_WARMUP_S)) return;
+    asked = true;
+    element.removeEventListener("timeupdate", look);
+    void (async () => {
+      const manager = state.deps.playbackManager;
+      if (typeof manager.getPlaylist !== "function" || typeof manager.getCurrentPlaylistIndex !== "function") return;
+      const next = (await manager.getPlaylist())[manager.getCurrentPlaylistIndex() + 1];
+      if (!next?.Id || next.Id === current.Id || preparedNext.has(next.Id)) return;
+      preparedNext.add(next.Id);
+      const api = state.deps.ServerConnections.getApiClient(next.ServerId ?? current.ServerId);
+      if (typeof api.getItem !== "function") return;
+      const item = await api.getItem(api.getCurrentUserId(), next.Id);
+      const source = item.MediaSources?.find((s) => s.Id === item.Id) ?? item.MediaSources?.[0];
+      if (!eligible(item) || !source?.Id || !state.playback) return;
+      const engine = await loadCore();
+      stopSheetWarmup();
+      stopSheetWarmup = engine.scheduleHeaderWarmup({ streamUrl: streamAddress(api.serverAddress(), item.Id!, source.Id), knownSize: source.Size ?? null, fileVersion: source.ETag ?? null }, 0);
+    })().catch(() => {});
+  };
+  element.addEventListener("timeupdate", look);
 }
 
 // --- 2. le lecteur ------------------------------------------------------------------------------
@@ -179,8 +337,12 @@ class LumenPlayer {
   isLocalPlayer = true;
 
   constructor(deps: Deps) {
-    states.set(this, { deps, adopted: null, playback: null, opening: 0, verdicts: new Map(), settings: new Map(), recorder: null, recorderServerId: undefined, askedAt: null, element: null, busy: 0, seekTarget: null, steps: {}, stepsFrom: 0, offered: null, current: null, rebuilds: [], rebuilding: null, seekAfterRebuild: null, lastPosition: 0, wasPaused: false, handedOver: false, onRangeRefused: null });
+    const state: State = { deps, standby: null, order: null, adopted: null, playback: null, opening: 0, verdicts: new Map(), settings: new Map(), recorder: null, recorderServerId: undefined, askedAt: null, element: null, busy: 0, seekTarget: null, steps: {}, stepsFrom: 0, offered: null, current: null, rebuilds: [], rebuilding: null, seekAfterRebuild: null, lastPosition: 0, wasPaused: false, handedOver: false, onRangeRefused: null };
+    states.set(this, state);
     instance = this;
+    // Dès la construction, et non à l'adoption du lecteur de jellyfin-web : celle-ci n'arrive qu'à la
+    // première question posée à ce lecteur, qui peut être la première lecture elle-même.
+    if (!televisionClient(navigator.userAgent)) watchSheets(state);
   }
 
   canPlayMediaType(mediaType: string): boolean {
@@ -248,6 +410,14 @@ function adopt(self: LumenPlayer): boolean {
     // jellyfin-web : sous un nom fixe, le panneau annonçait « Lumen » pendant un transcodage.
     Object.defineProperty(self, "name", { configurable: true, enumerable: true, get: () => (state.playback ? "Lumen" : htmlName) });
     state.adopted = true;
+    watchPlayOrders(state);
+    // Les réglages du compte, demandés d'avance : la première lecture saura déjà si Lumen le sert.
+    try {
+      const api = state.deps.ServerConnections.currentApiClient?.();
+      if (api?.accessToken()) void settingsOf(state, api).then((answer) => answer.enabled && warmEngine());
+    } catch {
+      /* pas encore de session : ils seront demandés à la première lecture */
+    }
     log("ready, plugged into the web client's video player");
   } catch (error) {
     Object.setPrototypeOf(self, before);
@@ -255,6 +425,34 @@ function adopt(self: LumenPlayer): boolean {
     console.warn("[Lumen] inactive: the video player of this web client version cannot be extended:", error);
   }
   return state.adopted;
+}
+
+/**
+ * Regarde passer les ordres de lecture de jellyfin-web, pour savoir où la lecture va commencer.
+ *
+ * Quand il demande le profil, jellyfin-web ne dit pas à son lecteur la position de départ : elle n'arrive
+ * qu'avec la source, après la négociation. La vérification gardée ouverte préparait donc toujours le
+ * début du film, et une reprise en cours de film la refermait pour tout refaire à la bonne position. L'ordre
+ * de lecture, lui, la porte (`startPositionTicks`) : on la note au passage, sans rien changer à l'appel.
+ *
+ * Sans cette méthode (un autre client web), la position attendue reste zéro, comme avant.
+ */
+function watchPlayOrders(state: State): void {
+  try {
+    const manager = state.deps.playbackManager;
+    const play = manager.play;
+    if (typeof play !== "function") return;
+    manager.play = function (this: unknown, options: { startPositionTicks?: number }, ...rest: unknown[]) {
+      try {
+        state.order = { at: performance.now(), seconds: (Number(options?.startPositionTicks) || 0) / 1e7 };
+      } catch {
+        /* un ordre illisible : la position attendue reste celle d'avant */
+      }
+      return (play as Function).call(this, options, ...rest);
+    };
+  } catch {
+    /* rien n'est regardé, rien n'est changé */
+  }
 }
 
 function lumenPrototype(base: Adopted): object {
@@ -288,14 +486,32 @@ function lumenPrototype(base: Adopted): object {
       state.stepsFrom = state.askedAt;
       state.steps = {};
       state.offered = null;
+      // Un film s'ouvre : la préparation de la fiche s'arrête, l'ouverture lit ce qu'il lui faut elle-même.
+      stopSheetWarmup();
       if (options?.isRetry) state.recorder?.error();
-      const profile = await base.getDeviceProfile.call(this, item, options);
+      const asked = base.getDeviceProfile.call(this, item, options);
+      if (!config.enabled || options?.isRetry || !eligible(item)) {
+        dropStandby(state);
+        return asked;
+      }
+      // Les trois questions partent ensemble : le profil de jellyfin-web (80 ms à froid), les réglages du
+      // compte (un aller-retour) et le fichier. Elles se suivaient, et chacune attendait la précédente
+      // pour rien. Seule exception : un compte que le plugin a dit ne pas servir, ou dont on ne sait
+      // encore rien — on ne lit pas un fichier pour un compte que Lumen ne servira peut-être pas.
+      const allowing = settings(state, item);
+      // En cours de lecture (changement de piste, de qualité), seulement le verdict : voir `check`.
+      const speculate = state.playback === null && state.rebuilding === null;
+      const checking = settingsHint(state, item) === true ? check(this, item, speculate) : null;
+      checking?.catch(() => {});
+      const profile = await asked;
       step(state, "profile");
-      if (!config.enabled || options?.isRetry || !eligible(item)) return profile;
-      const allowed = (await settings(state, item)).enabled;
+      const allowed = (await allowing).enabled;
       step(state, "settings");
-      if (!allowed) return profile;
-      const verdict = await check(this, item);
+      if (!allowed) {
+        dropStandby(state);
+        return profile;
+      }
+      const verdict = await (checking ?? check(this, item, speculate));
       step(state, "check");
       if (!verdict?.ok) return profile;
       state.offered = item.Id ?? null;
@@ -335,6 +551,7 @@ function lumenPrototype(base: Adopted): object {
       } else {
         state.recorder = null;
       }
+      if (item?.Id && state.offered === item.Id) skipOpeningAnimation();
       return base.play.call(this, options);
     },
 
@@ -346,7 +563,10 @@ function lumenPrototype(base: Adopted): object {
       observe(state, element, options);
       alignSubtitles(state, element);
       const verdict = options.item?.Id ? state.verdicts.get(options.item.Id) : undefined;
-      if (!config.enabled || options.playMethod !== "DirectPlay" || !verdict?.ok || !options.mediaSource?.Id || !options.item?.Id || state.offered !== options.item.Id) {
+      // `verdict` et non `verdict.ok` : un fichier accepté d'avance puis refusé pendant la négociation
+      // (voir `check`) passe aussi par ici, pour que son ouverture échoue — plus bas — au lieu d'être
+      // confiée telle quelle au lecteur de jellyfin-web.
+      if (!config.enabled || options.playMethod !== "DirectPlay" || !verdict || !options.mediaSource?.Id || !options.item?.Id || state.offered !== options.item.Id) {
         return base.setCurrentSrc.call(this, element, options);
       }
       const self = this;
@@ -359,10 +579,16 @@ function lumenPrototype(base: Adopted): object {
         get(target, property) {
           if (property === "play") {
             return () => {
-              state.current = { element: target, options, verdict };
+              // Le serveur a répondu « lecture directe » au profil de Lumen, et Lumen ne lira pas : ce
+              // fichier brut n'est pas pour autant lisible par le lecteur de jellyfin-web (sous une
+              // politique de sécurité stricte, il jouait un film en AC-3 sans le son, banc du 24/11/2026).
+              // L'ouverture échoue donc, et jellyfin-web renégocie avec son propre profil.
+              if (!verdict.ok) return Promise.reject(new Error(verdict.reason ?? "Lumen declined this file"));
+              watchForNext(state, target, options.item!);
+              state.current = { element: target, options };
               state.rebuilds = [];
               state.wasPaused = false;
-              return open(self, target, options, verdict);
+              return open(self, target, options);
             };
           }
           // L'erreur de l'élément est l'affaire du moteur, qui a ses reprises ; il dit lui-même quand il
@@ -413,13 +639,25 @@ function lumenPrototype(base: Adopted): object {
     },
 
     /**
-     * Changer de piste son dans le tampon vivant : jamais. jellyfin-web renégocie alors le flux, et
-     * rappelle `setCurrentSrc` avec la nouvelle piste et la position — la reconstruction que le moteur
-     * demande de toute façon.
+     * Changer de piste son : Lumen le fait lui-même, en rouvrant le fichier sur la nouvelle piste à la
+     * position courante (`switchAudio`) — le moteur ne change jamais de piste dans le tampon vivant.
+     *
+     * Répondre « non » ici faisait renégocier le flux par jellyfin-web : le profil redemandé, un
+     * aller-retour au serveur, puis `setCurrentSrc` — pour aboutir à la même réouverture. Seulement
+     * quand le moteur porte toutes les pistes du fichier : sinon la piste choisie pourrait être celle
+     * qu'il refuse, et c'est la renégociation qui sait alors passer la main au serveur.
      */
     canSetAudioStreamIndex(this: LumenPlayer): boolean {
-      if (states.get(this)!.playback) return false;
-      return (base as unknown as { canSetAudioStreamIndex(): boolean }).canSetAudioStreamIndex.call(this);
+      const state = states.get(this)!;
+      const playback = state.playback;
+      if (!playback) return (base as unknown as { canSetAudioStreamIndex(): boolean }).canSetAudioStreamIndex.call(this);
+      return state.current !== null && state.rebuilding === null && playback.audioTracks.every((track) => playback.canCarryAudio(track.number));
+    },
+
+    setAudioStreamIndex(this: LumenPlayer, index: number): void {
+      const state = states.get(this)!;
+      if (!state.playback || !state.current) return (base as unknown as { setAudioStreamIndex(index: number): void }).setAudioStreamIndex.call(this, index);
+      switchAudio(this, index);
     },
 
     /**
@@ -443,6 +681,7 @@ function lumenPrototype(base: Adopted): object {
       releasePlaybackAudio();
       flush(states.get(this)!);
       close(states.get(this)!);
+      dropStandby(states.get(this)!);
       return base.stop.call(this, destroyPlayer);
     },
 
@@ -450,6 +689,7 @@ function lumenPrototype(base: Adopted): object {
       releasePlaybackAudio();
       flush(states.get(this)!);
       close(states.get(this)!);
+      dropStandby(states.get(this)!);
       base.destroy.call(this);
     },
   });
@@ -526,7 +766,10 @@ function close(state: State, rebuilding = false): void {
  * d'authentification, lui, coupe les deux.
  */
 function settings(state: State, item: JellyfinItem): Promise<Settings> {
-  const api = state.deps.ServerConnections.getApiClient(item.ServerId);
+  return settingsOf(state, state.deps.ServerConnections.getApiClient(item.ServerId));
+}
+
+function settingsOf(state: State, api: ReturnType<Deps["ServerConnections"]["getApiClient"]>): Promise<Settings> {
   const key = `${api.serverAddress()}|${api.getCurrentUserId()}`;
   // Redemandés à chaque lecture (une préparation de flux pose plusieurs fois la question en quelques
   // millisecondes : celles-là partagent une réponse). Gardés pour la durée de la page, un interrupteur
@@ -540,6 +783,7 @@ function settings(state: State, item: JellyfinItem): Promise<Settings> {
         if (response.status === 401 || response.status === 403) return { enabled: false, journal: false };
         if (!response.ok) return { enabled: true, journal: false };
         const answered = (await response.json()) as { Enabled?: boolean; Journal?: boolean };
+        settingsSeen.set(key, answered.Enabled !== false);
         if (answered.Enabled === false) log("regular player: Lumen does not play for this user (plugin settings)");
         return { enabled: answered.Enabled !== false, journal: answered.Journal === true };
       })
@@ -547,6 +791,82 @@ function settings(state: State, item: JellyfinItem): Promise<Settings> {
     state.settings.set(key, { at: Date.now(), answer });
   }
   return answer;
+}
+
+/** La dernière réponse connue des réglages pour ce compte, quel que soit son âge ; `null` : jamais reçue. */
+const settingsSeen = new Map<string, boolean>();
+
+function settingsHint(state: State, item: JellyfinItem): boolean | null {
+  try {
+    const api = state.deps.ServerConnections.getApiClient(item.ServerId);
+    return settingsSeen.get(`${api.serverAddress()}|${api.getCurrentUserId()}`) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Ne pas attendre la fin de l'animation d'ouverture de jellyfin-web pour commencer à lire.
+ *
+ * Son lecteur crée l'élément vidéo, l'insère, puis lance sur son conteneur un zoom de 240 ms et n'appelle
+ * `setCurrentSrc` qu'à la fin (`createMediaElement`). L'élément est là dès le début ; l'attente n'est que
+ * visuelle. Mesurée au banc : 250 à 330 ms entre la réponse du serveur et la source, à chaque ouverture.
+ * On annonce donc la fin de l'animation dès que le conteneur apparaît : jellyfin-web enchaîne, et le zoom
+ * se joue pendant que Lumen ouvre le fichier.
+ *
+ * Seulement pour une lecture que Lumen prend. Sans conteneur dans les trois secondes (un client web qui
+ * ne ferait plus ainsi), rien n'est touché.
+ */
+function skipOpeningAnimation(): void {
+  try {
+    if (document.querySelector(".videoPlayerContainer")) return;
+    const announce = (node: Node) => {
+      if (!(node instanceof HTMLElement) || !node.classList.contains("videoPlayerContainer")) return false;
+      holdPictureUntilZoomed(node);
+      for (const type of ["animationend", "webkitAnimationEnd"]) node.dispatchEvent(new Event(type));
+      return true;
+    };
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of Array.from(record.addedNodes)) {
+          if (!announce(node)) continue;
+          observer.disconnect();
+          clearTimeout(timer);
+          return;
+        }
+      }
+    });
+    const timer = setTimeout(() => observer.disconnect(), 3000);
+    observer.observe(document.body, { childList: true });
+  } catch {
+    /* l'animation se joue alors comme avant */
+  }
+}
+
+/**
+ * L'image reste cachée tant que le zoom d'ouverture se joue.
+ *
+ * Une ouverture rapide (page chaude, fiche préparée) montre sa première image en moins de 240 ms : elle
+ * apparaissait alors dans le cadre encore en train de grandir, à demi transparent, ce que le client web ne
+ * fait jamais de lui-même (il n'attache la source qu'après le zoom). Le film se prépare pendant le zoom et
+ * se montre à sa fin : à l'écran, rien ne distingue cette ouverture de celle de jellyfin-web, sauf sa durée.
+ *
+ * La vraie fin d'animation se reconnaît à `isTrusted` (celle qu'on annonce soi-même ne l'est pas). Le
+ * délai de garde couvre un navigateur qui ne jouerait pas l'animation : l'image ne reste jamais cachée.
+ */
+function holdPictureUntilZoomed(container: HTMLElement): void {
+  const video = container.querySelector("video");
+  if (!video || !container.style.animation) return;
+  video.style.visibility = "hidden";
+  const types = ["animationend", "webkitAnimationEnd", "animationcancel"];
+  const show = (event?: Event) => {
+    if (event && !event.isTrusted) return;
+    video.style.visibility = "";
+    clearTimeout(guard);
+    for (const type of types) container.removeEventListener(type, show);
+  };
+  for (const type of types) container.addEventListener(type, show);
+  const guard = setTimeout(show, 400);
 }
 
 // --- le journal ---------------------------------------------------------------------------------
@@ -571,28 +891,34 @@ const watched = new WeakSet<HTMLVideoElement>();
 /**
  * Mesure le flux qui démarre sur cet élément : sa première image, puis les arrêts de l'image et le film
  * joué. Les mêmes gestes pour les deux lecteurs — c'est l'élément `<video>` qu'on regarde, pas le moteur.
- * Mesure seulement : rien ici ne touche à la lecture, et rien ne lève.
+ * Relève aussi, journal allumé ou non, la dernière position jouée et l'état de pause, dont les
+ * réouvertures repartent. Rien ici ne touche à la lecture, et rien ne lève.
  */
 function observe(state: State, element: HTMLVideoElement, options: StreamInfo): void {
   const recorder = state.recorder;
   state.element = element;
-  if (!recorder) return;
   try {
-    const startedAt = state.askedAt ?? performance.now();
-    state.askedAt = null;
-    state.busy += 1;
-    void nextFrame(element).then((at) => {
-      state.busy -= 1;
-      if (state.recorder !== recorder || at === null) return;
-      recorder.stream({
-        player: state.playback ? "lumen" : "jellyfin",
-        playMethod: options.playMethod ?? null,
-        transcodeReasons: transcodeReasonsOf(options.url),
-        audio: state.playback?.diagnostics["Traitement audio"] ?? null,
+    if (recorder) {
+      const startedAt = state.askedAt ?? performance.now();
+      state.askedAt = null;
+      state.busy += 1;
+      void nextFrame(element).then((at) => {
+        state.busy -= 1;
+        if (state.recorder !== recorder || at === null) return;
+        recorder.stream({
+          player: state.playback ? "lumen" : "jellyfin",
+          playMethod: options.playMethod ?? null,
+          transcodeReasons: transcodeReasonsOf(options.url),
+          audio: state.playback?.diagnostics["Traitement audio"] ?? null,
+        });
+        if (!recorder.opened) recorder.opening({ ...state.steps });
+        recorder.frame(at - startedAt);
       });
-      if (!recorder.opened) recorder.opening({ ...state.steps });
-      recorder.frame(at - startedAt);
-    });
+    }
+    // L'élément est suivi même sans journal : la position et la pause relevées ici servent aux
+    // réouvertures (retour au premier plan, changement de piste). Tant qu'elles n'étaient relevées que
+    // journal allumé, un serveur au journal éteint reprenait le film à zéro après une coupure du réseau, et
+    // relançait un film mis en pause dont on changeait la piste son (cas-limites.mjs, LOSS=1, le 24/11/2026).
     if (watched.has(element)) return;
     watched.add(element);
     let waitingSince: number | null = null;
@@ -730,19 +1056,104 @@ function hostFor(state: State, core: Core, item: JellyfinItem) {
   return api;
 }
 
+/** Ce que la sonde dit en cours de lecture ; rebranché sur l'ouverture qui la reprend. */
+interface ProbeHooks {
+  onWarning: (warning: { code: string; detail?: unknown }) => void;
+  onError: (message: string, kind?: "network" | "playback") => void;
+}
+
+/**
+ * Le verdict est-il rendu d'avance, dès que le moteur dit que le chemin tient ? Vrai jusqu'au premier
+ * refus tombé après coup dans cette page : ce qui l'a causé (un décodeur que la page n'a pas le droit de
+ * charger, par exemple) vaudra pour les fichiers suivants, et chacun paierait une ouverture ratée puis
+ * une renégociation. La vérification attend alors la sonde entière, comme avant.
+ */
+let optimistic = wasmAllowed();
+
+/**
+ * La page a-t-elle le droit de compiler du WebAssembly ? Sous une politique de sécurité qui l'interdit,
+ * tout fichier dont le son se décode ici sera refusé — après le verdict d'avance. Autant le savoir
+ * tout de suite : le plus petit module qui soit, huit octets, compilé une fois au chargement.
+ */
+function wasmAllowed(): boolean {
+  try {
+    new WebAssembly.Module(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Ce qu'a fait de la vérification gardée la dernière ouverture — pour les bancs (`window.Lumen.status()`). */
+let lastStandby: "reused" | "mismatch" | "failed" | "none" = "none";
+
+/** Pose la question au moteur : ce fichier, à cette position, sur la piste son que le serveur a retenue. */
+function ask(state: State, engine: Core, item: JellyfinItem, source: JellyfinMediaSource | undefined, startSeconds: number, more: Partial<Parameters<Core["probePlaybackPath"]>[0]> & { picked?: (track: number | null) => void }, hooks: ProbeHooks): Promise<Probe> {
+  const api = hostFor(state, engine, item);
+  const video = source?.MediaStreams?.find((s) => s.Type === "Video");
+  const { picked, ...options } = more;
+  return engine.probePlaybackPath({
+    streamUrl: streamAddress(api.serverAddress(), item.Id!, source?.Id ?? item.Id!),
+    knownSize: source?.Size ?? null,
+    fileVersion: source?.ETag ?? null,
+    videoRangeType: video?.VideoRangeType ?? null,
+    startSeconds,
+    // La piste que le serveur a retenue (préférences du compte, choix au menu), traduite pour le moteur
+    // une fois ses pistes connues : il ouvre dessus, au lieu d'ouvrir sur la sienne puis de recommencer.
+    pickAudioTrack: (tracks) => {
+      const track = audioTrackFor(source?.MediaStreams, source?.DefaultAudioStreamIndex, tracks.map((t) => t.number));
+      picked?.(track);
+      return track;
+    },
+    onWarning: (warning) => hooks.onWarning(warning),
+    onError: (message, kind) => hooks.onError(message, kind),
+    ...options,
+  });
+}
+
+/** Referme la vérification gardée ouverte, si personne ne l'a reprise. */
+function dropStandby(state: State): void {
+  const standby = state.standby;
+  state.standby = null;
+  if (!standby || standby.spent) return;
+  standby.spent = true;
+  clearTimeout(standby.timer);
+  void standby.probe.then((probe) => probe.discard()).catch(() => {});
+}
+
+/** Reprend la vérification gardée ouverte pour ce fichier, s'il y en a une : à l'appelant de s'en servir ou de la refermer. */
+function takeStandby(state: State, itemId: string, mediaSourceId: string): Standby | null {
+  const standby = state.standby;
+  if (!standby || standby.spent || standby.itemId !== itemId || standby.mediaSourceId !== mediaSourceId) return null;
+  state.standby = null;
+  standby.spent = true;
+  clearTimeout(standby.timer);
+  return standby;
+}
+
+/** La position où la lecture qui se prépare va commencer, d'après le dernier ordre vu ; zéro sans ordre récent. */
+function expectedStart(state: State): number {
+  return state.order && performance.now() - state.order.at < ORDER_MS ? state.order.seconds : 0;
+}
+
 /**
  * Lumen porte-t-il ce fichier ? La question est posée au moteur, qui ouvre le fichier et choisit son
- * chemin comme pour le lire, puis referme : ce qu'il a lu (en-tête, index, premiers morceaux) reste en
- * mémoire sous l'adresse du fichier et sert à l'ouverture qui suit.
+ * chemin comme pour le lire. La réponse est rendue dès que le moteur sait que le chemin tient (`onViable` :
+ * en-tête lu, codecs acceptés par le navigateur) ; la sonde continue derrière et reste ouverte pour
+ * l'ouverture qui suit — voir `Standby`.
+ *
+ * `speculate` faux : seulement le verdict, sans rien garder ouvert — pour un changement de flux en cours
+ * de lecture, dont ni la position ni la piste ne se devinent d'ici.
  *
  * Rend `null` quand la question n'a pas pu être posée à temps (moteur introuvable, serveur muet) : ce
  * n'est pas un refus du fichier, et rien n'est retenu.
  */
-async function check(self: LumenPlayer, item: JellyfinItem): Promise<Verdict | null> {
+async function check(self: LumenPlayer, item: JellyfinItem, speculate = true): Promise<Verdict | null> {
   const state = states.get(self)!;
   const id = item.Id!;
   const known = state.verdicts.get(id);
-  if (known && Date.now() - known.at < VERDICT_MS) return known;
+  const fresh = known && Date.now() - known.at < VERDICT_MS ? known : null;
+  if (fresh && (!fresh.ok || !speculate)) return fresh;
   const source = item.MediaSources?.find((s) => s.Id === id) ?? item.MediaSources?.[0];
   const mediaSourceId = source?.Id ?? id;
   let engine: Core;
@@ -753,74 +1164,85 @@ async function check(self: LumenPlayer, item: JellyfinItem): Promise<Verdict | n
     log("engine not found, regular player:", error instanceof Error ? error.message : error);
     return null;
   }
-  try {
-    const api = hostFor(state, engine, item);
-    const video = source?.MediaStreams?.find((s) => s.Type === "Video");
-    const asked = engine.probePlaybackPath({
-      streamUrl: streamAddress(api.serverAddress(), id, mediaSourceId),
-      knownSize: source?.Size ?? null,
-      fileVersion: source?.ETag ?? null,
-      videoRangeType: video?.VideoRangeType ?? null,
-      startSeconds: 0,
-      onError: () => {},
-    });
-    const timeout = new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), CHECK_TIMEOUT_MS));
-    const probe = await Promise.race([asked, timeout]);
-    if (probe === "timeout") {
-      // Arrivée trop tard, elle sera refermée ; son refus éventuel n'intéresse plus personne.
-      void asked.then((late) => late.discard()).catch(() => {});
-      log(`checking the file took too long (${CHECK_TIMEOUT_MS / 1000} s), regular player`);
-      return null;
-    }
-    const verdict: Verdict = { at: Date.now(), ok: true, mediaSourceId, audioTracks: probe.audioTracks.map((track) => track.number) };
-    probe.discard();
-    state.verdicts.set(id, verdict);
-    return verdict;
-  } catch (error) {
+  const refusal = (error: unknown): Verdict | null => {
     const reason = error instanceof Error ? error.message : String(error);
     // Un réseau absent ou une session finie ne disent rien du fichier : ce n'est pas un refus à retenir.
     if (error instanceof engine.NetworkUnavailable || error instanceof engine.SessionEnded) {
       log("could not check the file, regular player:", reason);
       return null;
     }
-    const verdict: Verdict = { at: Date.now(), ok: false, reason, mediaSourceId, audioTracks: [] };
+    const verdict: Verdict = { at: Date.now(), ok: false, reason, mediaSourceId };
     state.verdicts.set(id, verdict);
     log("declined, regular player:", reason);
     return verdict;
+  };
+  const startSeconds = expectedStart(state);
+  // jellyfin-web pose la question plusieurs fois pendant une préparation de flux : la même sonde sert.
+  let standby = state.standby;
+  if (!standby || standby.spent || standby.itemId !== id || standby.mediaSourceId !== mediaSourceId || standby.startSeconds !== startSeconds) {
+    dropStandby(state);
+    let announce!: () => void;
+    const viable = new Promise<void>((resolve) => (announce = resolve));
+    const hooks: ProbeHooks = { onWarning: () => {}, onError: () => {} };
+    let picked: number | null | undefined;
+    let probe: Promise<Probe>;
+    try {
+      probe = ask(state, engine, item, source, startSeconds, { onViable: announce, picked: (track) => (picked = track) }, hooks);
+    } catch (error) {
+      return refusal(error);
+    }
+    const mine: Standby = { itemId: id, mediaSourceId, startSeconds, probe, viable, hooks, picked: () => picked, spent: false, timer: setTimeout(() => state.standby === mine && dropStandby(state), STANDBY_MS) };
+    standby = state.standby = mine;
+    // Un refus tardif — après le verdict rendu d'avance — est retenu : la prochaine fois, la question ne
+    // sera plus posée, et l'ouverture en cours le lira (`open`).
+    probe.catch((error) => {
+      if (state.standby === mine) state.standby = null;
+      clearTimeout(mine.timer);
+      if ((fresh || state.verdicts.get(id)?.ok) && refusal(error)) {
+        optimistic = false;
+        log("verdicts will wait for the full check from now on (a file was declined after being accepted)");
+      }
+    });
+  }
+  if (fresh) return fresh;
+  const timeout = new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), CHECK_TIMEOUT_MS));
+  try {
+    const first = await Promise.race(optimistic ? [standby.viable, standby.probe, timeout] : [standby.probe, timeout]);
+    if (first === "timeout") {
+      // Arrivée trop tard, elle sera refermée ; son refus éventuel n'intéresse plus personne.
+      if (state.standby === standby) dropStandby(state);
+      log(`checking the file took too long (${CHECK_TIMEOUT_MS / 1000} s), regular player`);
+      return null;
+    }
+    const verdict: Verdict = { at: Date.now(), ok: true, mediaSourceId };
+    state.verdicts.set(id, verdict);
+    return verdict;
+  } catch (error) {
+    return refusal(error);
   }
 }
 
 /** Ouvre Lumen sur l'élément et lance la lecture. C'est le `play()` que le lecteur de jellyfin-web attend. */
-async function open(self: LumenPlayer, element: HTMLVideoElement, options: StreamInfo, verdict: Verdict, resume?: { seconds: number; paused: boolean }): Promise<void> {
+async function open(self: LumenPlayer, element: HTMLVideoElement, options: StreamInfo, resume?: { seconds: number; paused: boolean }): Promise<void> {
   const state = states.get(self)!;
   const mine = ++state.opening;
   const item = options.item!;
   const source = options.mediaSource!;
   step(state, "play");
   const engine = await loadCore();
-  const api = hostFor(state, engine, item);
-  const video = source.MediaStreams?.find((s) => s.Type === "Video");
-  const ask = (audioTrackNumber: number | null) =>
-    engine.probePlaybackPath({
-      streamUrl: streamAddress(api.serverAddress(), item.Id!, source.Id!),
-      knownSize: source.Size ?? null,
-      fileVersion: source.ETag ?? null,
-      videoRangeType: video?.VideoRangeType ?? null,
-      startSeconds: resume?.seconds ?? (options.playerStartPositionTicks ?? 0) / 1e7,
-      // Une reconstruction ne relance pas un film que le spectateur avait mis en pause.
-      startPaused: resume?.paused ?? false,
-      audioTrackNumber,
-      onWarning: (warning) => log("engine warning:", warning.code, warning.detail ?? ""),
-      // Le moteur a épuisé ses reprises sur cette source. On la rouvre à la même position, quelques
-      // fois ; au-delà, c'est une erreur de lecture pour jellyfin-web, qui renégocie et transcode.
-      onError: (message, kind) => {
-        if (states.get(self)!.opening !== mine) return;
-        log("the engine gave up:", message);
-        void rebuild(self, kind === "network" ? "network" : "source lost").then((rebuilt) => {
-          if (!rebuilt) handOver(self, kind === "network" ? "network" : "mediadecodeerror");
-        });
-      },
-    });
+  const startSeconds = resume?.seconds ?? (options.playerStartPositionTicks ?? 0) / 1e7;
+  const hooks: ProbeHooks = {
+    onWarning: (warning) => log("engine warning:", warning.code, warning.detail ?? ""),
+    // Le moteur a épuisé ses reprises sur cette source. On la rouvre à la même position, quelques
+    // fois ; au-delà, c'est une erreur de lecture pour jellyfin-web, qui renégocie et transcode.
+    onError: (message, kind) => {
+      if (states.get(self)!.opening !== mine) return;
+      log("the engine gave up:", message);
+      void rebuild(self, kind === "network" ? "network" : "source lost").then((rebuilt) => {
+        if (!rebuilt) handOver(self, kind === "network" ? "network" : "mediadecodeerror");
+      });
+    },
+  };
   // Un serveur qui refuse le fichier (403, 500…) n'est pas un réseau absent. Le moteur, lui, ne fait pas
   // la différence : il redemande, puis attend 48 s que le réseau revienne — c'est juste dans Laterna, où
   // l'autre lecteur a besoin du même réseau. Ici jellyfin-web sait transcoder : au quatrième refus
@@ -836,17 +1258,42 @@ async function open(self: LumenPlayer, element: HTMLVideoElement, options: Strea
     log(`the server refuses the file (status ${status}), handing over to the regular player`);
     handOver(self, "network");
   };
-  // La piste que le serveur a retenue (préférences du compte, choix au menu), traduite pour le moteur.
-  const known = verdict.mediaSourceId === source.Id ? verdict.audioTracks : [];
-  let probe = await ask(audioTrackFor(source.MediaStreams, source.DefaultAudioStreamIndex, known));
-  if (known.length === 0) {
-    // Une autre version du fichier que celle vérifiée : ses pistes ne sont connues que maintenant.
-    const wanted = audioTrackFor(source.MediaStreams, source.DefaultAudioStreamIndex, probe.audioTracks.map((track) => track.number));
-    if (wanted !== null && wanted !== probe.audioTrack) {
-      probe.discard();
-      probe = await ask(wanted);
+  let probe: Probe | null = null;
+  // La vérification gardée ouverte, si elle a préparé cette lecture-ci : même fichier, même position,
+  // même piste son. Sinon elle est refermée et la question est reposée — ce qui se faisait toujours.
+  // Jamais pour une reconstruction : elle rouvre en pause ou ailleurs, ce que la vérification ignorait.
+  const standby = resume ? null : takeStandby(state, item.Id!, source.Id!);
+  lastStandby = "none";
+  if (standby) {
+    let ready: Probe | null = null;
+    try {
+      ready = await standby.probe;
+    } catch (error) {
+      lastStandby = "failed";
+      // Le fichier lui-même est refusé (le verdict l'a déjà retenu, voir `check`) : c'est une erreur de
+      // lecture pour jellyfin-web, qui renégocie avec son propre profil. Une panne de réseau, elle, ne dit
+      // rien du fichier : la question est reposée, et le moteur attend le réseau comme il sait le faire.
+      if (!(error instanceof engine.NetworkUnavailable || error instanceof engine.SessionEnded)) throw error;
+    }
+    if (ready) {
+      const wanted = audioTrackFor(source.MediaStreams, source.DefaultAudioStreamIndex, ready.audioTracks.map((track) => track.number));
+      if (state.opening === mine && standby.startSeconds === startSeconds && standby.picked() === wanted) {
+        standby.hooks.onWarning = hooks.onWarning;
+        standby.hooks.onError = hooks.onError;
+        probe = ready;
+        lastStandby = "reused";
+      } else {
+        ready.discard();
+        lastStandby = "mismatch";
+      }
     }
   }
+  if (state.opening !== mine) {
+    probe?.discard();
+    return;
+  }
+  // Une reconstruction ne relance pas un film que le spectateur avait mis en pause.
+  probe ??= await ask(state, engine, item, source, startSeconds, { startPaused: resume?.paused ?? false }, hooks);
   if (state.opening !== mine) {
     probe.discard();
     return;
@@ -876,6 +1323,35 @@ function handOver(self: LumenPlayer, type: "network" | "mediadecodeerror"): void
   if (state.handedOver) return;
   state.handedOver = true;
   state.deps.events.trigger(self, "error", [{ type }]);
+}
+
+/**
+ * Rouvre le fichier sur une autre piste son, à la position courante, sans repasser par le serveur —
+ * voir `canSetAudioStreamIndex`. `index` est celui de Jellyfin ; la source gardée le retient, pour qu'une
+ * reconstruction ultérieure rouvre sur la piste choisie et non sur celle de la négociation.
+ */
+function switchAudio(self: LumenPlayer, index: number): void {
+  const state = states.get(self)!;
+  const current = state.current;
+  const playback = state.playback;
+  if (!current || !playback || state.rebuilding !== null) return;
+  const source = current.options.mediaSource!;
+  const wanted = audioTrackFor(source.MediaStreams, index, playback.audioTracks.map((track) => track.number));
+  if (wanted === null || wanted === playback.currentAudioTrack) return;
+  current.options = { ...current.options, mediaSource: { ...source, DefaultAudioStreamIndex: index } };
+  const seconds = playback.position > 0 ? playback.position : state.lastPosition;
+  const startedAt = performance.now();
+  const recorder = state.recorder;
+  void reopen(self, current, seconds, state.wasPaused).then((reopened) => {
+    if (!reopened) handOver(self, "mediadecodeerror");
+  });
+  // Mesuré comme un changement de flux par renégociation : de l'ordre à la première image de la nouvelle
+  // source (l'ancienne vient d'être fermée, plus aucune image n'en sort).
+  state.busy += 1;
+  void nextFrame(current.element, 60_000).then((at) => {
+    state.busy -= 1;
+    if (state.recorder === recorder && at !== null) recorder?.frame(at - startedAt);
+  });
 }
 
 /** Au plus tant de reconstructions dans cette fenêtre — les bornes de Laterna (`playerLifecycle`). */
@@ -912,6 +1388,12 @@ async function rebuild(self: LumenPlayer, why: string): Promise<boolean> {
   const paused = state.wasPaused;
   log(`reopening (${why}) at ${seconds.toFixed(1)} s${paused ? ", paused" : ""}; engine at ${playback.position.toFixed(1)} s, last played position ${state.lastPosition.toFixed(1)} s`);
   state.recorder?.rebuilt();
+  return reopen(self, current, seconds, paused);
+}
+
+/** Ferme la source et la rouvre sur le même élément, à `seconds` : le geste commun à une reconstruction et à un changement de piste. */
+async function reopen(self: LumenPlayer, current: NonNullable<State["current"]>, seconds: number, paused: boolean): Promise<boolean> {
+  const state = states.get(self)!;
   state.rebuilding = seconds;
   close(state, true);
   try {
@@ -920,7 +1402,7 @@ async function rebuild(self: LumenPlayer, why: string): Promise<boolean> {
     if (state.current !== current) return true;
     state.busy += 1;
     try {
-      await open(self, current.element, current.options, current.verdict, { seconds, paused });
+      await open(self, current.element, current.options, { seconds, paused });
     } finally {
       state.busy -= 1;
     }
@@ -986,6 +1468,7 @@ w.Lumen = {
     return {
       adopted: state.adopted,
       playing: state.playback !== null,
+      standby: lastStandby,
       position: state.playback?.position ?? null,
       audioTrack: state.playback?.currentAudioTrack ?? null,
       diagnostics: state.playback?.diagnostics ?? null,

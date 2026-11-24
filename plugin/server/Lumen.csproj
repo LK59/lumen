@@ -5,9 +5,9 @@
     <RootNamespace>Lumen.Jellyfin</RootNamespace>
     <AssemblyName>Lumen</AssemblyName>
     <!-- Quatre nombres : Jellyfin compare les versions de plugin ainsi, et nomme le dossier d'après elles. -->
-    <Version>0.1.13.0</Version>
+    <Version>0.1.14.0</Version>
     <!-- Ce que cette version change, en une ligne : repris dans le manifeste du dépôt de plugins. -->
-    <PackageReleaseNotes>The plugin page shows the measured gains: start, seeks and audio track changes.</PackageReleaseNotes>
+    <PackageReleaseNotes>Faster start and resume: the file is checked while the web client negotiates and prepared from its detail page. Audio track changes no longer go back to the server. Fixes the position lost after a network drop when the journal is off.</PackageReleaseNotes>
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>

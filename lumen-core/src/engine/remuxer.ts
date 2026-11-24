@@ -1196,6 +1196,15 @@ export class Remuxer {
     this.source.warm?.(from);
   }
 
+  /** Le premier envoi d'une ouverture : la source rend l'avance qu'une reprise retenait (`focusOpening`). */
+  openingSettled(): void {
+    try {
+      this.source.seekSettled?.();
+    } catch {
+      /* une préférence de lecture, pas une lecture */
+    }
+  }
+
   /** Le saut a sa première image : la source reprend sa lecture en avance entière. */
   seekSettled(): void {
     try {

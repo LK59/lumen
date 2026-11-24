@@ -12,7 +12,7 @@ body:
     attributes:
       label: Lumen and Jellyfin versions
       description: Dashboard > Lumen shows the plugin version; Dashboard > General shows the server version.
-      placeholder: Lumen 0.1.13.0, Jellyfin 10.11.11
+      placeholder: Lumen 0.1.14.0, Jellyfin 10.11.11
     validations:
       required: true
   - type: input

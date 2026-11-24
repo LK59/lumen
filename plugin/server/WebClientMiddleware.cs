@@ -32,7 +32,7 @@ internal sealed class WebClientMiddleware
     /// <summary>
     /// Ce qui, dans une page, dit que le script y est déjà.
     /// </summary>
-    private const string ScriptMarker = "Lumen/web/lumen-jellyfin.js";
+    private const string ScriptMarker = "/lumen-jellyfin.js";
 
     /// <summary>
     /// Au-delà, ce n'est ni la page d'entrée ni la configuration du client web : on ne garde pas en mémoire
@@ -105,7 +105,7 @@ internal sealed class WebClientMiddleware
             && !response.Headers.ContainsKey(HeaderNames.ContentEncoding)
             && body.Length > 0 && body.Length <= MaxBytes)
         {
-            var transformed = Transform(body, index, plugin.Version.ToString());
+            var transformed = Transform(body, index, plugin.WebStamp);
             if (transformed is not null)
             {
                 body = transformed;
@@ -182,8 +182,11 @@ internal sealed class WebClientMiddleware
             return null;
         }
 
+        // L'empreinte est dans le chemin, pas en paramètre : le moteur, son worker et ses décodeurs sont
+        // chargés par des adresses relatives à ce script, et héritent ainsi du même dossier — voir
+        // `Plugin.WebStamp` et `LumenController.GetWebFile`.
         var script = "<script>window.LumenConfig={build:\"" + version + "\"}</script>"
-            + "<script src=\"../" + ScriptMarker + "?v=" + version + "\"></script>";
+            + "<script src=\"../Lumen/web/@" + version + ScriptMarker + "\"></script>";
         return html.Insert(end + 1, script);
     }
 
