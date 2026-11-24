@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/LK59/lumen/main/plugin/logo.png",
     "versions": [
       {
+        "version": "0.1.16.0",
+        "changelog": "The journal records how playback starts after the first frame of each opening: player events and seconds buffered ahead.",
+        "targetAbi": "10.10.0.0",
+        "sourceUrl": "https://raw.githubusercontent.com/LK59/lumen/main/releases/lumen_0.1.16.0.zip",
+        "checksum": "de01815f70043fd070af163a657e941f",
+        "timestamp": "2026-11-24T08:27:35Z"
+      },
+      {
         "version": "0.1.15.0",
         "changelog": "The picture stays hidden until the resume position is on screen: a frame from another shot could flash when resuming or changing the audio track. The journal records the first frames of each opening.",
         "targetAbi": "10.10.0.0",

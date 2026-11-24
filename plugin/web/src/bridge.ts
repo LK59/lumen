@@ -903,7 +903,7 @@ const HOLD_GUARD_MS = 1500;
 /** Sans aucune donnée au bout de ce délai, la retenue tombe : l'élément a peut-être changé de mains. */
 const HOLD_CAP_MS = 15_000;
 /** Les premières images relevées par ouverture, pour le journal. */
-const TRACED_FRAMES = 6;
+const TRACED_FRAMES = 8;
 let holdCount = 0;
 
 /**
@@ -930,41 +930,57 @@ function watchOpening(state: State, element: HTMLVideoElement, target: number, a
     const holding = target >= HOLD_FROM_SECONDS;
     const marks: Record<string, number> = {};
     const frames: number[][] = [];
-    let done = false;
+    let shown: { heldMs: number; shownBy: string } | null = null;
+    let reported = false;
     let guard: ReturnType<typeof setTimeout> | undefined;
-    const types = ["loadeddata", "canplay", "seeked", "playing", "timeupdate"];
-    const finish = (by: string) => {
-      if (done) return;
-      done = true;
+    // Les secondes de film en mémoire devant la position : ce qui dit si une image figée attend des
+    // octets (rien devant) ou le navigateur (de quoi lire, et pourtant rien ne bouge).
+    const ahead = () => {
+      const { buffered, currentTime } = element;
+      for (let i = 0; i < buffered.length; i += 1) if (buffered.start(i) <= currentTime + 0.1 && currentTime <= buffered.end(i)) return Math.round((buffered.end(i) - currentTime) * 10) / 10;
+      return 0;
+    };
+    const types = ["loadeddata", "canplay", "canplaythrough", "seeked", "play", "playing", "waiting", "stalled", "pause", "timeupdate"];
+    const show = (by: string) => {
+      if (shown) return;
+      shown = { heldMs: since(), shownBy: by };
       clearTimeout(guard);
+      if (holding) releasePicture(element, reason);
+    };
+    // Le relevé part une fois ses images réunies, ou au bout du délai : il couvre ainsi le démarrage de la
+    // lecture après la première image, là où une reprise restait figée jusqu'à deux secondes sur iPhone
+    // (journal du 24/11/2026) sans que rien ne dise ce qu'elle attendait.
+    const report = (why?: string) => {
+      if (reported) return;
+      reported = true;
+      show(why ?? "report");
       clearTimeout(cap);
       for (const type of types) element.removeEventListener(type, onEvent);
-      if (holding) releasePicture(element, reason);
       // Une ouverture remplacée entre-temps (autre flux, fermeture) n'a rien à dire de celle qui suit.
-      if (alive()) state.recorder?.openingTrace({ target: Math.round(target * 10) / 10, ...(holding ? { heldMs: since(), shownBy: by } : {}), marks, frames });
+      if (alive()) state.recorder?.openingTrace({ target: Math.round(target * 10) / 10, ...(holding && shown ? shown : {}), marks, frames });
     };
     const there = (seconds: number) => !element.seeking && seconds >= target - HOLD_TOLERANCE_SECONDS;
     const onEvent = (event: Event) => {
-      if (!alive()) return finish("replaced");
+      if (!alive()) return report("replaced");
       marks[event.type] ??= since();
+      if (shown) return;
       // Les premières données sont là : à partir d'ici, l'image ne peut plus attendre longtemps.
-      if (holding) guard ??= setTimeout(() => finish("guard"), HOLD_GUARD_MS);
-      if (holding && element.readyState >= 2 && there(element.currentTime)) finish("position");
+      if (holding) guard ??= setTimeout(() => show("guard"), HOLD_GUARD_MS);
+      if (!holding || (element.readyState >= 2 && there(element.currentTime))) show("position");
     };
     for (const type of types) element.addEventListener(type, onEvent);
-    const cap = setTimeout(() => finish("cap"), HOLD_CAP_MS);
+    const cap = setTimeout(() => report("cap"), HOLD_CAP_MS);
     if (holding) holdPicture(element, reason);
     if (typeof element.requestVideoFrameCallback !== "function") return;
     const onFrame = (_now: number, meta: { mediaTime: number }) => {
-      if (!alive()) return finish("replaced");
-      if (done && frames.length >= TRACED_FRAMES) return;
-      // [ms depuis l'ouverture, position de l'image, position de l'élément, saut en cours]
-      if (frames.length < TRACED_FRAMES) frames.push([since(), Math.round(meta.mediaTime * 100) / 100, Math.round(element.currentTime * 100) / 100, element.seeking ? 1 : 0]);
-      if (!done && (!holding || there(meta.mediaTime))) {
-        // Sans retenue, le relevé part une fois ses images réunies.
-        if (holding || frames.length >= TRACED_FRAMES) finish("frame");
-      }
-      if (!done || frames.length < TRACED_FRAMES) element.requestVideoFrameCallback?.(onFrame);
+      if (!alive()) return report("replaced");
+      if (reported) return;
+      // [ms depuis l'ouverture, position de l'image, position de l'élément, saut en cours, secondes en
+      //  mémoire devant, readyState]
+      frames.push([since(), Math.round(meta.mediaTime * 100) / 100, Math.round(element.currentTime * 100) / 100, element.seeking ? 1 : 0, ahead(), element.readyState]);
+      if (!holding || there(meta.mediaTime)) show("frame");
+      if (frames.length >= TRACED_FRAMES) return report();
+      element.requestVideoFrameCallback?.(onFrame);
     };
     element.requestVideoFrameCallback(onFrame);
   } catch {

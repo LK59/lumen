@@ -33,7 +33,7 @@ export interface PlaybackEntry {
    * Les ouvertures du moteur sur l'élément (la première, puis chaque réouverture), quatre au plus : la
    * position demandée, combien de temps l'image a été retenue et ce qui l'a levée (`frame`, `position`,
    * `guard`, `cap`), les premiers événements de l'élément et ses premières images présentées
-   * (`[ms, position de l'image, position de l'élément, saut en cours]`), en ms depuis l'ouverture.
+   * (`[ms, position de l'image, position de l'élément, saut en cours, secondes en mémoire devant, readyState]`), en ms depuis l'ouverture.
    */
   openings?: OpeningTrace[];
   /** Chaque saut, de l'ordre à la première image après lui. */
