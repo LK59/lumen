@@ -747,6 +747,8 @@ function close(state: State, rebuilding = false): void {
   }
   state.opening += 1;
   state.onRangeRefused = null;
+  // Une ouverture abandonnée ne laisse pas l'image cachée à qui reprend l'élément (jellyfin-web, au repli).
+  if (state.element) releasePicture(state.element);
   const playback = state.playback;
   state.playback = null;
   state.seekTarget = null;
@@ -857,16 +859,117 @@ function skipOpeningAnimation(): void {
 function holdPictureUntilZoomed(container: HTMLElement): void {
   const video = container.querySelector("video");
   if (!video || !container.style.animation) return;
-  video.style.visibility = "hidden";
+  holdPicture(video, "zoom");
   const types = ["animationend", "webkitAnimationEnd", "animationcancel"];
   const show = (event?: Event) => {
     if (event && !event.isTrusted) return;
-    video.style.visibility = "";
+    releasePicture(video, "zoom");
     clearTimeout(guard);
     for (const type of types) container.removeEventListener(type, show);
   };
   for (const type of types) container.addEventListener(type, show);
   const guard = setTimeout(show, 400);
+}
+
+/**
+ * Les raisons pour lesquelles l'image d'un élément est cachée : le zoom d'ouverture, une position de
+ * départ pas encore atteinte. L'image se montre quand il n'en reste aucune — deux retenues qui se
+ * chevauchent (une reprise pendant le zoom) ne se lèvent pas l'une l'autre.
+ */
+const pictureHolds = new WeakMap<HTMLVideoElement, Set<string>>();
+
+function holdPicture(element: HTMLVideoElement, reason: string): void {
+  const reasons = pictureHolds.get(element) ?? new Set<string>();
+  pictureHolds.set(element, reasons);
+  reasons.add(reason);
+  element.style.visibility = "hidden";
+}
+
+/** Sans `reason` : les retenues de position tombent toutes (la lecture se ferme ou change de mains) ; celle du zoom reste. */
+function releasePicture(element: HTMLVideoElement, reason?: string): void {
+  const reasons = pictureHolds.get(element);
+  if (!reasons) return;
+  if (reason !== undefined) reasons.delete(reason);
+  else for (const held of Array.from(reasons)) if (held !== "zoom") reasons.delete(held);
+  if (reasons.size === 0) element.style.visibility = "";
+}
+
+/** En deçà, un départ est un départ de zéro : rien à retenir, la première image est la bonne. */
+const HOLD_FROM_SECONDS = 1;
+/** Une image présentée à moins de cela avant la position demandée est tenue pour la bonne. */
+const HOLD_TOLERANCE_SECONDS = 1;
+/** Après les premières données, l'image n'attend pas davantage : mieux vaut une image de travers que rien. */
+const HOLD_GUARD_MS = 1500;
+/** Sans aucune donnée au bout de ce délai, la retenue tombe : l'élément a peut-être changé de mains. */
+const HOLD_CAP_MS = 15_000;
+/** Les premières images relevées par ouverture, pour le journal. */
+const TRACED_FRAMES = 6;
+let holdCount = 0;
+
+/**
+ * Suit une ouverture du moteur sur l'élément : relève ses premiers événements et ses premières images
+ * pour le journal et, quand elle part d'une position (reprise, changement de piste, reconstruction),
+ * garde l'image cachée jusqu'à ce que cette position soit à l'écran.
+ *
+ * Symptôme d'origine (enregistrements d'écran sur iPhone, le 24/11/2026) : à un changement de piste son,
+ * une image d'un autre plan apparaissait 0,2 s, puis un noir, puis le film ; la même image passait à
+ * l'ouverture d'une reprise. Hypothèse non vérifiée faute de Safari au banc : l'image clé d'où le
+ * décodage repart, quelques secondes avant la position, montrée le temps d'y arriver. Le relevé
+ * (`openings` du journal : la position de chaque image présentée) est là pour le confirmer ou l'infirmer.
+ *
+ * L'image se montre à la première de ces preuves : une image présentée à la position, hors saut ; ou,
+ * pour un navigateur qui n'annoncerait pas les images d'un élément caché, l'élément lui-même posé à la
+ * position avec de quoi l'afficher. Deux gardes pour qu'elle ne reste jamais cachée.
+ */
+function watchOpening(state: State, element: HTMLVideoElement, target: number, alive: () => boolean): void {
+  // Une retenue par ouverture : celle d'une ouverture remplacée ne lève pas celle de la suivante.
+  const reason = `position#${(holdCount += 1)}`;
+  try {
+    const from = performance.now();
+    const since = () => Math.round(performance.now() - from);
+    const holding = target >= HOLD_FROM_SECONDS;
+    const marks: Record<string, number> = {};
+    const frames: number[][] = [];
+    let done = false;
+    let guard: ReturnType<typeof setTimeout> | undefined;
+    const types = ["loadeddata", "canplay", "seeked", "playing", "timeupdate"];
+    const finish = (by: string) => {
+      if (done) return;
+      done = true;
+      clearTimeout(guard);
+      clearTimeout(cap);
+      for (const type of types) element.removeEventListener(type, onEvent);
+      if (holding) releasePicture(element, reason);
+      // Une ouverture remplacée entre-temps (autre flux, fermeture) n'a rien à dire de celle qui suit.
+      if (alive()) state.recorder?.openingTrace({ target: Math.round(target * 10) / 10, ...(holding ? { heldMs: since(), shownBy: by } : {}), marks, frames });
+    };
+    const there = (seconds: number) => !element.seeking && seconds >= target - HOLD_TOLERANCE_SECONDS;
+    const onEvent = (event: Event) => {
+      if (!alive()) return finish("replaced");
+      marks[event.type] ??= since();
+      // Les premières données sont là : à partir d'ici, l'image ne peut plus attendre longtemps.
+      if (holding) guard ??= setTimeout(() => finish("guard"), HOLD_GUARD_MS);
+      if (holding && element.readyState >= 2 && there(element.currentTime)) finish("position");
+    };
+    for (const type of types) element.addEventListener(type, onEvent);
+    const cap = setTimeout(() => finish("cap"), HOLD_CAP_MS);
+    if (holding) holdPicture(element, reason);
+    if (typeof element.requestVideoFrameCallback !== "function") return;
+    const onFrame = (_now: number, meta: { mediaTime: number }) => {
+      if (!alive()) return finish("replaced");
+      if (done && frames.length >= TRACED_FRAMES) return;
+      // [ms depuis l'ouverture, position de l'image, position de l'élément, saut en cours]
+      if (frames.length < TRACED_FRAMES) frames.push([since(), Math.round(meta.mediaTime * 100) / 100, Math.round(element.currentTime * 100) / 100, element.seeking ? 1 : 0]);
+      if (!done && (!holding || there(meta.mediaTime))) {
+        // Sans retenue, le relevé part une fois ses images réunies.
+        if (holding || frames.length >= TRACED_FRAMES) finish("frame");
+      }
+      if (!done || frames.length < TRACED_FRAMES) element.requestVideoFrameCallback?.(onFrame);
+    };
+    element.requestVideoFrameCallback(onFrame);
+  } catch {
+    releasePicture(element, reason);
+  }
 }
 
 // --- le journal ---------------------------------------------------------------------------------
@@ -1302,6 +1405,7 @@ async function open(self: LumenPlayer, element: HTMLVideoElement, options: Strea
   // jellyfin-web crée son élément avec `autoplay` : sur une source neuve, le navigateur relançait de
   // lui-même un film rouvert en pause, sans qu'aucun `play()` ne soit appelé.
   if (resume?.paused) element.autoplay = false;
+  watchOpening(state, element, startSeconds, () => state.opening === mine);
   const playback = await probe.start(element);
   step(state, "started");
   if (state.opening !== mine) {

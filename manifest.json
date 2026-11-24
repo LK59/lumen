@@ -9,6 +9,14 @@
     "imageUrl": "https://raw.githubusercontent.com/LK59/lumen/main/plugin/logo.png",
     "versions": [
       {
+        "version": "0.1.15.0",
+        "changelog": "The picture stays hidden until the resume position is on screen: a frame from another shot could flash when resuming or changing the audio track. The journal records the first frames of each opening.",
+        "targetAbi": "10.10.0.0",
+        "sourceUrl": "https://raw.githubusercontent.com/LK59/lumen/main/releases/lumen_0.1.15.0.zip",
+        "checksum": "0b16313f74689a361e3e6e9a197f80a0",
+        "timestamp": "2026-11-24T07:58:37Z"
+      },
+      {
         "version": "0.1.14.0",
         "changelog": "Faster start and resume: the file is checked while the web client negotiates and prepared from its detail page. Audio track changes no longer go back to the server. Fixes the position lost after a network drop when the journal is off.",
         "targetAbi": "10.10.0.0",

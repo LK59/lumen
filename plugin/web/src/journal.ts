@@ -29,6 +29,13 @@ export interface PlaybackEntry {
    * `play`, `probed`, `started`, `released` : l'ouverture du moteur). Null avant la première image.
    */
   openingSteps: Record<string, number> | null;
+  /**
+   * Les ouvertures du moteur sur l'élément (la première, puis chaque réouverture), quatre au plus : la
+   * position demandée, combien de temps l'image a été retenue et ce qui l'a levée (`frame`, `position`,
+   * `guard`, `cap`), les premiers événements de l'élément et ses premières images présentées
+   * (`[ms, position de l'image, position de l'élément, saut en cours]`), en ms depuis l'ouverture.
+   */
+  openings?: OpeningTrace[];
   /** Chaque saut, de l'ordre à la première image après lui. */
   seeksMs: number[];
   /** Chaque changement de flux en cours de lecture (piste son, qualité, repli) jusqu'à l'image suivante. */
@@ -42,6 +49,14 @@ export interface PlaybackEntry {
   rebuilds: number;
   /** Une erreur de lecture a-t-elle fait renégocier le flux ? */
   errors: number;
+}
+
+export interface OpeningTrace {
+  target: number;
+  heldMs?: number;
+  shownBy?: string;
+  marks: Record<string, number>;
+  frames: number[][];
 }
 
 /** En dessous, une attente ne se voit pas : le navigateur en signale de très brèves en continu. */
@@ -83,6 +98,11 @@ export class PlaybackRecorder {
 
   opening(steps: Record<string, number>): void {
     this.entry.openingSteps = steps;
+  }
+
+  openingTrace(trace: OpeningTrace): void {
+    const openings = (this.entry.openings ??= []);
+    if (openings.length < 4) openings.push(trace);
   }
 
   seek(ms: number): void {
